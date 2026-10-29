@@ -5852,6 +5852,10 @@ class DistMoeTwoRankTest(unittest.TestCase):
     def test_nvfp4_inference_exercises_peer_paths_fq(self) -> None:
         """Tightly bound prepared NVFP4 against its fake-quantized reference.
 
+        The reference dequantizes its operands and evaluates each GEMM with
+        ``F.linear``, while Dist-MoE executes real NVFP4 tensor-core compute.
+        Their accumulation and scale-application orders are therefore not
+        bitwise equivalent, so the comparison uses calibrated tolerances:
         Require 1%/0.002 elementwise error, 2.5% relative L2, and 0.9997 cosine.
         """
         self._run_two_rank_numerics(
