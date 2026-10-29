@@ -1,9 +1,10 @@
 # NVFP4 Forward and Backward Plan
 
 The graphs are placed side by side below. Read from left to right to compare
-the BF16 baseline, current NVFP4 implementation, and target NVFP4 training
-implementation. Blank padding aligns corresponding components. The current
-NVFP4 columns also distinguish available DQ primitives from integrated flow.
+the BF16 baseline, current public NVFP4 inference, and the target NVFP4
+training flow. The target forward column is implemented internally by this
+change; the target backward column remains future work. Blank padding aligns
+corresponding components.
 
 Legend:
 
@@ -22,36 +23,36 @@ inference-only, and the target backward remains future work.
 ## Forward
 
 ```text
-BF16 FORWARD                                                             | CURRENT NVFP4 FORWARD                                                    | TARGET NVFP4 FORWARD
+BF16 FORWARD                                                             | CURRENT PUBLIC NVFP4 INFERENCE                                           | TARGET NVFP4 FORWARD (PRIVATE PRODUCER IMPLEMENTED)
 -------------------------------------------------------------------------+--------------------------------------------------------------------------+-------------------------------------------------------------------------
                                                                          | BF16 W13/W2                             prepared NVFP4 W13/W2            | BF16 W13/W2
                                                                          |      │                                           │                       |      │
                                                                          |      │ dynamic quantization                      │                       |      │ dynamic quantization
                                                                          |      ▼                                           │                       |      ▼
-                                                                         | Q(W13), Q(W2) + scales [S] ◀─────────────────────┘                       | Q(W13), Q(W2) + scales [S]
+                                                                         | Q(W13), Q(W2) + scales [S] ◀─────────────────────┘                       | Q(W13), Q(W2) + block scales + per-expert outer scales [temporary; not saved]
                                                                          |      │                                                                   |      │
                                                                          |      │                                                                   |      │
 Local X BF16 + expert IDs                                                | Local X BF16                                                             | Local X BF16 + expert IDs
           │                                                              |      │                                                                   |      │
           │ publish                                                      |      │ per-token NVFP4 quantization                                      |      │ per-token NVFP4 quantization and publication
           ▼                                                              |      ▼                                                                   |      ▼
-[SYM] BF16 X + routing IDs                                               | [SYM] Q(X) + block scales + token outer scale                            | [SYM] Q(X) + scales
+[SYM] BF16 X + routing IDs                                               | [SYM] Q(X) + block scales + token outer scale                            | [SYM] Q(X) + block scales + per-token outer scale
           │                                                              |      │                                                                   |      │
           ├──────────────→ routing counts and gather/scatter pointers    |      ├──────────────→ routing counts and gather/scatter pointers         |      ├──────────────→ routing counts and gather/scatter pointers
           │                                  │                           |      │                                                                   |      │                                  │
           │                                  ▼                           |      ▼                                                                   |      │                                  ▼
-          │                           device forward planner             | bind inference scratch                                                   |      │                           device forward planner
+          │                           device forward planner             | bind inference scratch                                                   |      │                 hybrid device forward planner
           │                           ┌───────┴────────┐                 |      │                                                                   |      │                           ┌───────┴────────┐
           │                           │                │                 |      ▼                                                                   |      │                           │                │
           │                       full-save        recompute             |                                                                          |      │                       full-save        recompute
           │                           │                │                 |                                                                          |      │                           │                │
           │                           │         save local X [P]         |                                                                          |      │                           │         save local X [P]
           ▼                           │                                  |                                                                          |      ▼                           │
-                                                                         |                                                                          | gather exact Q(X)                │
+                                                                         |                                                                          | gather exact peer-addressed Q(X) │
                                                                          |                                                                          |      │                           │
-                                                                         |                                                                          |      ├── DQ ─────────────────────┴──→ X_bw [P] or [S]
-                                                                         |                                                                          |      │
-                                                                         |                                                                          |      ▼
+                                                                         |                                                                          |      └── DQ ──→ X_bw [P]         │ no X_bw write
+                                                                         |                                                                          |                                  │
+                                                                         |                                                                          |      ▼                           ▼
 ┌─────────────────────┐              │                                   | ┌──────────────────────────┐                                             | ┌──────────────────────────┐
 │ Gather + W13 GEMM   │              │                                   | │ NVFP4 W13                │                                             | │ NVFP4 W13                │
 │                     │              │                                   | │                          │                                             | │                          │
@@ -67,7 +68,7 @@ Local X BF16 + expert IDs                                                | Local
            │                                                             |              │                                                           |              │
            ▼                                                             |              │ per-route NVFP4 quantization                              |              │ per-route NVFP4 quantization
                                                                          |              ▼                                                           |              ▼
-                                                                         |           Q(H2) + scales ─────────────────────────→ [S]                  |           Q(H2) + scales ─────────────────→ [S] only
+                                                                         |           Q(H2) + scales ─────────────────────────→ [S]                  |           Q(H2) + block scales + per-token outer scale ──→ [S] only
                                                                          |              │                                                           |              │
                                                                          |              ▼                                                           |              ▼
 ┌─────────────────────┐                                                  | ┌──────────────────────────┐                                             | ┌──────────────────────────┐
@@ -90,28 +91,35 @@ score × H3 + top-k reduction                                             |     
                                                                          |                                                                          |
 Full-save:  [X_gathered, H1, H3]                                         | Survives:     Y and caller-owned weights                                 | Full-save:  [X_bw = DQ(Q(X_gathered)), H1, H3]
 Recompute:  [original local X]                                           | Discarded:    dynamic Q(W), Q(X), H1, Q(H2), H3, routing state           | Recompute:  [original local BF16 X]
-                                                                         | Backward:     unsupported                                                |
-                                                                         | DQ available: exact Q(A) per-token and Q(W) per-expert → BF16            |
-                                                                         | Buffer form: device offset + predicate; not yet integrated               |
-                                                                         | Integration:  not called by the current inference path                   |
-H2 is never persistent.                                                  |                                                                          | H2 and Q(H2) are never persistent.
+                                                                         | Backward:     unsupported                                                | Fixed 21-tensor state: 10 empty weight slots
+                                                                         | DQ available: exact Q(A) per-token and Q(W) per-expert → BF16            |              + expert row counts
+                                                                         | Buffer form: device offset + predicate                                   |              + forward/backward gather and scatter pointers
+                                                                         | Public integration: inference does not request saved state                |              + per-rank row-count snapshot and local row count
+                                                                         |                                                                          |              + need_recompute and all planner/descriptor offsets
+                                                                         |                                                                          |              + device recompute predicate and postprocessing state
+                                                                         |                                                                          | BF16 weights remain explicit registered-op inputs for later re-quantization.
+                                                                         |                                                                          | Saved H1/H3 are the real NVFP4 GEMM BF16 boundaries.
+                                                                         |                                                                          | The fixed tensor schema is FakeTensor/make_fx/CUDA-graph visible.
+H2 is never persistent.                                                  |                                                                          | H2, Q(H2), Q(X), and Q(W) are never persistent.
 ```
 
 ## Backward
 
 ```text
-BF16 BACKWARD                                                            | CURRENT NVFP4 BACKWARD                                                   | TARGET NVFP4 BACKWARD
+BF16 BACKWARD                                                            | CURRENT NVFP4 BACKWARD                                                   | TARGET NVFP4 BACKWARD (FUTURE PR)
 -------------------------------------------------------------------------+--------------------------------------------------------------------------+-------------------------------------------------------------------------
-                                                                         | DQ primitives available but not wired into backward:                     | BF16 W13                            BF16 W2
-                                                                         |   Q(A) + per-token outer scale  ── DQ ──→ BF16                           |     │                                   │
-                                                                         |   Q(W) + per-expert outer scale ── DQ ──→ BF16                           |     │ quantize again                    │ quantize again
-                                                                         |                                                                          |     ▼                                   ▼
-                                                                         | Backward: unsupported                                                    | Q(W13) + scales                     Q(W2) + scales
+                                                                         | Private forward producer now emits:                                      | BF16 W13                            BF16 W2
+                                                                         |   full-save [X_bw, H1, H3]                                               |     │                                   │
+                                                                         |   recompute [original local BF16 X]                                      |     │ quantize again                    │ quantize again
+                                                                         |   fixed routing/planner/postprocessing state                             |     ▼                                   ▼
+                                                                         |   no H2 or quantized tensor payloads                                     | Q(W13) + scales                     Q(W2) + scales
                                                                          |                                                                          |     │                                   │
-                                                                         |                                                                          |     │ dequantize                        │ dequantize
-                                                                         |                                                                          |     ▼                                   ▼
-                                                                         |                                                                          | W13_bw = DQ(Q(W13))                 W2_bw = DQ(Q(W2))
-Saved routing + offsets + planner predicate                              |                                                                          | Saved routing + offsets + planner predicate
+                                                                         | DQ primitives available but not wired into backward:                     |     │ dequantize                        │ dequantize
+                                                                         |   Q(A) + per-token outer scale  ── DQ ──→ BF16                           |     ▼                                   ▼
+                                                                         |   Q(W) + per-expert outer scale ── DQ ──→ BF16                           | W13_bw = DQ(Q(W13))                 W2_bw = DQ(Q(W2))
+                                                                         | Backward: unsupported                                                    |
+Saved routing + offsets + planner predicate                              |                                                                          | Saved routing + offsets + need_recompute
+                                                                         |                                                                          | + row-count snapshot + descriptor offsets + postprocessing state
                       │                                                  |                                                                          |                       │
                       ▼                                                  |                                                                          |                       ▼
               device backward planner                                    |                                                                          |               device backward planner
