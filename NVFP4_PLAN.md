@@ -1,9 +1,9 @@
 # NVFP4 Forward and Backward Plan
 
-The original graphs are placed side by side below. Read from left to right to
-compare the BF16 baseline, current NVFP4 implementation, and target NVFP4
-training implementation. Blank padding aligns corresponding components; the
-content of each original graph is unchanged.
+The graphs are placed side by side below. Read from left to right to compare
+the BF16 baseline, current NVFP4 implementation, and target NVFP4 training
+implementation. Blank padding aligns corresponding components. The current
+NVFP4 columns also distinguish available DQ primitives from integrated flow.
 
 Legend:
 
@@ -87,6 +87,9 @@ score × H3 + top-k reduction                                             |     
 Full-save:  [X_gathered, H1, H3]                                         | Survives:     Y and caller-owned weights                                 | Full-save:  [X_bw = DQ(Q(X_gathered)), H1, H3]
 Recompute:  [original local X]                                           | Discarded:    dynamic Q(W), Q(X), H1, Q(H2), H3, routing state           | Recompute:  [original local BF16 X]
                                                                          | Backward:     unsupported                                                |
+                                                                         | DQ available: exact Q(A) per-token and Q(W) per-expert → BF16            |
+                                                                         | Buffer form: device offset + predicate; not yet integrated               |
+                                                                         | Integration:  not called by the current inference path                   |
 H2 is never persistent.                                                  |                                                                          | H2 and Q(H2) are never persistent.
 ```
 
@@ -95,11 +98,11 @@ H2 is never persistent.                                                  |      
 ```text
 BF16 BACKWARD                                                            | CURRENT NVFP4 BACKWARD                                                   | TARGET NVFP4 BACKWARD
 -------------------------------------------------------------------------+--------------------------------------------------------------------------+-------------------------------------------------------------------------
-                                                                         | Backward:     unsupported                                                | BF16 W13                            BF16 W2
-                                                                         |                                                                          |     │                                   │
-                                                                         |                                                                          |     │ quantize again                    │ quantize again
+                                                                         | DQ primitives available but not wired into backward:                     | BF16 W13                            BF16 W2
+                                                                         |   Q(A) + per-token outer scale  ── DQ ──→ BF16                           |     │                                   │
+                                                                         |   Q(W) + per-expert outer scale ── DQ ──→ BF16                           |     │ quantize again                    │ quantize again
                                                                          |                                                                          |     ▼                                   ▼
-                                                                         |                                                                          | Q(W13) + scales                     Q(W2) + scales
+                                                                         | Backward: unsupported                                                    | Q(W13) + scales                     Q(W2) + scales
                                                                          |                                                                          |     │                                   │
                                                                          |                                                                          |     │ dequantize                        │ dequantize
                                                                          |                                                                          |     ▼                                   ▼

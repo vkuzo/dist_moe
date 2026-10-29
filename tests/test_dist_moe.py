@@ -56,6 +56,7 @@ from dist_moe._triton_ops import (
 from dist_moe.formats import (
     BlockScaledFormat as _KernelBlockScaledFormat,
     canonical_situ_glu,
+    FP4_E2M1_TABLE,
     NVFP4_GLOBAL_SCALE_EPS,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
@@ -69,7 +70,15 @@ from dist_moe.kernels import (
     grouped_gemm_kernel as grouped_gemm_kernel_impl,
     mega_blockscaled_grouped_gemm as mega_impl,
 )
+from dist_moe.kernels.scale_factor_layout import natural_to_cublas_blocked
 from dist_moe.kernels.triton import swiglu as swiglu_impl
+from dist_moe.kernels.triton_quantization.blockscaled_quantize import (
+    quantize_block_scaled as triton_quantize_block_scaled,
+)
+from dist_moe.kernels.triton_quantization.formats import (
+    BlockScaledFormatId as TritonBlockScaledFormatId,
+    ScaleFactorLayoutId as TritonScaleFactorLayoutId,
+)
 from torch._higher_order_ops.effects import has_effects
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.device_mesh import init_device_mesh
@@ -1978,6 +1987,339 @@ class DistMoeKernelTest(unittest.TestCase):
         self.assertTrue(all(tensor.grad_fn is None for tensor in storage))
         self.assertTrue(any(tensor is prepared.global_scale for tensor in storage))
         self.assertTrue(any(tensor is prepared.global_scale_inv for tensor in storage))
+
+    def test_nvfp4_activation_dequantization_matches_gold(self) -> None:
+        """Activation DQ exactly decodes strided current-forward row bundles.
+
+        The input views exercise packed activation-buffer offsets. The golden
+        recipe independently decodes E2M1/E4M3 before the current wire inverse
+        is applied per token. Both scale layouts are bitwise equal in BF16.
+        """
+        rows, cols = 35, 256
+        generator = torch.Generator(device="cuda").manual_seed(20261029)
+        x = torch.randn(
+            rows,
+            cols,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        q_cols, scale_cols = cols // 2, cols // 16
+        row_bytes = (q_cols + scale_cols + 4 + 31) // 32 * 32
+        packed = torch.empty((rows, row_bytes), dtype=torch.uint8, device="cuda")
+        qdata_MQ = packed[:, :q_cols].view(torch.float4_e2m1fn_x2)
+        scale_MB = packed[:, q_cols : q_cols + scale_cols].view(torch.float8_e4m3fn)
+        global_scale_inv_M = packed[
+            :, q_cols + scale_cols : q_cols + scale_cols + 4
+        ].view(torch.float32)[:, 0]
+        blockscaled_impl._quantize_nvfp4_per_token(
+            x,
+            layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
+            q_out=qdata_MQ,
+            scale_out=scale_MB,
+            token_scale_inv_out=global_scale_inv_M,
+        )
+
+        actual = blockscaled_impl._dequantize_nvfp4_activation(
+            qdata_MQ,
+            scale_MB,
+            global_scale_inv_M,
+        )
+        blocked_scale_MB = natural_to_cublas_blocked(
+            scale_MB.contiguous(),
+            is_a=True,
+        )
+        blocked_actual = blockscaled_impl._dequantize_nvfp4_activation(
+            qdata_MQ,
+            blocked_scale_MB,
+            global_scale_inv_M,
+            blocked_scales=True,
+        )
+        inner_dequantized = nvfp4_gs_dq_f(
+            qdata_MQ.contiguous(),
+            scale_MB.contiguous(),
+            torch.ones((rows, 1), dtype=torch.float32, device="cuda"),
+        )
+        expected = (inner_dequantized * global_scale_inv_M[:, None]).to(torch.bfloat16)
+        output_bytes = expected.numel() * expected.element_size()
+        activation_offset = 32
+        activation_buffer = torch.full(
+            (activation_offset + output_bytes + 32,),
+            0xA5,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        activation_offset_1 = torch.tensor(
+            [activation_offset],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        conditional_execution_1 = torch.zeros(
+            (1,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        original_buffer = activation_buffer.clone()
+        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
+            qdata_MQ,
+            scale_MB,
+            global_scale_inv_M,
+            activation_buffer,
+            activation_offset_1,
+            conditional_execution_1,
+        )
+        self.assertTrue(torch.equal(activation_buffer, original_buffer))
+        conditional_execution_1.fill_(1)
+        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
+            qdata_MQ,
+            scale_MB,
+            global_scale_inv_M,
+            activation_buffer,
+            activation_offset_1,
+            conditional_execution_1,
+        )
+        buffered = (
+            activation_buffer[activation_offset : activation_offset + output_bytes]
+            .view(torch.bfloat16)
+            .view_as(expected)
+        )
+
+        self.assertFalse(qdata_MQ.is_contiguous())
+        self.assertFalse(scale_MB.is_contiguous())
+        self.assertGreater(global_scale_inv_M.stride(0), 1)
+        self.assertTrue(
+            torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+        )
+        self.assertTrue(
+            torch.equal(blocked_actual.view(torch.uint16), expected.view(torch.uint16))
+        )
+        self.assertTrue(
+            torch.equal(buffered.view(torch.uint16), expected.view(torch.uint16))
+        )
+        self.assertTrue(torch.all(activation_buffer[:activation_offset] == 0xA5).item())
+        self.assertTrue(
+            torch.all(
+                activation_buffer[activation_offset + output_bytes :] == 0xA5
+            ).item()
+        )
+
+    def test_nvfp4_weight_dequantization_matches_gold(self) -> None:
+        """Weight DQ exactly decodes grouped padded CUBLAS-blocked scales.
+
+        Non-atom-aligned expert rows and scale columns prove that each expert
+        uses its own padded blocked region and outer scale. Equality is
+        bitwise after the independent golden result is converted to BF16.
+        """
+        experts, rows, cols = 2, 129, 272
+        generator = torch.Generator(device="cuda").manual_seed(20261029)
+        weight_ENK = torch.randn(
+            experts,
+            rows,
+            cols,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        weight_ENK[1].mul_(8)
+        qdata_ENQ, scale_RB, global_scale_E, global_scale_inv_E = (
+            blockscaled_impl._prepare_nvfp4_weight_operands(weight_ENK)
+        )
+        self.assertNotEqual(global_scale_E[0].item(), global_scale_E[1].item())
+
+        outer_scale_R1 = (
+            global_scale_E[:, None].expand(experts, rows).reshape(experts * rows, 1)
+        )
+        natural_q_ENQ, natural_scale_ENB = triton_quantize_block_scaled(
+            weight_ENK,
+            format_id=TritonBlockScaledFormatId.NVFP4.value,
+            layout_id=TritonScaleFactorLayoutId.NATURAL.value,
+            is_a=False,
+            global_scale=outer_scale_R1.reshape(-1),
+        )
+        self.assertTrue(
+            torch.equal(
+                qdata_ENQ.view(torch.uint8),
+                natural_q_ENQ.view(torch.uint8),
+            )
+        )
+
+        actual = blockscaled_impl._dequantize_nvfp4_weight(
+            qdata_ENQ,
+            scale_RB,
+            global_scale_inv_E,
+        )
+        inner_dequantized = nvfp4_gs_dq_f(
+            natural_q_ENQ.reshape(experts * rows, -1),
+            natural_scale_ENB.reshape(experts * rows, -1),
+            torch.ones_like(outer_scale_R1),
+        ).reshape_as(weight_ENK)
+        expected = (inner_dequantized * global_scale_inv_E[:, None, None]).to(
+            torch.bfloat16
+        )
+
+        self.assertEqual(scale_RB.shape, (512, 20))
+        self.assertTrue(
+            torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+        )
+
+    def test_nvfp4_dequantization_decodes_all_e2m1_codes(self) -> None:
+        """Packed DQ preserves every E2M1 code, including signed zero."""
+        packed = torch.tensor(
+            [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]],
+            dtype=torch.uint8,
+            device="cuda",
+        ).view(torch.float4_e2m1fn_x2)
+        actual = blockscaled_impl._dequantize_nvfp4_activation(
+            packed,
+            torch.ones((1, 1), dtype=torch.float8_e4m3fn, device="cuda"),
+            torch.ones((1,), dtype=torch.float32, device="cuda"),
+        )
+        expected = torch.tensor(
+            FP4_E2M1_TABLE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )[None, :]
+
+        self.assertTrue(
+            torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+        )
+
+    def test_nvfp4_dequantization_supports_fake_tensor_metadata(self) -> None:
+        """Both DQ ops expose their exact BF16 shapes without CUDA execution."""
+        with FakeTensorMode():
+            activation = blockscaled_impl._dequantize_nvfp4_activation(
+                torch.empty(
+                    7,
+                    136,
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="cuda",
+                ),
+                torch.empty(
+                    7,
+                    17,
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                ),
+                torch.empty(7, dtype=torch.float32, device="cuda"),
+            )
+            weight = blockscaled_impl._dequantize_nvfp4_weight(
+                torch.empty(
+                    2,
+                    129,
+                    136,
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="cuda",
+                ),
+                torch.empty(
+                    512,
+                    20,
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                ),
+                torch.empty(2, dtype=torch.float32, device="cuda"),
+            )
+            blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
+                torch.empty(
+                    7,
+                    136,
+                    dtype=torch.float4_e2m1fn_x2,
+                    device="cuda",
+                ),
+                torch.empty(
+                    7,
+                    17,
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                ),
+                torch.empty(7, dtype=torch.float32, device="cuda"),
+                torch.empty(7 * 272 * 2, dtype=torch.uint8, device="cuda"),
+                torch.empty(1, dtype=torch.int64, device="cuda"),
+                torch.empty(1, dtype=torch.int32, device="cuda"),
+            )
+
+        self.assertEqual(activation.shape, (7, 272))
+        self.assertIs(activation.dtype, torch.bfloat16)
+        self.assertEqual(weight.shape, (2, 129, 272))
+        self.assertIs(weight.dtype, torch.bfloat16)
+
+    def test_nvfp4_activation_dequantization_graph_replays_device_state(self) -> None:
+        """Captured DQ follows replay-time activation offsets and predicates."""
+        rows, cols = 4, 256
+        generator = torch.Generator(device="cuda").manual_seed(20261029)
+        x = torch.randn(
+            rows,
+            cols,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        qdata_MQ, scale_MB, global_scale_inv_M = (
+            blockscaled_impl._quantize_nvfp4_per_token(
+                x,
+                layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
+            )
+        )
+        expected = blockscaled_impl._dequantize_nvfp4_activation(
+            qdata_MQ,
+            scale_MB,
+            global_scale_inv_M,
+        )
+        output_bytes = expected.numel() * expected.element_size()
+        first_offset = 32
+        second_offset = first_offset + output_bytes
+        activation_buffer = torch.full(
+            (second_offset + output_bytes + 32,),
+            0xA5,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        activation_offset_1 = torch.tensor(
+            [first_offset],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        conditional_execution_1 = torch.zeros(
+            (1,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
+            qdata_MQ,
+            scale_MB,
+            global_scale_inv_M,
+            activation_buffer,
+            activation_offset_1,
+            conditional_execution_1,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
+                qdata_MQ,
+                scale_MB,
+                global_scale_inv_M,
+                activation_buffer,
+                activation_offset_1,
+                conditional_execution_1,
+            )
+
+        activation_offset_1.fill_(second_offset)
+        conditional_execution_1.fill_(1)
+        graph.replay()
+        buffered = (
+            activation_buffer[second_offset : second_offset + output_bytes]
+            .view(torch.bfloat16)
+            .view_as(expected)
+        )
+
+        self.assertTrue(
+            torch.equal(buffered.view(torch.uint16), expected.view(torch.uint16))
+        )
+        self.assertTrue(
+            torch.all(
+                activation_buffer[first_offset : first_offset + output_bytes] == 0xA5
+            ).item()
+        )
 
     def test_nvfp4_token_scale_writes_directly_to_strided_output(self) -> None:
         """Dynamic NVFP4 quantization writes its inverse scale in place."""
