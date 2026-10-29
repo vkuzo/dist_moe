@@ -3916,8 +3916,10 @@ def routed_experts(  # noqa: C901
         w13_weight: Local BF16 gate/up weight with shape
             ``[E_local, 2, F, D]``, ``[E_local, 2F, D]``, or
             ``[E_local * 2F, D]``, or a prepared MXFP8/NVFP4 operand whose
-            source has one of those shapes. NVFP4 requires prepared weights
-            and an inference context.
+            source has one of those shapes. Native NVFP4 weights are
+            quantized during each inference invocation; prepared NVFP4
+            operands avoid that repeated work. NVFP4 requires an inference
+            context.
         w2_weight: Local BF16 down weight with shape ``[E_local, D, F]`` or
             ``[E_local * D, F]``, or a matching prepared MXFP8/NVFP4 operand.
         context: Factory-created execution context for these static shapes.

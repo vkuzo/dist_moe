@@ -42,11 +42,13 @@ separate MMA epilogue inputs, not replacements for the per-16-value scales.
 <a id="prepare-weights"></a>
 ## Prepare weights
 
-NVFP4 weights must be prepared before execution. Preparation creates packed
-FPROP qdata and CUBLAS-blocked scales. Because NVFP4 is inference-only, the
-prepared object does not allocate DGRAD qdata or scales. It retains both the
-per-expert global scale and its reciprocal. The runtime consumes the reciprocal
-directly, so eager execution and CUDA graph replay do not launch a reciprocal
+NVFP4 execution accepts native BF16 or explicitly prepared weights. Native
+weights are converted to packed FPROP qdata and CUBLAS-blocked scales during
+every invocation. Explicit preparation creates the same operands once.
+Because NVFP4 is inference-only, the prepared object does not allocate DGRAD
+qdata or scales. It retains both the per-expert global scale and its
+reciprocal. The runtime consumes the reciprocal directly, so prepared eager
+execution and CUDA graph replay do not launch quantization or a reciprocal
 kernel on every invocation.
 
 The default W13 rows concatenate gate and up projections for both staged and
@@ -225,7 +227,7 @@ belongs to MXFP8 training, not to NVFP4's supported surface.
 | qdata | E4M3, one byte/value | E2M1, two values/byte |
 | block scale | E8M0 per 32 values | E4M3 per 16 values |
 | row global scale | none | FP32 inverse per activation row |
-| expert global scale | none | FP32 per prepared weight |
+| expert global scale | none | FP32 per expert weight tensor |
 | dispatch traffic | BF16 source rows | packed qdata + scales |
 | backward | staged and Mega | unsupported |
 | activation buffer | saved state + scratch | scratch only |
