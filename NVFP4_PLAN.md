@@ -15,10 +15,9 @@ Q(A) packed NVFP4
 A_bw = DQ(Q(A))
 ```
 
-Implementation status: the current NVFP4 training forward is implemented
-behind the private registered-operation boundary. Its backward is unsupported,
-and the public NVFP4 API remains inference-only. The final column shows the
-completed training path after the future backward change.
+Implementation status: the NVFP4 training forward and backward are
+implemented. The current column records the retained forward state; its
+backward is the completed target path shown in the final column.
 
 ## Forward
 
@@ -98,10 +97,10 @@ Recompute:  [original local X]                                           | Recom
                                                                          |              + need_recompute and all planner/descriptor offsets         |
                                                                          |              + device recompute predicate and postprocessing state       |
                                                                          | BF16 weights remain explicit registered-op inputs.                      |
-                                                                         | Backward will re-quantize them.                                         |
+                                                                         | Backward re-quantizes them.                                              |
                                                                          | Saved H1/H3 are the real NVFP4 GEMM BF16 boundaries.                    |
                                                                          | The fixed tensor schema is FakeTensor/make_fx/CUDA-graph visible.        |
-                                                                         | Backward: unsupported                                                    |
+                                                                         | Backward: implemented as shown in the target column                     |
 H2 is never persistent.                                                  | H2, Q(H2), Q(X), and Q(W) are never persistent.                          | H2 and Q(H2) are never persistent.
 ```
 
@@ -110,16 +109,16 @@ H2 is never persistent.                                                  | H2, Q
 ```text
 BF16 BACKWARD                                                            | CURRENT NVFP4 TRAINING BACKWARD                                          | TARGET NVFP4 BACKWARD
 -------------------------------------------------------------------------+--------------------------------------------------------------------------+-------------------------------------------------------------------------
-                                                                         | Private forward producer now emits:                                      | BF16 W13                            BF16 W2
+                                                                         | Public training forward emits:                                           | BF16 W13                            BF16 W2
                                                                          |   full-save [X_bw, H1, H3]                                               |     │                                   │
                                                                          |   recompute [original local BF16 X]                                      |     │ quantize again                    │ quantize again
                                                                          |   fixed routing/planner/postprocessing state                             |     ▼                                   ▼
                                                                          |   no H2 or quantized tensor payloads                                     | Q(W13) + scales                     Q(W2) + scales
                                                                          |                                                                          |     │                                   │
-                                                                         | DQ primitives available but not wired into backward:                     |     │ dequantize                        │ dequantize
+                                                                         | DQ primitives wired into the shared BF16 backward:                       |     │ dequantize                        │ dequantize
                                                                          |   Q(A) + per-token outer scale  ── DQ ──→ BF16                           |     ▼                                   ▼
                                                                          |   Q(W) + per-expert outer scale ── DQ ──→ BF16                           | W13_bw = DQ(Q(W13))                 W2_bw = DQ(Q(W2))
-                                                                         | Backward: unsupported                                                    |
+                                                                         | Current backward is the completed target path shown at right. ─────────→ |
 Saved routing + offsets + planner predicate                              |                                                                          | Saved routing + offsets + planner predicate
                       │                                                  |                                                                          |                       │
                       ▼                                                  |                                                                          |                       ▼
