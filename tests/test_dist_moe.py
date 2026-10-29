@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.testing._internal.distributed.fake_pg  # noqa: F401
+from quant_cast_bench.quant_cast_gold.recipes import nvfp4_gs_dq_f, nvfp4_gs_f
 from dist_moe._activation_buffer import (
     ActivationBuffer,
     BlockscaledStorageConfig,
@@ -55,6 +56,9 @@ from dist_moe._triton_ops import (
 from dist_moe.formats import (
     BlockScaledFormat as _KernelBlockScaledFormat,
     canonical_situ_glu,
+    NVFP4_GLOBAL_SCALE_EPS,
+    NVFP4_MAX,
+    NVFP4_TOKEN_AMAX_FLOOR,
     SITU_GLU_GATE_BETA_DEFAULT,
     SITU_GLU_UP_BETA_DEFAULT,
 )
@@ -182,6 +186,60 @@ class _BackwardOpRecorder(TorchDispatchMode):
         return result
 
 
+class _NVFP4FakeQuantSTE(torch.autograd.Function):
+    """Apply the golden NVFP4 quantize-dequantize recipe with an STE."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        tensor: torch.Tensor,
+        outer_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Quantize-dequantize one row-major operand into FP32 compute values."""
+        ctx.input_dtype = tensor.dtype
+        original_shape = tensor.shape
+        flattened = tensor.reshape(-1, original_shape[-1])
+        flattened_outer_scale = (
+            outer_scale.reshape(-1, 1) if outer_scale.ndim > 0 else outer_scale
+        )
+        qdata, inner_scale = nvfp4_gs_f(flattened, flattened_outer_scale)
+        dequantized = nvfp4_gs_dq_f(qdata, inner_scale, flattened_outer_scale)
+        return dequantized.reshape(original_shape)
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None]:
+        """Pass the tensor gradient through and stop scale gradients."""
+        return grad_output.to(ctx.input_dtype), None
+
+
+def _nvfp4_fake_quant(
+    tensor: torch.Tensor,
+    *,
+    per_token: bool,
+) -> torch.Tensor:
+    """Fake-quantize an NVFP4 operand with token- or tensor-level outer scale."""
+    if per_token:
+        amax = torch.linalg.vector_norm(
+            tensor,
+            ord=float("inf"),
+            dim=-1,
+            keepdim=True,
+            dtype=torch.float32,
+        ).clamp(min=NVFP4_TOKEN_AMAX_FLOOR)
+    else:
+        amax = torch.linalg.vector_norm(
+            tensor,
+            ord=float("inf"),
+            dim=tuple(range(tensor.ndim)),
+            dtype=torch.float32,
+        ).clamp(min=NVFP4_GLOBAL_SCALE_EPS)
+    outer_scale = NVFP4_MAX * torch.reciprocal(amax)
+    return _NVFP4FakeQuantSTE.apply(tensor, outer_scale)
+
+
 def _reference_moe(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -260,6 +318,99 @@ def _reference_moe(
         outputs.append(
             torch.sum(stacked.float() * topk_scores[token_index, :, None], dim=0).to(
                 x.dtype
+            )
+        )
+    return torch.stack(outputs)
+
+
+def _reference_moe_nvfp4_fake_quant(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_scores: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    experts_output_postprocess: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    clamped: bool = False,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    situ_glu: bool = False,
+    situ_glu_beta: float = 4.0,
+    situ_glu_linear_beta: float = 25.0,
+) -> torch.Tensor:
+    """Evaluate a routed MoE with NVFP4 fake quantization at FPROP boundaries.
+
+    Args:
+        x: Input tokens with shape ``[T, D]``.
+        topk_ids: Expert IDs with shape ``[T, K]``.
+        topk_scores: Expert weights with shape ``[T, K]``.
+        w13: Fused local gate/up weights.
+        w2: Local down-projection weights.
+        experts_output_postprocess: Optional route-wise output transform.
+        clamped: Whether to apply the clamped SwiGLU formula.
+        swiglu_alpha: Sigmoid multiplier for clamped SwiGLU.
+        swiglu_limit: Preactivation bound for clamped SwiGLU.
+        situ_glu: Whether to apply the SiTU-GLU formula.
+        situ_glu_beta: Gate tanh bound for SiTU-GLU.
+        situ_glu_linear_beta: Up-projection tanh bound for SiTU-GLU.
+
+    Returns:
+        Fake-quantized reference output with shape ``[T, D]``.
+    """
+    output_dtype = x.dtype
+    x = _nvfp4_fake_quant(x, per_token=True)
+    w13 = torch.stack(
+        tuple(_nvfp4_fake_quant(expert, per_token=False) for expert in w13)
+    )
+    w2 = torch.stack(tuple(_nvfp4_fake_quant(expert, per_token=False) for expert in w2))
+
+    outputs = []
+    intermediate_dim = w2.shape[2]
+    for token_index in range(x.shape[0]):
+        token_outputs = []
+        for slot in range(topk_ids.shape[1]):
+            expert = int(topk_ids[token_index, slot])
+            if expert < 0:
+                token_outputs.append(
+                    torch.zeros_like(x[token_index], dtype=output_dtype)
+                )
+                continue
+            h13 = F.linear(x[token_index], w13[expert]).to(output_dtype)
+            gate, up = h13.split(intermediate_dim)
+            gate_f32, up_f32 = gate.float(), up.float()
+            if clamped:
+                gate_f32 = torch.minimum(
+                    gate_f32,
+                    gate_f32.new_tensor(swiglu_limit),
+                )
+                up_f32 = torch.clamp(
+                    up_f32,
+                    min=-swiglu_limit,
+                    max=swiglu_limit,
+                )
+                h2 = (
+                    gate_f32 * torch.sigmoid(swiglu_alpha * gate_f32) * (up_f32 + 1.0)
+                ).to(output_dtype)
+            elif situ_glu:
+                gate_f32 = (
+                    situ_glu_beta
+                    * torch.tanh(gate_f32 / situ_glu_beta)
+                    * torch.sigmoid(gate_f32)
+                )
+                up_f32 = situ_glu_linear_beta * torch.tanh(
+                    up_f32 / situ_glu_linear_beta
+                )
+                h2 = (gate_f32 * up_f32).to(output_dtype)
+            else:
+                h2 = (gate_f32 * torch.sigmoid(gate_f32) * up_f32).to(output_dtype)
+            h2 = _nvfp4_fake_quant(h2.unsqueeze(0), per_token=True).squeeze(0)
+            token_outputs.append(F.linear(h2, w2[expert]).to(output_dtype))
+        stacked = torch.stack(token_outputs)
+        if experts_output_postprocess is not None:
+            stacked = experts_output_postprocess(stacked)
+        outputs.append(
+            torch.sum(stacked.float() * topk_scores[token_index, :, None], dim=0).to(
+                output_dtype
             )
         )
     return torch.stack(outputs)
@@ -5001,6 +5152,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
         inference: bool = False,
         fuse_swiglu: bool = False,
         weight_block_size: Literal["1x32", "32x32"] | None = None,
+        reference_moe: Callable[..., torch.Tensor] = _reference_moe,
+        fwd_tolerance_override: tuple[float, float, float, float] | None = None,
     ) -> None:
         """Run one precision through real peer dispatch and combine paths.
 
@@ -5027,6 +5180,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
             inference: Whether to exercise forward-only MXFP8 execution.
             fuse_swiglu: Whether to interleave prepared inference W13.
             weight_block_size: Optional MXFP8 inference quantization grain.
+            reference_moe: Routed reference implementation to compare against.
+            fwd_tolerance_override: Optional rtol, atol, relative-L2, and cosine
+                bounds replacing the format defaults.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -5182,7 +5338,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
             global_grad_output = _all_gather_cat(grad_output)
             reference_w13 = full_w13.detach().clone().requires_grad_()
             reference_w2 = full_w2.detach().clone().requires_grad_()
-            reference = _reference_moe(
+            reference = reference_moe(
                 global_x,
                 global_ids,
                 global_scores,
@@ -5197,7 +5353,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 situ_glu_linear_beta=situ_glu_linear_beta,
             )
             reference = reference * reference_output_scale
-            if block_scaled is None:
+            if fwd_tolerance_override is not None:
+                fwd_tolerance = fwd_tolerance_override
+            elif block_scaled is None:
                 fwd_tolerance = (2e-2, 2e-2, 5e-3, 0.999)
             else:
                 fwd_tolerance = _blockscaled_tolerance(block_scaled.format, "fwd")
@@ -5688,4 +5846,16 @@ class DistMoeTwoRankTest(unittest.TestCase):
         """
         self._run_two_rank_numerics(
             dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4)
+        )
+
+    @with_comms
+    def test_nvfp4_inference_exercises_peer_paths_fq(self) -> None:
+        """Tightly bound prepared NVFP4 against its fake-quantized reference.
+
+        Require 1%/0.002 elementwise error, 2.5% relative L2, and 0.9997 cosine.
+        """
+        self._run_two_rank_numerics(
+            dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
+            reference_moe=_reference_moe_nvfp4_fake_quant,
+            fwd_tolerance_override=(0.01, 0.002, 0.025, 0.9997),
         )
