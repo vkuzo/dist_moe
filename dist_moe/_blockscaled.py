@@ -522,6 +522,130 @@ def _dequantize_nvfp4_activation_to_buffer_fake(
     )
 
 
+def _validate_nvfp4_gather_dequantization(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    activation_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    n_cols: int,
+) -> None:
+    """Validate gather-addressed NVFP4 activation dequantization metadata.
+
+    Args:
+        gather_ptrs_M: Capacity-sized peer row-address table.
+        num_rows_1: Device scalar with the valid padded-row count.
+        activation_buffer: Planner-owned byte storage.
+        activation_offset_1: Device scalar destination offset.
+        conditional_execution_1: Device execution predicate.
+        n_cols: Logical BF16 feature width.
+    """
+    if (
+        gather_ptrs_M.dtype != torch.int64
+        or gather_ptrs_M.ndim != 1
+        or not gather_ptrs_M.is_contiguous()
+        or not gather_ptrs_M.is_cuda
+    ):
+        raise ValueError("gather_ptrs_M must be a contiguous CUDA int64 vector")
+    if (
+        num_rows_1.dtype not in (torch.int32, torch.int64)
+        or num_rows_1.shape != (1,)
+        or not num_rows_1.is_contiguous()
+        or num_rows_1.device != gather_ptrs_M.device
+    ):
+        raise ValueError(
+            "num_rows_1 must be a contiguous int32 or int64 tensor with shape "
+            "(1,) on the gather-pointer device"
+        )
+    if n_cols <= 0 or n_cols % BLOCKSCALED_DISPATCH_DIM_ALIGNMENT != 0:
+        raise ValueError(
+            "NVFP4 gathered activation width must be positive and aligned to "
+            f"{BLOCKSCALED_DISPATCH_DIM_ALIGNMENT}"
+        )
+    _validate_nvfp4_activation_buffer_metadata(
+        activation_buffer,
+        activation_offset_1,
+        conditional_execution_1,
+        device=gather_ptrs_M.device,
+        required_bytes=(gather_ptrs_M.numel() * n_cols * torch.bfloat16.itemsize),
+    )
+
+
+@torch.library.custom_op(
+    "dist_moe::dequantize_gathered_nvfp4_activation_to_buffer_",
+    mutates_args=("activation_buffer",),
+)
+def _dequantize_gathered_nvfp4_activation_to_buffer(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    activation_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    n_cols: int,
+    execute_when_zero: bool = False,
+) -> None:
+    """Conditionally dequantize packed peer rows into saved BF16 storage.
+
+    Each nonzero gather pointer addresses one symmetric-memory row containing
+    packed E2M1 values, natural E4M3 block scales, and one FP32 inverse token
+    scale. Zero routing-padding pointers produce all-zero BF16 rows.
+
+    Args:
+        gather_ptrs_M: Capacity-sized peer row-address table.
+        num_rows_1: Device scalar with the valid padded-row count.
+        activation_buffer: Planner-owned byte storage.
+        activation_offset_1: Device scalar destination offset.
+        conditional_execution_1: Device execution predicate.
+        n_cols: Logical BF16 feature width.
+        execute_when_zero: Whether a zero predicate selects this operation.
+    """
+    _validate_nvfp4_gather_dequantization(
+        gather_ptrs_M,
+        num_rows_1,
+        activation_buffer,
+        activation_offset_1,
+        conditional_execution_1,
+        n_cols,
+    )
+    validate_activation_buffer_storage(activation_buffer)
+
+    from .kernels.triton_quantization.blockscaled_dequantize import (
+        dequantize_gathered_nvfp4_to_activation_buffer,
+    )
+
+    dequantize_gathered_nvfp4_to_activation_buffer(
+        gather_ptrs_M,
+        num_rows_1,
+        activation_buffer,
+        activation_offset_1,
+        conditional_execution_1,
+        n_cols=n_cols,
+        execute_when_zero=execute_when_zero,
+    )
+
+
+@_dequantize_gathered_nvfp4_activation_to_buffer.register_fake
+def _dequantize_gathered_nvfp4_activation_to_buffer_fake(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    activation_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    n_cols: int,
+    execute_when_zero: bool = False,
+) -> None:
+    """Validate fake metadata for gather-addressed activation dequantization."""
+    del execute_when_zero
+    _validate_nvfp4_gather_dequantization(
+        gather_ptrs_M,
+        num_rows_1,
+        activation_buffer,
+        activation_offset_1,
+        conditional_execution_1,
+        n_cols,
+    )
+
+
 def _validate_nvfp4_weight_dequantization(
     qdata_ENQ: torch.Tensor,
     scale_RB: torch.Tensor,
@@ -967,6 +1091,7 @@ class _BlockscaledConfig:
     interleaved_fc13: bool = False
     routing_capacity: int | None = None
     static_inference_storage: bool = False
+    save_dequantized_activations: bool = False
 
     @property
     def policy(self) -> _FusedBlockscaledFormatPolicy:
@@ -1005,7 +1130,7 @@ class _ComputeDispatch:
         Returns:
             Whether dispatch uses packed row-quantized storage.
         """
-        return inference_mode
+        return inference_mode or self.blockscaled.save_dequantized_activations
 
 
 def _validate_compute_config(
@@ -1198,7 +1323,9 @@ def _async_resolve_compute(
     )
     if inference_mode and save_for_backward:
         raise ValueError("inference execution cannot save backward state")
-    return compute, save_for_backward
+    return compute, save_for_backward and not (
+        blockscaled_cfg.save_dequantized_activations
+    )
 
 
 def _prepare_blockscaled_weight_impl(
@@ -1689,6 +1816,7 @@ def _async_model_config(
         routing_m_multiple_of=routing_m_multiple,
         max_num_recv_tokens=max_num_recv_tokens,
         mega=blockscaled_cfg.mega,
+        save_dequantized_activations=(blockscaled_cfg.save_dequantized_activations),
     )
 
 
@@ -1840,7 +1968,18 @@ class _BlockScaledAutograd(torch.autograd.Function):
         # Prepared operands remain caller-owned; dynamic operands are retained
         # or regenerated according to the backward recomputation contract.
         input_dtype = x_TD.dtype
-        auto_inference_tuning = inference_mode and config is None
+        save_dequantized_activations = blockscaled_cfg.save_dequantized_activations
+        if save_dequantized_activations and (
+            blockscaled_cfg.format is not BlockScaledFormat.NVFP4
+            or inference_mode
+            or not save_for_backward
+        ):
+            raise ValueError(
+                "dequantized activation saving requires an internal NVFP4 "
+                "training forward"
+            )
+        fprop_inference_mode = inference_mode or save_dequantized_activations
+        auto_inference_tuning = fprop_inference_mode and config is None
         static_inference_storage = (
             inference_mode
             and blockscaled_cfg.mega
@@ -1862,7 +2001,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         )
         # Compact decode tuning assumes the Mega inference layout. Staged
         # offset-backed execution retains the asynchronous source defaults.
-        if inference_mode and blockscaled_cfg.mega:
+        if fprop_inference_mode and blockscaled_cfg.mega:
             from .kernels._environment import num_sms_per_device
             from .kernels.inference_config import _blockscaled_inference_config
 
@@ -1883,7 +2022,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             )
             compute = replace(compute, config=config)
         blockscaled_dispatch = compute.uses_blockscaled_dispatch(
-            inference_mode=inference_mode
+            inference_mode=fprop_inference_mode
         )
         ctx.config = config
         ctx.blockscaled_cfg = blockscaled_cfg
@@ -1894,10 +2033,13 @@ class _BlockScaledAutograd(torch.autograd.Function):
         ctx.wgrad_destination_fn = wgrad_destination_fn
         ctx.inference_mode = inference_mode
         ctx.wgrad_postprocess_fn = wgrad_postprocess_fn
-        ctx.recompute_dynamic_weight_quants = _recompute_dynamic_mega_weight_quants(
-            compute,
-            inference_mode=inference_mode,
-            weights_preprocess_fn=weights_preprocess_fn,
+        ctx.recompute_dynamic_weight_quants = (
+            save_dequantized_activations
+            or _recompute_dynamic_mega_weight_quants(
+                compute,
+                inference_mode=inference_mode,
+                weights_preprocess_fn=weights_preprocess_fn,
+            )
         )
         # When weights are 2D, view to 3D for computation.
         # Store original shapes to reshape gradients back in backward.
@@ -1924,7 +2066,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         w13_handle = _prepare_weight_handle(
             w13_compute_EFD,
             compute,
-            inference_mode=inference_mode,
+            inference_mode=fprop_inference_mode,
             prequantized=BlockscaledWeightSpec(
                 w_native=w13_compute_EFD,
                 w_q_fprop=w13_q_fprop,
@@ -1938,7 +2080,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         w2_handle = _prepare_weight_handle(
             w2_compute_EDF,
             compute,
-            inference_mode=inference_mode,
+            inference_mode=fprop_inference_mode,
             prequantized=BlockscaledWeightSpec(
                 w_native=w2_compute_EDF,
                 w_q_fprop=w2_q_fprop,
@@ -1971,7 +2113,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         with record_function("moe_preprocess"):
             assert x_TD.ndim == 2
             dispatch_stride_bytes = None
-            if inference_mode or blockscaled_dispatch:
+            if fprop_inference_mode or blockscaled_dispatch:
                 copy_routing(
                     expert_ids=topk_expert_ids_TK,
                     routing=local_routing_buffer,
@@ -2006,7 +2148,10 @@ class _BlockScaledAutograd(torch.autograd.Function):
         # 3. Planning, routing, and grouped GEMM share one topology-capped
         # receive capacity; no host decision depends on the routed row count.
         hidden_dim = x_TD.shape[1]
-        routing_m_multiple = _routing_m_multiple(compute, inference_mode=inference_mode)
+        routing_m_multiple = _routing_m_multiple(
+            compute,
+            inference_mode=fprop_inference_mode,
+        )
         routing_world_size = dist.get_world_size(comm_group)
         local_expert_count = w13_compute_EFD.shape[0]
         scratch_imbalance_factor = (
@@ -2052,10 +2197,10 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 dispatch_stride_bytes=dispatch_stride_bytes,
                 bwd_dispatch_stride_bytes=x_TD.shape[1] * x_TD.element_size(),
                 generate_bwd_gather_ptrs=save_for_backward,
-                use_low_latency=inference_mode,
+                use_low_latency=fprop_inference_mode,
                 max_num_recv_tokens=model_config.max_recv_tokens,
                 pointer_capacity_multiple_of=(
-                    128 if inference_mode and blockscaled_cfg.mega else 1
+                    128 if fprop_inference_mode and blockscaled_cfg.mega else 1
                 ),
             )
 
@@ -2113,6 +2258,16 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 activation_offset=forward_plan.x_offset,
                 condition=recompute_condition,
             )
+            if save_dequantized_activations:
+                _dequantize_gathered_nvfp4_activation_to_buffer(
+                    dispatch_fwd_gather_ptrs,
+                    num_recv_tokens,
+                    activation_buffer.buffer,
+                    forward_plan.x_gathered_offset,
+                    recompute_condition,
+                    hidden_dim,
+                    True,
+                )
 
         # 5. Execute either the staged or Mega fused expert pipeline. Both
         # produce route-wise H3 before the common postprocessing boundary.
@@ -2127,7 +2282,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     )
                     blockscaled_forward_plan = forward_plan.blockscaled
                 capacity_rows = model_config.max_recv_tokens
-                if inference_mode and blockscaled_cfg.mega:
+                if fprop_inference_mode and blockscaled_cfg.mega:
                     # Descriptor/tile allocation is 128-aligned; routing's
                     # logical padded-row overflow bound remains unchanged.
                     capacity_rows = (capacity_rows + 127) // 128 * 128
@@ -2196,7 +2351,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     )
                     gemm_m_multiple = (
                         _inference_routing_multiple(config, mega=False)
-                        if inference_mode and config is not None
+                        if fprop_inference_mode and config is not None
                         else dist_bs_gemm.DEFAULT_M_MULTIPLE_OF
                     )
                     dist_blockscaled_grouped_gemm_fprop_dispatch(
@@ -3515,6 +3670,7 @@ def _forward_weight_state(
     saved: tuple[torch.Tensor | None, ...],
     start: int,
     supplied: bool,
+    regenerated: bool,
     reference: torch.Tensor,
     format: BlockScaledFormat,
 ) -> tuple[torch.Tensor, ...]:
@@ -3524,13 +3680,14 @@ def _forward_weight_state(
         saved: Flattened private weight state.
         start: Starting index for this weight.
         supplied: Whether the caller supplied prepared operands.
+        regenerated: Whether backward will recreate dynamic operands.
         reference: Tensor supplying device placement for empty state.
         format: Active block-scaled format.
 
     Returns:
         Five graph-owned weight-state tensors.
     """
-    if supplied:
+    if supplied or regenerated:
         return tuple(
             _empty_private_state(reference) for _ in range(_SAVED_WEIGHT_STATE_COUNT)
         )
@@ -3556,6 +3713,7 @@ def _forward_weight_state(
 def _fake_weight_state(
     weight: torch.Tensor,
     supplied: bool,
+    regenerated: bool,
     format: BlockScaledFormat,
 ) -> tuple[torch.Tensor, ...]:
     """Describe dynamic weight operands without reading data.
@@ -3563,12 +3721,13 @@ def _fake_weight_state(
     Args:
         weight: Native grouped weight defining shape and device.
         supplied: Whether the caller supplied prepared operands.
+        regenerated: Whether backward will recreate dynamic operands.
         format: Active block-scaled format.
 
     Returns:
         Five FakeTensor-compatible weight-state tensors.
     """
-    if supplied:
+    if supplied or regenerated:
         return tuple(
             _empty_private_state(weight) for _ in range(_SAVED_WEIGHT_STATE_COUNT)
         )
@@ -3641,6 +3800,7 @@ def _pack_block_scaled_backward_state(
             saved,
             _W13_SAVED_WEIGHT_START,
             prepared_weights,
+            format is BlockScaledFormat.NVFP4,
             reference,
             format,
         ),
@@ -3648,6 +3808,7 @@ def _pack_block_scaled_backward_state(
             saved,
             _W2_SAVED_WEIGHT_START,
             prepared_weights,
+            format is BlockScaledFormat.NVFP4,
             reference,
             format,
         ),
@@ -3721,8 +3882,18 @@ def _block_scaled_forward_metadata(
     w13_qdata, *_ = prepared[:_PREPARED_WEIGHT_OPERAND_COUNT]
     w2_qdata, *_ = prepared[_PREPARED_WEIGHT_OPERAND_COUNT:]
     weights = (
-        *_fake_weight_state(w13_EFD, w13_qdata is not None, kernel_format),
-        *_fake_weight_state(w2_EDF, w2_qdata is not None, kernel_format),
+        *_fake_weight_state(
+            w13_EFD,
+            w13_qdata is not None,
+            kernel_format is BlockScaledFormat.NVFP4,
+            kernel_format,
+        ),
+        *_fake_weight_state(
+            w2_EDF,
+            w2_qdata is not None,
+            kernel_format is BlockScaledFormat.NVFP4,
+            kernel_format,
+        ),
     )
     routing = (
         integer((local_experts,), dtype=torch.int32),
@@ -3790,6 +3961,9 @@ def _run_async_forward(
     activation_buffer = context.activation_buffer
     assert activation_buffer is not None
     blockscaled_cfg, config = _blockscaled_compute_config(context)
+    save_dequantized_activations = (
+        save_for_backward and blockscaled_cfg.format is BlockScaledFormat.NVFP4
+    )
     if interleaved_fc13 and (
         not context.config.inference or not blockscaled_cfg.mega or save_for_backward
     ):
@@ -3797,6 +3971,11 @@ def _run_async_forward(
     blockscaled_cfg = replace(
         blockscaled_cfg,
         interleaved_fc13=interleaved_fc13,
+        save_dequantized_activations=save_dequantized_activations,
+        static_inference_storage=(
+            blockscaled_cfg.static_inference_storage
+            and not save_dequantized_activations
+        ),
         routing_capacity=(
             context.memory_plan.total_scratch_capacity_rows
             if context.config.inference and context.memory_plan is not None
@@ -3851,7 +4030,7 @@ def _run_async_forward(
         inplace_wgrad_accum=False,
         wgrad_parameter_refs=None,
         wgrad_output_dtype=context.config.wgrad_dtype,
-        inference_mode=context.config.inference,
+        inference_mode=context.config.inference and not save_dequantized_activations,
         save_for_backward=save_for_backward,
         activation=context.config.activation,
         swiglu_alpha=context.config.swiglu_alpha,
@@ -3890,7 +4069,7 @@ def _block_scaled_forward_op(
     context_id: str,
     interleaved_fc13: bool = False,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Run async MXFP8 forward and expose fixed-shape backward metadata.
+    """Run an async block-scaled forward and expose fixed-shape backward metadata.
 
     Args:
         x_TD: Local BF16 activations with shape ``[T, D]``.

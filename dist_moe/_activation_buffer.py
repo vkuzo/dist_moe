@@ -1230,6 +1230,10 @@ class ModelConfig:
     # persistent -- row instead of column -- and makes the backward's working set
     # dense, so both halves of the plan change shape. Block-scaled planning only.
     native_backward: bool = False
+    # Persist dense dequantized forward operands for a future BF16 backward
+    # while retaining block-scaled row scratch for the forward GEMMs. Unlike
+    # native_backward, no quantized activation bundle survives the forward.
+    save_dequantized_activations: bool = False
     # Interleaved FC13 consumes its epilogue output directly and therefore does
     # not materialize dense h1. This inference-only layout requires Mega.
     interleaved_fc13: bool = False
@@ -1250,6 +1254,16 @@ class ModelConfig:
             raise ValueError(
                 "interleaved_fc13 requires block-scaled storage and mega=True"
             )
+        if self.save_dequantized_activations and storage is None:
+            raise ValueError(
+                "save_dequantized_activations requires block-scaled storage"
+            )
+        if self.save_dequantized_activations and self.native_backward:
+            raise ValueError(
+                "save_dequantized_activations and native_backward are mutually exclusive"
+            )
+        if self.save_dequantized_activations and self.interleaved_fc13:
+            raise ValueError("saved dequantized activations require materialized H1")
         if storage is None:
             return
         self._validate_blockscaled_storage(storage)
@@ -1326,6 +1340,11 @@ class ModelConfig:
         Returns:
             Memory size in bytes with 128-byte alignment.
         """
+        if self.save_dequantized_activations:
+            return self._dequantized_blockscaled_fwd_act_mem_size(
+                num_recv_tokens,
+                recompute,
+            )
         if self.blockscaled_storage is not None:
             return self._blockscaled_fwd_act_mem_size(num_recv_tokens, recompute)
 
@@ -1372,6 +1391,11 @@ class ModelConfig:
         Returns:
             Memory size in bytes with 128-byte alignment.
         """
+        if self.save_dequantized_activations:
+            return self._dequantized_blockscaled_bwd_act_mem_size(
+                num_recv_tokens,
+                recompute,
+            )
         if self.blockscaled_storage is not None:
             return self._blockscaled_bwd_act_mem_size(num_recv_tokens, recompute)
 
@@ -1434,7 +1458,9 @@ class ModelConfig:
                     self.num_tokens * self.hidden_dim * self.element_size
                 )
             return x_size
-        elif self.blockscaled_storage is not None:
+        elif self.blockscaled_storage is not None and not (
+            self.save_dequantized_activations
+        ):
             return self._blockscaled_no_recompute_saved_size(num_recv_tokens)
         else:
             # x_gathered + h1 + h3_saved
@@ -1595,6 +1621,76 @@ class ModelConfig:
         # No recompute: the x_gathered column bundle, dense h1, h2 column bundle,
         # and dense h3 persist; the row slot is the only extra scratch cost.
         return self.saved_act_mem_size(num_recv_tokens, False) + row_scratch
+
+    def _dequantized_blockscaled_fwd_act_mem_size(
+        self,
+        num_recv_tokens: int,
+        recompute: bool,
+    ) -> int:
+        """Peak forward bytes for dense saved state plus block-scaled scratch.
+
+        Args:
+            num_recv_tokens: Capacity-padded received rows.
+            recompute: Whether only the local dense input persists.
+
+        Returns:
+            Persistent activation bytes plus transient NVFP4 row operands.
+        """
+        row_scratch = self._blockscaled_fwd_row_scratch_size(num_recv_tokens)
+        h1_size = _align_bytes(
+            num_recv_tokens * 2 * self.intermediate_dim * self.element_size
+        )
+        if recompute:
+            return (
+                self.saved_act_mem_size(num_recv_tokens, True) + h1_size + row_scratch
+            )
+        return self.saved_act_mem_size(num_recv_tokens, False) + row_scratch
+
+    def _dequantized_blockscaled_bwd_act_mem_size(
+        self,
+        num_recv_tokens: int,
+        recompute: bool,
+    ) -> int:
+        """Conservatively reserve the future dense-backward working set.
+
+        The backward implementation lands in a later change. Reserving its
+        BF16 gradient workspace now keeps the forward planner's shared scratch
+        boundary stable when that consumer is connected.
+
+        Args:
+            num_recv_tokens: Capacity-padded received rows.
+            recompute: Whether the NVFP4 forward operands must be recreated.
+
+        Returns:
+            Dense BF16 backward bytes plus recompute-only row scratch.
+        """
+        grad_h1_size = _align_bytes(
+            num_recv_tokens * 2 * self.intermediate_dim * self.element_size
+        )
+        grad_h2_size = _align_bytes(
+            num_recv_tokens * self.intermediate_dim * self.element_size
+        )
+        grad_h3_size = _align_bytes(
+            num_recv_tokens * self.hidden_dim * self.element_size
+        )
+        gradient_scratch = grad_h1_size + grad_h2_size
+        if self.hidden_dim > self.intermediate_dim:
+            gradient_scratch += grad_h3_size
+        if not recompute:
+            return gradient_scratch
+
+        x_gathered_size = _align_bytes(
+            num_recv_tokens * self.hidden_dim * self.element_size
+        )
+        h1_size = _align_bytes(
+            num_recv_tokens * 2 * self.intermediate_dim * self.element_size
+        )
+        return (
+            gradient_scratch
+            + x_gathered_size
+            + h1_size
+            + self._blockscaled_fwd_row_scratch_size(num_recv_tokens)
+        )
 
     def _blockscaled_bwd_act_mem_size(
         self, num_recv_tokens: int, recompute: bool
@@ -2186,6 +2282,7 @@ def _get_blockscaled_forward_plan(
         inference_mode=inference_mode,
         scratch_only=scratch_only,
         native_backward=model_config.native_backward,
+        save_dequantized_activations=model_config.save_dequantized_activations,
         interleaved_fc13=model_config.interleaved_fc13,
     )
     # Unpack in the same order the kernel stores into fwd_offsets_ptr.
