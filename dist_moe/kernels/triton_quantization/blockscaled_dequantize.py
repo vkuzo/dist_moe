@@ -149,6 +149,68 @@ def _dequantize_nvfp4_kernel(
     )
 
 
+@triton.jit
+def _dequantize_nvfp4_gather_kernel(
+    gather_ptrs,
+    num_rows_ptr,
+    output_buffer_ptr,
+    output_offset_ptr,
+    condition_ptr,
+    n_cols,
+    EXECUTE_WHEN_ZERO: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    condition = tl.load(condition_ptr, eviction_policy="evict_last")
+    should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
+    if not should_execute:
+        return
+
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    num_rows = tl.load(num_rows_ptr, eviction_policy="evict_last")
+    valid_col = cols < n_cols
+    valid_row = row < num_rows
+    row_address = tl.load(gather_ptrs + row)
+    valid_source = valid_row & (row_address != 0)
+
+    packed_ptr = row_address.to(tl.pointer_type(tl.uint8))
+    packed = tl.load(
+        packed_ptr + cols // 2,
+        mask=valid_col & valid_source,
+        other=0,
+    )
+    code = tl.where((cols & 1) == 0, packed & 0xF, packed >> 4)
+    values = _decode_fp4_e2m1(code)
+
+    q_cols = n_cols // 2
+    scale_cols = n_cols // 16
+    scale_ptr = row_address.to(tl.pointer_type(tl.float8e4nv))
+    inner_scale = tl.load(
+        scale_ptr + q_cols + cols // 16,
+        mask=valid_col & valid_source,
+        other=0.0,
+    ).to(tl.float32)
+    global_scale_inv_ptr = (row_address + q_cols + scale_cols).to(
+        tl.pointer_type(tl.float32)
+    )
+    global_scale_inv = tl.load(
+        global_scale_inv_ptr,
+        mask=valid_source,
+        other=0.0,
+    ).to(tl.float32)
+
+    output_offset = tl.load(
+        output_offset_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    output = (output_buffer_ptr + output_offset).to(tl.pointer_type(tl.bfloat16))
+    tl.store(
+        output + row.to(tl.int64) * n_cols + cols.to(tl.int64),
+        values * inner_scale * global_scale_inv,
+        mask=valid_col & valid_row,
+    )
+
+
 def dequantize_nvfp4(
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -272,6 +334,43 @@ def dequantize_nvfp4_to_activation_buffer(
         OUTER_SCALE_PER_ROW=True,
         WRITE_ACTIVATION_BUFFER=True,
         HAS_CONDITION=True,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=4,
+    )
+
+
+def dequantize_gathered_nvfp4_to_activation_buffer(
+    gather_ptrs: torch.Tensor,
+    num_rows: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    activation_offset: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    n_cols: int,
+    execute_when_zero: bool,
+) -> None:
+    """Dequantize peer-addressed packed rows into planner-owned BF16 storage.
+
+    Args:
+        gather_ptrs: Capacity-sized table of packed symmetric-memory row addresses.
+        num_rows: Device scalar containing the valid padded-row count.
+        activation_buffer: Planner-owned one-dimensional byte storage.
+        activation_offset: One-element device byte offset for the destination.
+        condition: One-element device predicate.
+        n_cols: Logical BF16 feature width.
+        execute_when_zero: Whether a zero predicate selects this operation.
+    """
+    if gather_ptrs.numel() == 0 or n_cols == 0:
+        return
+    grid = (gather_ptrs.numel(), triton.cdiv(n_cols, _BLOCK_SIZE))
+    _dequantize_nvfp4_gather_kernel[grid](
+        gather_ptrs,
+        num_rows,
+        activation_buffer,
+        activation_offset,
+        condition,
+        n_cols,
+        EXECUTE_WHEN_ZERO=execute_when_zero,
         BLOCK_SIZE=_BLOCK_SIZE,
         num_warps=4,
     )

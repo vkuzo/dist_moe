@@ -15,6 +15,10 @@ Q(A) packed NVFP4
 A_bw = DQ(Q(A))
 ```
 
+Implementation status: the target forward state producer is now implemented
+behind the private registered-operation boundary. The public NVFP4 API remains
+inference-only, and the target backward remains future work.
+
 ## Forward
 
 ```text

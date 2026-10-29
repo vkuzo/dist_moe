@@ -323,6 +323,7 @@ def _triton_get_blockscaled_forward_plan(
     inference_mode: tl.constexpr,
     scratch_only: tl.constexpr,
     native_backward: tl.constexpr,
+    save_dequantized_activations: tl.constexpr,
     interleaved_fc13: tl.constexpr,
 ):
     """Compute the block-scaled forward plan: offsets + recompute decision.
@@ -365,6 +366,13 @@ def _triton_get_blockscaled_forward_plan(
 
       no-recompute  slot [x_row | h1 | h2_row | h3];  scratch []
       recompute     slot [x packed]; scratch [row scratch | h1]
+
+    With save_dequantized_activations, the forward keeps only the dense BF16
+    values a future BF16 backward will consume. Quantized operands remain
+    transient row scratch:
+
+      no-recompute  slot [x_bw | h1 | h3]; scratch [row scratch]
+      recompute     slot [x dense];        scratch [row scratch | h1]
     """
     rank_offsets = tl.arange(0, EP)
     rank_counts = tl.load(num_recv_tokens_per_rank_ptr + rank_offsets).to(tl.int64)
@@ -374,6 +382,7 @@ def _triton_get_blockscaled_forward_plan(
     padded_rows = tl.load(num_recv_tokens_ptr).to(tl.int64)
     tl.device_assert(padded_rows <= capacity_rows, "padded receive capacity exceeded")
     rows = padded_rows
+    x_gathered_size = _tl_align(rows * hidden_dim * element_size)
     h1_size = _tl_align(rows * 2 * intermediate_dim * element_size)  # h1 dense
     x_row_q_size, x_row_scale_size = _tl_row_quant_sizes(
         rows,
@@ -480,20 +489,27 @@ def _triton_get_blockscaled_forward_plan(
         else:
             x_mem_size = _tl_align(num_tokens * hidden_dim * element_size)
         h3_mem_size = _tl_align(num_tokens * topk * hidden_dim * element_size)
-        no_recompute_alloc_per_rank = _tl_blockscaled_no_recompute_alloc_per_rank(
-            rank_counts,
-            h3_mem_size,
-            hidden_dim,
-            intermediate_dim,
-            element_size,
-            operand_element_size,
-            operand_values_per_storage_element,
-            scale_element_size,
-            row_scale_storage_multiple,
-            row_global_scale_element_size,
-            sf_vec_size,
-            native_backward,
-        )
+        if save_dequantized_activations:
+            x_gathered_per_rank = _tl_align(rank_counts * hidden_dim * element_size)
+            h1_per_rank = _tl_align(rank_counts * 2 * intermediate_dim * element_size)
+            no_recompute_alloc_per_rank = (
+                x_gathered_per_rank + h1_per_rank + h3_mem_size
+            )
+        else:
+            no_recompute_alloc_per_rank = _tl_blockscaled_no_recompute_alloc_per_rank(
+                rank_counts,
+                h3_mem_size,
+                hidden_dim,
+                intermediate_dim,
+                element_size,
+                operand_element_size,
+                operand_values_per_storage_element,
+                scale_element_size,
+                row_scale_storage_multiple,
+                row_global_scale_element_size,
+                sf_vec_size,
+                native_backward,
+            )
         # Look-ahead recompute decision: recompute if saving full activations
         # this layer (no_recompute_alloc_per_rank, worst rank) plus the saved input for
         # every remaining layer would overflow the selected slot.
@@ -511,6 +527,15 @@ def _triton_get_blockscaled_forward_plan(
             new_free_start = x_offset + x_mem_size
             h3_offset = zero
             h1_offset = row_slot_offset - h1_size
+            scratch_bottom = h1_offset
+        elif need_recompute and save_dequantized_activations:
+            # Save local BF16 X only. H1 remains transient because the current
+            # forward's second GEMM still consumes it.
+            x_offset = free_start
+            new_free_start = x_offset + x_mem_size
+            x_gathered_offset = zero
+            h1_offset = row_slot_offset - h1_size
+            h3_offset = zero
             scratch_bottom = h1_offset
         elif need_recompute:
             # Save only dense x in the slot. The col bundles + h1 are transient
@@ -534,6 +559,15 @@ def _triton_get_blockscaled_forward_plan(
             new_free_start = h3_offset + h3_mem_size
             x_offset = zero
             scratch_bottom = scratch_end
+        elif save_dequantized_activations:
+            # Persist exactly the dense operands consumed by the future BF16
+            # backward. Q(X) and Q(H2) remain in the shared row scratch.
+            x_gathered_offset = free_start
+            h1_offset = x_gathered_offset + x_gathered_size
+            h3_offset = h1_offset + h1_size
+            new_free_start = h3_offset + h3_mem_size
+            x_offset = zero
+            scratch_bottom = row_slot_offset
         else:
             # Save the operands backward needs, ascending from free_start in the
             # order: x_col (x_gathered, FC13 WGRAD), h1 (dense), h2_col (h2, FC2
@@ -576,7 +610,7 @@ def _triton_get_blockscaled_forward_plan(
         tl.minimum(scratch_peak, scratch_free),
     )
 
-    if native_backward:
+    if native_backward or save_dequantized_activations:
         x_col_offset = x_row_offset
         h2_col_offset = h2_row_offset
     tl.store(need_recompute_ptr, need_recompute)

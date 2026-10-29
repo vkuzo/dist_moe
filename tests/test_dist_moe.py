@@ -249,6 +249,19 @@ def _nvfp4_fake_quant(
     return _NVFP4FakeQuantSTE.apply(tensor, outer_scale)
 
 
+def _dist_moe_nvfp4_activation_qdq(tensor: torch.Tensor) -> torch.Tensor:
+    """Run Dist-MoE's exact per-token NVFP4 quantize-dequantize pair."""
+    qdata, scale, global_scale_inv = blockscaled_impl._quantize_nvfp4_per_token(
+        tensor,
+        layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
+    )
+    return blockscaled_impl._dequantize_nvfp4_activation(
+        qdata,
+        scale,
+        global_scale_inv,
+    )
+
+
 def _reference_moe(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -346,6 +359,7 @@ def _reference_moe_nvfp4_fake_quant(
     situ_glu: bool = False,
     situ_glu_beta: float = 4.0,
     situ_glu_linear_beta: float = 25.0,
+    saved_activations: dict[str, Any] | None = None,
 ) -> torch.Tensor:
     """Evaluate a routed MoE with NVFP4 fake quantization at FPROP boundaries.
 
@@ -362,6 +376,8 @@ def _reference_moe_nvfp4_fake_quant(
         situ_glu: Whether to apply the SiTU-GLU formula.
         situ_glu_beta: Gate tanh bound for SiTU-GLU.
         situ_glu_linear_beta: Up-projection tanh bound for SiTU-GLU.
+        saved_activations: Optional output dictionary populated with
+            expert-grouped ``x_bw`` and ``h1`` rows plus route-ordered ``h3``.
 
     Returns:
         Fake-quantized reference output with shape ``[T, D]``.
@@ -374,17 +390,22 @@ def _reference_moe_nvfp4_fake_quant(
     w2 = torch.stack(tuple(_nvfp4_fake_quant(expert, per_token=False) for expert in w2))
 
     outputs = []
+    x_bw_by_expert: list[list[torch.Tensor]] = [[] for _ in range(w13.shape[0])]
+    h1_by_expert: list[list[torch.Tensor]] = [[] for _ in range(w13.shape[0])]
+    route_h3: list[torch.Tensor] = []
     intermediate_dim = w2.shape[2]
     for token_index in range(x.shape[0]):
         token_outputs = []
         for slot in range(topk_ids.shape[1]):
             expert = int(topk_ids[token_index, slot])
             if expert < 0:
-                token_outputs.append(
-                    torch.zeros_like(x[token_index], dtype=output_dtype)
-                )
+                h3 = torch.zeros_like(x[token_index], dtype=output_dtype)
+                token_outputs.append(h3)
+                route_h3.append(h3)
                 continue
             h13 = F.linear(x[token_index], w13[expert]).to(output_dtype)
+            x_bw_by_expert[expert].append(x[token_index].to(output_dtype))
+            h1_by_expert[expert].append(h13)
             gate, up = h13.split(intermediate_dim)
             gate_f32, up_f32 = gate.float(), up.float()
             if clamped:
@@ -413,7 +434,9 @@ def _reference_moe_nvfp4_fake_quant(
             else:
                 h2 = (gate_f32 * torch.sigmoid(gate_f32) * up_f32).to(output_dtype)
             h2 = _nvfp4_fake_quant(h2.unsqueeze(0), per_token=True).squeeze(0)
-            token_outputs.append(F.linear(h2, w2[expert]).to(output_dtype))
+            h3 = F.linear(h2, w2[expert]).to(output_dtype)
+            token_outputs.append(h3)
+            route_h3.append(h3)
         stacked = torch.stack(token_outputs)
         if experts_output_postprocess is not None:
             stacked = experts_output_postprocess(stacked)
@@ -422,7 +445,111 @@ def _reference_moe_nvfp4_fake_quant(
                 output_dtype
             )
         )
+    if saved_activations is not None:
+        empty_x = x.new_empty((0, x.shape[-1]), dtype=output_dtype)
+        empty_h1 = x.new_empty((0, 2 * intermediate_dim), dtype=output_dtype)
+        saved_activations.update(
+            x_bw_by_expert=tuple(
+                torch.stack(rows) if rows else empty_x for rows in x_bw_by_expert
+            ),
+            h1_by_expert=tuple(
+                torch.stack(rows) if rows else empty_h1 for rows in h1_by_expert
+            ),
+            h3=torch.stack(route_h3).view(
+                x.shape[0],
+                topk_ids.shape[1],
+                x.shape[1],
+            ),
+        )
     return torch.stack(outputs)
+
+
+def _install_nvfp4_forward_activation_buffer(
+    context: dist_moe.Context,
+    *,
+    force_recompute: bool,
+) -> ActivationBuffer:
+    """Replace inference scratch with the internal forward-saving layout.
+
+    Args:
+        context: Public inference context supplying communication buffers and
+            static NVFP4 policy.
+        force_recompute: Whether to reserve only mandatory local-input state.
+
+    Returns:
+        Training-layout activation buffer installed on ``context``.
+    """
+    old_buffer = context.activation_buffer
+    assert old_buffer is not None
+    blockscaled_cfg, _ = blockscaled_impl._blockscaled_compute_config(context)
+    blockscaled_cfg = dataclasses.replace(
+        blockscaled_cfg,
+        save_dequantized_activations=True,
+        static_inference_storage=False,
+    )
+    world_size = dist.get_world_size(context.group)
+    num_local_experts = context.config.num_experts // world_size
+    model_config = blockscaled_impl._async_model_config(
+        dtype=torch.bfloat16,
+        hidden_dim=context.config.hidden_dim,
+        intermediate_dim=context.config.intermediate_dim,
+        num_tokens=context.config.max_num_local_input_tokens,
+        topk=context.top_k,
+        max_imbalance_factor=context.config.device_scratch_capacity_factor,
+        num_moe_layers=context.config.max_moe_layers_per_activation_slot,
+        num_local_experts=num_local_experts,
+        routing_world_size=world_size,
+        routing_m_multiple=blockscaled_impl.dist_bs_gemm.DEFAULT_M_MULTIPLE_OF,
+        max_num_recv_tokens=None,
+        blockscaled_cfg=blockscaled_cfg,
+    )
+    total_bytes = (
+        model_config.min_buffer_size(num_activation_slots=1)
+        if force_recompute
+        else model_config.max_buffer_size(num_activation_slots=1)
+    )
+    activation_buffer = ActivationBuffer.create(
+        total_size_in_bytes=total_bytes,
+        ep_size=world_size,
+        device=old_buffer.buffer.device,
+        scratch_mem_size_in_bytes=model_config.scratch_mem_size,
+        num_activation_slots=1,
+        num_moe_layers=context.config.max_moe_layers_per_activation_slot,
+    )
+    activation_buffer.model_config = model_config
+    activation_buffer.scratch_capacity_factor = (
+        context.config.device_scratch_capacity_factor
+    )
+    context.activation_buffer = activation_buffer
+    return activation_buffer
+
+
+def _run_nvfp4_forward_with_saved_activations(
+    context: dist_moe.Context,
+    x_TD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
+    topk_scores_TK: torch.Tensor,
+    w13_EFD: torch.Tensor,
+    w2_EDF: torch.Tensor,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Run the internal NVFP4 forward-state producer without attaching backward."""
+    activation_buffer = context.activation_buffer
+    assert activation_buffer is not None
+    return blockscaled_impl._block_scaled_forward_op(
+        x_TD,
+        topk_expert_ids_TK,
+        topk_scores_TK,
+        w13_EFD,
+        w2_EDF,
+        [None] * blockscaled_impl._PREPARED_WEIGHT_PAIR_COUNT,
+        *_registered_rmsnorm_args(None),
+        activation_buffer.activation_slot_id_1,
+        activation_buffer._num_moe_layers_in_selected_slot,
+        True,
+        False,
+        context.context_id,
+        False,
+    )
 
 
 def _reference_swiglu_clip_stats(
@@ -3488,6 +3615,364 @@ class DistMoeKernelTest(unittest.TestCase):
                     )
                 torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
 
+    def test_nvfp4_forward_saves_reference_backward_activations(self) -> None:
+        """Save dense Q-DQ inputs and real GEMM boundaries for future backward.
+
+        Staged and Mega must preserve their current output bitwise. The saved
+        ``X_bw``, ``H1``, and ``H3`` are compared with the fake-quantized
+        reference at tight bounds; its gold quantizer can make different
+        boundary choices, and it uses ``F.linear`` rather than real NVFP4
+        tensor-core MMA. X_bw is also checked bitwise against Dist-MoE's
+        independent per-token Q-DQ primitive.
+        Guard bytes and empty weight-state slots prove that H2 and quantized
+        tensors do not persist in the activation slot or fixed state schema.
+        """
+        for pipeline in ("staged", "mega"):
+            with self.subTest(pipeline=pipeline):
+                policy = dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    pipeline=pipeline,
+                )
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    block_scaled=policy,
+                    num_tokens=128,
+                    num_experts=4,
+                )
+                x_TD, ids_TK, scores_TK = case_a
+                x_TD.mul_(0.1)
+                with torch.no_grad():
+                    inference_output_TD = dist_moe.routed_experts(
+                        x_TD,
+                        ids_TK,
+                        scores_TK,
+                        w13_EFD,
+                        w2_EDF,
+                        context,
+                    )
+                reference_state: dict[str, Any] = {}
+                _reference_moe_nvfp4_fake_quant(
+                    x_TD,
+                    ids_TK,
+                    scores_TK,
+                    w13_EFD,
+                    w2_EDF,
+                    saved_activations=reference_state,
+                )
+                dist_moe_x_bw_TD = _dist_moe_nvfp4_activation_qdq(x_TD)
+                dist_moe_x_bw_TKD = dist_moe_x_bw_TD[:, None, :].expand(
+                    -1,
+                    ids_TK.shape[1],
+                    -1,
+                )
+
+                activation_buffer = _install_nvfp4_forward_activation_buffer(
+                    context,
+                    force_recompute=False,
+                )
+                assert activation_buffer.model_config is not None
+                self.assertFalse(activation_buffer.model_config.native_backward)
+                activation_buffer.buffer.fill_(0xA5)
+                actual_TD, state = _run_nvfp4_forward_with_saved_activations(
+                    context,
+                    x_TD,
+                    ids_TK,
+                    scores_TK,
+                    w13_EFD,
+                    w2_EDF,
+                )
+                torch.cuda.synchronize()
+
+                torch.testing.assert_close(
+                    actual_TD,
+                    inference_output_TD,
+                    rtol=0,
+                    atol=0,
+                )
+                self.assertEqual(
+                    len(state), blockscaled_impl._BACKWARD_STATE_TENSOR_COUNT
+                )
+                self.assertTrue(all(tensor.numel() == 0 for tensor in state[:10]))
+                self.assertFalse(state[16].item())
+                offsets = state[17].tolist()
+                self.assertEqual(offsets[3], 0)
+                self.assertEqual(state[20].numel(), 0)
+                num_recv_tokens = int(state[15].item())
+                split_sizes = state[10].tolist()
+                x_bw_MD = (
+                    activation_buffer.buffer[
+                        offsets[1] : offsets[1]
+                        + num_recv_tokens * x_TD.shape[1] * torch.bfloat16.itemsize
+                    ]
+                    .view(torch.bfloat16)
+                    .view(num_recv_tokens, x_TD.shape[1])
+                )
+                h1_M2F = (
+                    activation_buffer.buffer[
+                        offsets[2] : offsets[2]
+                        + num_recv_tokens
+                        * 2
+                        * w2_EDF.shape[2]
+                        * torch.bfloat16.itemsize
+                    ]
+                    .view(torch.bfloat16)
+                    .view(num_recv_tokens, 2 * w2_EDF.shape[2])
+                )
+                h3_TKD = (
+                    activation_buffer.buffer[
+                        offsets[4] : offsets[4]
+                        + ids_TK.numel() * x_TD.shape[1] * torch.bfloat16.itemsize
+                    ]
+                    .view(torch.bfloat16)
+                    .view(
+                        x_TD.shape[0],
+                        ids_TK.shape[1],
+                        x_TD.shape[1],
+                    )
+                )
+
+                expected_x_by_expert = reference_state["x_bw_by_expert"]
+                expected_h1_by_expert = reference_state["h1_by_expert"]
+                cursor = 0
+                for expert, split_size in enumerate(split_sizes):
+                    active_rows = expected_x_by_expert[expert].shape[0]
+                    actual_x = x_bw_MD[cursor : cursor + active_rows]
+                    expected_x = expected_x_by_expert[expert]
+                    exact_x = dist_moe_x_bw_TKD[ids_TK == expert]
+                    self.assertTrue(
+                        torch.equal(
+                            actual_x.view(torch.uint16),
+                            exact_x.view(torch.uint16),
+                        )
+                    )
+                    self.assertLess(
+                        torch.max(torch.abs(actual_x - expected_x)).item(),
+                        3.5e-2,
+                    )
+                    self.assertLess(
+                        _relative_l2(actual_x, expected_x),
+                        1e-2,
+                    )
+                    self.assertGreater(
+                        _cosine_similarity(actual_x, expected_x),
+                        0.9999,
+                    )
+                    actual_h1 = h1_M2F[cursor : cursor + active_rows]
+                    expected_h1 = expected_h1_by_expert[expert]
+                    self.assertLess(
+                        _relative_l2(actual_h1, expected_h1),
+                        1.5e-2,
+                    )
+                    self.assertGreater(
+                        _cosine_similarity(actual_h1, expected_h1),
+                        0.9999,
+                    )
+                    self.assertEqual(
+                        torch.count_nonzero(
+                            x_bw_MD[cursor + active_rows : cursor + split_size]
+                        ).item(),
+                        0,
+                    )
+                    self.assertEqual(
+                        torch.count_nonzero(
+                            h1_M2F[cursor + active_rows : cursor + split_size]
+                        ).item(),
+                        0,
+                    )
+                    cursor += split_size
+                self.assertEqual(cursor, num_recv_tokens)
+                torch.testing.assert_close(
+                    h3_TKD,
+                    reference_state["h3"],
+                    rtol=2e-2,
+                    atol=2.5e-3,
+                )
+                self.assertLess(
+                    _relative_l2(h3_TKD, reference_state["h3"]),
+                    3e-2,
+                )
+                self.assertGreater(
+                    _cosine_similarity(h3_TKD, reference_state["h3"]),
+                    0.9995,
+                )
+
+                saved_end = int(activation_buffer.buffer_offsets[0].item())
+                expected_saved_end = (
+                    offsets[4]
+                    + ids_TK.numel() * x_TD.shape[1] * torch.bfloat16.itemsize
+                )
+                self.assertEqual(saved_end, expected_saved_end)
+                self.assertTrue(
+                    torch.all(
+                        activation_buffer.buffer[
+                            saved_end : activation_buffer.activation_slot_bytes
+                        ]
+                        == 0xA5
+                    ).item()
+                )
+
+    def test_nvfp4_forward_recompute_saves_only_local_input(self) -> None:
+        """Force recompute and retain only local BF16 X plus fixed metadata."""
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+        )
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            block_scaled=policy,
+            num_tokens=128,
+            num_experts=4,
+        )
+        x_TD, ids_TK, scores_TK = case_a
+        with torch.no_grad():
+            inference_output_TD = dist_moe.routed_experts(
+                x_TD,
+                ids_TK,
+                scores_TK,
+                w13_EFD,
+                w2_EDF,
+                context,
+            )
+
+        activation_buffer = _install_nvfp4_forward_activation_buffer(
+            context,
+            force_recompute=True,
+        )
+        activation_buffer.buffer.fill_(0xA5)
+        actual_TD, state = _run_nvfp4_forward_with_saved_activations(
+            context,
+            x_TD,
+            ids_TK,
+            scores_TK,
+            w13_EFD,
+            w2_EDF,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual_TD, inference_output_TD, rtol=0, atol=0)
+        self.assertTrue(state[16].item())
+        self.assertTrue(all(tensor.numel() == 0 for tensor in state[:10]))
+        offsets = state[17].tolist()
+        self.assertEqual(offsets[1], 0)
+        self.assertEqual(offsets[3], 0)
+        self.assertEqual(offsets[4], 0)
+        x_bytes = x_TD.numel() * torch.bfloat16.itemsize
+        saved_x_TD = (
+            activation_buffer.buffer[offsets[0] : offsets[0] + x_bytes]
+            .view(torch.bfloat16)
+            .view_as(x_TD)
+        )
+        torch.testing.assert_close(saved_x_TD, x_TD, rtol=0, atol=0)
+        self.assertEqual(int(activation_buffer.buffer_offsets[0].item()), x_bytes)
+        self.assertGreaterEqual(offsets[2], activation_buffer.activation_slot_bytes)
+        self.assertTrue(
+            torch.all(
+                activation_buffer.buffer[
+                    x_bytes : activation_buffer.activation_slot_bytes
+                ]
+                == 0xA5
+            ).item()
+        )
+        self.assertEqual(state[10].shape, (w13_EFD.shape[0],))
+        self.assertGreater(state[11].numel(), 0)
+        self.assertGreater(state[12].numel(), 0)
+        self.assertGreater(state[13].numel(), 0)
+        self.assertEqual(state[14].shape, (1,))
+        self.assertEqual(state[15].shape, (1,))
+        self.assertEqual(state[18].ndim, 1)
+        self.assertEqual(state[19].item(), 1)
+        self.assertEqual(state[20].numel(), 0)
+
+    def test_nvfp4_forward_saved_state_is_graph_visible(self) -> None:
+        """Preserve the fixed state schema in FakeTensor, make_fx, and capture."""
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+        )
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            block_scaled=policy,
+            num_tokens=128,
+            num_experts=4,
+        )
+        activation_buffer = _install_nvfp4_forward_activation_buffer(
+            context,
+            force_recompute=False,
+        )
+
+        with FakeTensorMode() as mode:
+            fake_x, fake_ids, fake_scores, fake_w13, fake_w2 = (
+                mode.from_tensor(tensor) for tensor in (*case_a, w13_EFD, w2_EDF)
+            )
+            fake_output, fake_state = blockscaled_impl._block_scaled_forward_op(
+                fake_x,
+                fake_ids,
+                fake_scores,
+                fake_w13,
+                fake_w2,
+                [None] * blockscaled_impl._PREPARED_WEIGHT_PAIR_COUNT,
+                *_registered_rmsnorm_args(None),
+                mode.from_tensor(activation_buffer.activation_slot_id_1),
+                1,
+                True,
+                False,
+                context.context_id,
+                False,
+            )
+        self.assertEqual(fake_output.shape, case_a[0].shape)
+        self.assertEqual(
+            len(fake_state),
+            blockscaled_impl._BACKWARD_STATE_TENSOR_COUNT,
+        )
+        self.assertTrue(all(tensor.numel() == 0 for tensor in fake_state[:10]))
+        self.assertEqual(fake_state[17].shape, (10,))
+
+        def run(
+            x_TD: torch.Tensor,
+            ids_TK: torch.Tensor,
+            scores_TK: torch.Tensor,
+        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            """Bind weights and context around the internal forward op."""
+            return _run_nvfp4_forward_with_saved_activations(
+                context,
+                x_TD,
+                ids_TK,
+                scores_TK,
+                w13_EFD,
+                w2_EDF,
+            )
+
+        traced = make_fx(run)(*case_a)
+        self.assertIn(
+            torch.ops.dist_moe.block_scaled_forward.default,
+            {node.target for node in traced.graph.nodes if node.op == "call_function"},
+        )
+        context.reset()
+        eager_output, eager_state = run(*case_a)
+        eager_output = eager_output.clone()
+        eager_need_recompute = eager_state[16].clone()
+        context.reset()
+        traced_output, traced_state = traced(*case_a)
+        torch.testing.assert_close(traced_output, eager_output, rtol=0, atol=0)
+        torch.testing.assert_close(
+            traced_state[16],
+            eager_need_recompute,
+            rtol=0,
+            atol=0,
+        )
+
+        context.reset()
+        run(*case_a)
+        context.reset()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output, captured_state = run(*case_a)
+        context.reset()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured_output, eager_output, rtol=0, atol=0)
+        torch.testing.assert_close(
+            captured_state[16],
+            eager_need_recompute,
+            rtol=0,
+            atol=0,
+        )
+
     def test_mxfp8_inference_cuda_graph_has_no_autograd_state(self) -> None:
         """Prepared no-grad calls never read storage-free logical weights.
 
@@ -6246,3 +6731,161 @@ class DistMoeTwoRankTest(unittest.TestCase):
             reference_moe=_reference_moe_nvfp4_fake_quant,
             fwd_tolerance_override=(0.01, 0.002, 0.025, 0.9997),
         )
+
+    @with_comms
+    def test_nvfp4_saved_x_bw_exercises_peer_gather_paths(self) -> None:
+        """Match saved Q-DQ rows gathered through real two-rank peer pointers.
+
+        Every local expert receives tokens from both ranks. Comparing the
+        expert-grouped activation slot with the fake-quantized global reference
+        proves that X_bw follows the routed row order and masks padding without
+        retaining the packed communication representation. A second,
+        Dist-MoE-native Q-DQ reference requires bitwise equality.
+        """
+        rank = dist.get_rank()
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        num_tokens, hidden_dim, intermediate_dim = 128, 256, 256
+        num_experts, top_k = 4, 2
+        num_local_experts = num_experts // self.world_size
+
+        global_token = rank * num_tokens + torch.arange(num_tokens, device=device)
+        first_expert = global_token % num_experts
+        ids_TK = torch.stack(
+            (
+                first_expert,
+                (first_expert + num_local_experts) % num_experts,
+            ),
+            dim=1,
+        ).to(torch.int64)
+        torch.manual_seed(1000 + rank)
+        x_TD = (
+            torch.randn(
+                num_tokens,
+                hidden_dim,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            * 0.1
+        )
+        scores_TK = torch.rand(num_tokens, top_k, device=device)
+        scores_TK /= scores_TK.sum(dim=1, keepdim=True)
+
+        torch.manual_seed(2027)
+        full_w13 = torch.randn(
+            num_experts,
+            2 * intermediate_dim,
+            hidden_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        full_w2 = torch.randn(
+            num_experts,
+            hidden_dim,
+            intermediate_dim,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        full_w13.mul_(hidden_dim**-0.5)
+        full_w2.mul_(intermediate_dim**-0.5)
+        expert_start = rank * num_local_experts
+        w13_EFD = full_w13[expert_start : expert_start + num_local_experts].clone()
+        w2_EDF = full_w2[expert_start : expert_start + num_local_experts].clone()
+
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+        )
+        context = dist_moe.create_context(
+            group=dist.group.WORLD,
+            config=dist_moe.Config(
+                max_num_local_input_tokens=num_tokens,
+                hidden_dim=hidden_dim,
+                intermediate_dim=intermediate_dim,
+                top_k=top_k,
+                num_experts=num_experts,
+                max_moe_layers_per_activation_slot=1,
+                block_scaled=policy,
+                inference=True,
+            ),
+            device=device,
+        )
+        try:
+            activation_buffer = _install_nvfp4_forward_activation_buffer(
+                context,
+                force_recompute=False,
+            )
+            _, state = _run_nvfp4_forward_with_saved_activations(
+                context,
+                x_TD,
+                ids_TK,
+                scores_TK,
+                w13_EFD,
+                w2_EDF,
+            )
+            torch.cuda.synchronize()
+            self.assertFalse(state[16].item())
+
+            global_x = _all_gather_cat(x_TD)
+            global_ids = _all_gather_cat(ids_TK)
+            global_scores = _all_gather_cat(scores_TK)
+            reference_state: dict[str, Any] = {}
+            _reference_moe_nvfp4_fake_quant(
+                global_x,
+                global_ids,
+                global_scores,
+                full_w13,
+                full_w2,
+                saved_activations=reference_state,
+            )
+            dist_moe_x_bw_TD = _dist_moe_nvfp4_activation_qdq(global_x)
+            dist_moe_x_bw_TKD = dist_moe_x_bw_TD[:, None, :].expand(
+                -1,
+                global_ids.shape[1],
+                -1,
+            )
+
+            offsets = state[17].tolist()
+            num_recv_tokens = int(state[15].item())
+            x_bw_MD = (
+                activation_buffer.buffer[
+                    offsets[1] : offsets[1]
+                    + num_recv_tokens * hidden_dim * torch.bfloat16.itemsize
+                ]
+                .view(torch.bfloat16)
+                .view(num_recv_tokens, hidden_dim)
+            )
+            split_sizes = state[10].tolist()
+            cursor = 0
+            for local_expert, split_size in enumerate(split_sizes):
+                global_expert = expert_start + local_expert
+                expected = reference_state["x_bw_by_expert"][global_expert]
+                actual = x_bw_MD[cursor : cursor + expected.shape[0]]
+                exact = dist_moe_x_bw_TKD[global_ids == global_expert]
+                self.assertTrue(
+                    torch.equal(
+                        actual.view(torch.uint16),
+                        exact.view(torch.uint16),
+                    )
+                )
+                self.assertLess(
+                    torch.max(torch.abs(actual - expected)).item(),
+                    6e-2,
+                )
+                self.assertLess(
+                    _relative_l2(actual, expected),
+                    1e-2,
+                )
+                self.assertGreater(
+                    _cosine_similarity(actual, expected),
+                    0.9999,
+                )
+                self.assertEqual(
+                    torch.count_nonzero(
+                        x_bw_MD[cursor + expected.shape[0] : cursor + split_size]
+                    ).item(),
+                    0,
+                )
+                cursor += split_size
+            self.assertEqual(cursor, num_recv_tokens)
+        finally:
+            context.close()
