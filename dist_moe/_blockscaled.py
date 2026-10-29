@@ -309,7 +309,6 @@ _FUSED_BLOCKSCALED_FORMAT_POLICIES: Mapping[
         BlockScaledFormat.MXFP8_E4M3: _DEFAULT_FUSED_BLOCKSCALED_FORMAT_POLICY,
         BlockScaledFormat.NVFP4: _FusedBlockscaledFormatPolicy(
             inference_only=True,
-            requires_prequantized_weights=True,
             requires_weight_global_scale=True,
             row_global_scale_element_size=4,
             input_dim_multiple=_NVFP4_DIM_MULTIPLE,
@@ -802,7 +801,7 @@ def _prepare_blockscaled_weight_impl(
     use_row_1d_quantization: bool = False,
     fuse_swiglu: bool = False,
 ) -> _BlockscaledWeight:
-    """Quantize one native MXFP8 weight for FPROP and DGRAD.
+    """Quantize one native block-scaled weight for FPROP and DGRAD.
 
     Args:
         w: Grouped native expert weight.
@@ -814,14 +813,25 @@ def _prepare_blockscaled_weight_impl(
 
     Returns:
         Prepared kernel operands.
-
-    Raises:
-        ValueError: If the format requires caller-owned preparation.
     """
     if cfg.policy.requires_prequantized_weights:
         raise ValueError(
             f"fused {cfg.format.value.upper()} requires pre-quantized weights "
             "with a per-expert global scale"
+        )
+    if cfg.format is BlockScaledFormat.NVFP4:
+        w_q_fprop, w_scale_fprop, _, w_global_scale_inv = (
+            _prepare_nvfp4_weight_operands(w)
+        )
+        # NVFP4 remains inference-only. Populate the otherwise-unused DGRAD
+        # slots so the shared weight handle retains one fixed tensor contract.
+        return _BlockscaledWeight(
+            w_native=w,
+            w_q_fprop=w_q_fprop,
+            w_scale_fprop=w_scale_fprop,
+            w_q_dgrad=w_q_fprop,
+            w_scale_dgrad=w_scale_fprop,
+            w_global_scale_inv=w_global_scale_inv,
         )
     _, _, sf_vec_size = block_scaled_format_constants(cfg.format)
     if use_row_1d_quantization or fuse_swiglu:

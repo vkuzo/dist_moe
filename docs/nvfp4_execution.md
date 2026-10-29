@@ -46,23 +46,21 @@ config = dist_moe.Config(
     inference=True,
 )
 context = dist_moe.create_context(group=ep_group, config=config)
-prepared_w13 = dist_moe.prepare_block_scaled_weight(
-    w13_E2FD.flatten(1, 2), policy, inference=True
-)
-prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy, inference=True)
 y_TD = dist_moe.routed_experts(
     x_TD,
     topk_expert_ids_TK,
     topk_scores_TK,
-    prepared_w13,
-    prepared_w2,
+    w13_E2FD.flatten(1, 2),
+    w2_EDF,
     context,
 )
 ```
 
 `D` and `F` must satisfy the NVFP4 alignment and maximum-dimension checks.
-Autograd is rejected. Weights must be prepared before execution, and prepared
-weights remain caller-owned for repeated eager calls or CUDA-graph replay.
+Autograd is rejected. Native BF16 weights are quantized inside every
+invocation, including every CUDA-graph replay. Callers can instead prepare
+weights explicitly; prepared weights remain caller-owned for repeated eager
+calls or replay and avoid that repeated quantization.
 Unlike MXFP8 evaluation, wrapping a training context in `torch.no_grad()` does
 not enable NVFP4: the format requires the static inference context because its
 routing, packed dispatch, weight contract, and memory layout are
@@ -92,13 +90,13 @@ rank 0 gathers packed A, C for E0 and packed B, D for E1
 
 There is no saved-state or reverse flow. The packed dispatch rows and local
 scratch may be overwritten after the invocation; only the returned BF16 token
-outputs and caller-owned prepared weights survive.
+outputs, native source weights, and any caller-owned prepared weights survive.
 
 <a id="prepare-weights"></a>
 ## Prepare weights
 
-`dist_moe.prepare_block_scaled_weight()` calls `_prepare_nvfp4_weight_operands()` for
-each grouped expert weight:
+Native BF16 execution and `dist_moe.prepare_block_scaled_weight()` both call
+`_prepare_nvfp4_weight_operands()` for each grouped expert weight:
 
 1. `nvfp4_weight_global_scale()` computes one FP32 global scale per expert.
 2. `expand_global_scale_for_rows()` creates the row-oriented scale input used
@@ -119,8 +117,10 @@ The resulting `dist_moe.PreparedWeight` owns:
 | `global_scale_inv` | FP32 `[E_local]` | Reciprocal consumed directly by FPROP kernels. |
 | `dgrad_data`, `dgrad_scale` | `None` | NVFP4 has no backward path. |
 
-Preparation is outside `dist_moe.routed_experts()`. Reusing the prepared object therefore
-does not requantize weights during each invocation or CUDA-graph replay.
+Explicit preparation is outside `dist_moe.routed_experts()`. Reusing the
+prepared object therefore does not requantize weights during each invocation
+or CUDA-graph replay. Passing BF16 weights performs the identical preparation
+inside the registered forward operation instead.
 Non-strict `make_fx` captures the same registered block-scaled forward without
 introducing autograd state.
 
@@ -194,9 +194,9 @@ local token results `A/B`; rank 1 performs the symmetric work for `C/D`.
 | 2 | `_ep_barrier` | dispatch and routing publication state | symmetric-memory signal state | device | no backward state | EP device barrier before peer reads |
 | 3 | `dist_dispatch_routing` | global top-k IDs and published row addresses | per-expert counts, gather pointers, scatter pointers | local HBM metadata referring to local or peer HBM | invocation-local only | no CPU synchronization |
 | 4 | scratch binding | received-row counts and static model geometry | static views for device-only Mega; GPU offsets for staged or VMM-configured inference | context-owned scratch | no backward state | planner-backed paths run `get_forward_plan`; device-only Mega skips that launch and the unused count clone |
-| 5a | staged distributed W13 GEMM | peer packed rows, prepared W13 qdata/scales/global inverse | W13 result and fused activation state at planner offsets | scratch; peer input remains in symmetric HBM | overwritten by the next invocation | kernel-internal producer/consumer ordering |
-| 5b | staged fused SwiGLU/W2/combine | staged activation, prepared W2 qdata/scales/global inverse, scatter pointers | combined expert output | local output plus peer symmetric combine stores | no recompute path exists | device barrier before peer combine consumption |
-| 5c | Mega fused forward | packed rows, both prepared weights, routing metadata, and static views or VMM scratch offsets | combined expert output | scratch and peer symmetric combine HBM | no backward state or recompute | fixed chunk-pipeline ordering and peer barrier |
+| 5a | staged distributed W13 GEMM | peer packed rows, dynamically or explicitly prepared W13 qdata/scales/global inverse | W13 result and fused activation state at planner offsets | scratch; peer input remains in symmetric HBM | overwritten by the next invocation | kernel-internal producer/consumer ordering |
+| 5b | staged fused SwiGLU/W2/combine | staged activation, dynamically or explicitly prepared W2 qdata/scales/global inverse, scatter pointers | combined expert output | local output plus peer symmetric combine stores | no recompute path exists | device barrier before peer combine consumption |
+| 5c | Mega fused forward | packed rows, both dynamically or explicitly prepared weights, routing metadata, and static views or VMM scratch offsets | combined expert output | scratch and peer symmetric combine HBM | no backward state or recompute | fixed chunk-pipeline ordering and peer barrier |
 | 6 | `_async_forward_postprocess` | combined rows and top-k scores | BF16 `y_TD` | local HBM | returned output only | no host synchronization |
 
 Only one of the staged pair or the Mega launch executes. Both consume the same
@@ -233,7 +233,7 @@ scratch planner and are overwritten by the next invocation after the required
 device ordering.
 
 The Mega path pipelines W13, SwiGLU, W2, and combine in one chunked forward
-launch. It uses the same arithmetic, prepared weights, peer pointers, and
+launch. It uses the same arithmetic, weight operands, peer pointers, and
 context-owned scratch but keeps intermediate tiles within the fused pipeline
 where possible. Device-only Mega uses static views; VMM-configured Mega keeps
 the device-offset plan and device tensor maps. The G8 offset-backed source path
@@ -247,11 +247,13 @@ result.
 <a id="capture-and-replay-cuda-graphs"></a>
 ## Capture and replay CUDA graphs
 
-The context, prepared weights, input tensors, routing tensors, output tensor,
+The context, input and weight tensors, routing tensors, output tensor,
 symmetric buffers, and scratch allocation must retain stable addresses across
-capture and replay. Device-side routing and planner-backed offsets can change
-values while their tensor shapes and launch topology remain fixed. Device-only
-Mega instead reuses static views with its captured automatic descriptor path.
+capture and replay. Prepared weights remain stable operands; native BF16
+weights are quantized again by the captured preparation launches on every
+replay. Device-side routing and planner-backed offsets can change values while
+their tensor shapes and launch topology remain fixed. Device-only Mega instead
+reuses static views with its captured automatic descriptor path.
 A replay may therefore
 use new activations and routing decisions without allocating a new dispatch
 row buffer or changing the captured kernel sequence.
@@ -263,8 +265,9 @@ Construction or invocation fails before kernel execution when:
 
 - `inference=False` is paired with NVFP4;
 - a dimension violates NVFP4 alignment or supported maxima;
-- either weight is not a prepared NVFP4 operand;
-- required global scales or reciprocal scales are absent or malformed;
+- a weight is neither native BF16 nor a prepared NVFP4 operand;
+- a prepared weight's required global scales or reciprocal scales are absent
+  or malformed;
 - input tokens exceed `max_num_local_input_tokens`; or
 - the selected scratch capacity cannot represent the configured receive bound.
 

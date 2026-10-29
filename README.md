@@ -36,10 +36,10 @@ graph-stable PyTorch operations needed to execute routed experts.
 All supported modes work with non-strict `make_fx`, CUDA graphs, and optional
 VMM host-backed scratch. Training modes include forward and backward.
 
-The package also supports prepared MXFP8 and NVFP4 weights, device-selected
-activation slots, plain and clamped SwiGLU, BF16 SiTU-GLU, fused post-expert
-RMSNorm, clip statistics, and optional in-place accumulation into standard
-`parameter.grad` buffers.
+The package also supports native BF16 or prepared NVFP4 inference weights,
+prepared MXFP8 weights, device-selected activation slots, plain and clamped
+SwiGLU, BF16 SiTU-GLU, fused post-expert RMSNorm, clip statistics, and optional
+in-place accumulation into standard `parameter.grad` buffers.
 
 <details>
 <summary>Not supported in this release</summary>
@@ -542,6 +542,9 @@ the exact saved-state contract.
 `dist_moe.prepare_block_scaled_weight()` creates caller-owned quantized data
 and scales. Prepared execution can use logical sources without readable
 storage; see [weight ownership and reuse](docs/mxfp8_execution.md#prepare-and-reuse-weights).
+NVFP4 inference also accepts native BF16 W13 and W2 weights and quantizes them
+during each invocation. Preparing NVFP4 weights explicitly avoids that
+repeated work and remains the reusable inference API.
 The complete
 [block-scaled inference example](examples/block_scaled_inference.py)
 prepares both expert weights before execution:

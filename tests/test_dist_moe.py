@@ -3105,6 +3105,47 @@ class DistMoeKernelTest(unittest.TestCase):
                             atol=0,
                         )
 
+    def test_nvfp4_bf16_weights_match_prepared_weights(self) -> None:
+        """Compare dynamic BF16 weights with explicit NVFP4 preparation.
+
+        Exact equality proves both inference pipelines consume identical
+        operands; prepared-weight reuse is covered separately.
+        """
+        for pipeline in ("staged", "mega"):
+            with self.subTest(pipeline=pipeline):
+                policy = dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    pipeline=pipeline,
+                )
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    block_scaled=policy,
+                    num_experts=64 if pipeline == "staged" else 4,
+                )
+                prepared_w13 = dist_moe.prepare_block_scaled_weight(
+                    w13_EFD,
+                    policy,
+                    inference=True,
+                )
+                prepared_w2 = dist_moe.prepare_block_scaled_weight(
+                    w2_EDF,
+                    policy,
+                    inference=True,
+                )
+                with torch.no_grad():
+                    expected_TD = dist_moe.routed_experts(
+                        *case_a,
+                        prepared_w13,
+                        prepared_w2,
+                        context,
+                    )
+                    actual_TD = dist_moe.routed_experts(
+                        *case_a,
+                        w13_EFD,
+                        w2_EDF,
+                        context,
+                    )
+                torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
+
     def test_mxfp8_inference_cuda_graph_has_no_autograd_state(self) -> None:
         """Prepared no-grad calls never read storage-free logical weights.
 
