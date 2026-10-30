@@ -2168,49 +2168,6 @@ class DistMoeKernelTest(unittest.TestCase):
             torch.ones((rows, 1), dtype=torch.float32, device="cuda"),
         )
         expected = (inner_dequantized * global_scale_inv_M[:, None]).to(torch.bfloat16)
-        output_bytes = expected.numel() * expected.element_size()
-        activation_offset = 32
-        activation_buffer = torch.full(
-            (activation_offset + output_bytes + 32,),
-            0xA5,
-            dtype=torch.uint8,
-            device="cuda",
-        )
-        activation_offset_1 = torch.tensor(
-            [activation_offset],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        conditional_execution_1 = torch.zeros(
-            (1,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        original_buffer = activation_buffer.clone()
-        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-            activation_buffer,
-            activation_offset_1,
-            conditional_execution_1,
-        )
-        self.assertTrue(torch.equal(activation_buffer, original_buffer))
-        conditional_execution_1.fill_(1)
-        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-            activation_buffer,
-            activation_offset_1,
-            conditional_execution_1,
-        )
-        buffered = (
-            activation_buffer[activation_offset : activation_offset + output_bytes]
-            .view(torch.bfloat16)
-            .view_as(expected)
-        )
-
         self.assertFalse(qdata_MQ.is_contiguous())
         self.assertFalse(scale_MB.is_contiguous())
         self.assertGreater(global_scale_inv_M.stride(0), 1)
@@ -2219,15 +2176,6 @@ class DistMoeKernelTest(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(blocked_actual.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(
-            torch.equal(buffered.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(torch.all(activation_buffer[:activation_offset] == 0xA5).item())
-        self.assertTrue(
-            torch.all(
-                activation_buffer[activation_offset + output_bytes :] == 0xA5
-            ).item()
         )
 
     def test_nvfp4_weight_dequantization_matches_gold(self) -> None:
@@ -2345,108 +2293,10 @@ class DistMoeKernelTest(unittest.TestCase):
                 ),
                 torch.empty(2, dtype=torch.float32, device="cuda"),
             )
-            blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-                torch.empty(
-                    7,
-                    136,
-                    dtype=torch.float4_e2m1fn_x2,
-                    device="cuda",
-                ),
-                torch.empty(
-                    7,
-                    17,
-                    dtype=torch.float8_e4m3fn,
-                    device="cuda",
-                ),
-                torch.empty(7, dtype=torch.float32, device="cuda"),
-                torch.empty(7 * 272 * 2, dtype=torch.uint8, device="cuda"),
-                torch.empty(1, dtype=torch.int64, device="cuda"),
-                torch.empty(1, dtype=torch.int32, device="cuda"),
-            )
-
         self.assertEqual(activation.shape, (7, 272))
         self.assertIs(activation.dtype, torch.bfloat16)
         self.assertEqual(weight.shape, (2, 129, 272))
         self.assertIs(weight.dtype, torch.bfloat16)
-
-    def test_nvfp4_activation_dequantization_graph_replays_device_state(self) -> None:
-        """Captured DQ follows replay-time activation offsets and predicates."""
-        rows, cols = 4, 256
-        generator = torch.Generator(device="cuda").manual_seed(20261029)
-        x = torch.randn(
-            rows,
-            cols,
-            dtype=torch.bfloat16,
-            device="cuda",
-            generator=generator,
-        )
-        qdata_MQ, scale_MB, global_scale_inv_M = (
-            blockscaled_impl._quantize_nvfp4_per_token(
-                x,
-                layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
-            )
-        )
-        expected = blockscaled_impl._dequantize_nvfp4_activation(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-        )
-        output_bytes = expected.numel() * expected.element_size()
-        first_offset = 32
-        second_offset = first_offset + output_bytes
-        activation_buffer = torch.full(
-            (second_offset + output_bytes + 32,),
-            0xA5,
-            dtype=torch.uint8,
-            device="cuda",
-        )
-        activation_offset_1 = torch.tensor(
-            [first_offset],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        conditional_execution_1 = torch.zeros(
-            (1,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-
-        blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-            activation_buffer,
-            activation_offset_1,
-            conditional_execution_1,
-        )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            blockscaled_impl._dequantize_nvfp4_activation_to_buffer(
-                qdata_MQ,
-                scale_MB,
-                global_scale_inv_M,
-                activation_buffer,
-                activation_offset_1,
-                conditional_execution_1,
-            )
-
-        activation_offset_1.fill_(second_offset)
-        conditional_execution_1.fill_(1)
-        graph.replay()
-        buffered = (
-            activation_buffer[second_offset : second_offset + output_bytes]
-            .view(torch.bfloat16)
-            .view_as(expected)
-        )
-
-        self.assertTrue(
-            torch.equal(buffered.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(
-            torch.all(
-                activation_buffer[first_offset : first_offset + output_bytes] == 0xA5
-            ).item()
-        )
 
     def test_nvfp4_token_scale_writes_directly_to_strided_output(self) -> None:
         """Dynamic NVFP4 quantization writes its inverse scale in place."""

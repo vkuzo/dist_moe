@@ -350,68 +350,6 @@ def dequantize_nvfp4(
     return output
 
 
-def dequantize_nvfp4_to_activation_buffer(
-    qdata: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale_inv: torch.Tensor,
-    activation_buffer: torch.Tensor,
-    activation_offset: torch.Tensor,
-    condition: torch.Tensor,
-    *,
-    scale_layout: ScaleFactorLayoutId,
-) -> None:
-    """Conditionally dequantize activation rows to an offset-backed BF16 region.
-
-    Args:
-        qdata: Rank-two packed E2M1 rows. Strided rows are supported.
-        scale: Natural or CUBLAS-blocked E4M3 scales.
-        global_scale_inv: FP32 inverse outer scale for each row.
-        activation_buffer: Planner-owned one-dimensional byte storage.
-        activation_offset: One-element int64 device byte offset.
-        condition: One-element bool or int32 device predicate.
-        scale_layout: Physical layout of ``scale``.
-    """
-    rows, q_cols = qdata.shape
-    n_cols = q_cols * 2
-    if rows == 0 or n_cols == 0:
-        return
-
-    scale_cols = triton.cdiv(n_cols, 16)
-    n_col_blocks = triton.cdiv(scale_cols, CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM)
-    padded_rows = (
-        triton.cdiv(rows, CUBLAS_BLOCKED_ROWS_PER_ATOM) * CUBLAS_BLOCKED_ROWS_PER_ATOM
-    )
-    group_scale_elements = (
-        padded_rows * n_col_blocks * CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
-    )
-    scale_row_stride = (
-        scale.stride(0) if scale_layout == ScaleFactorLayoutId.NATURAL else 0
-    )
-    grid = (rows, triton.cdiv(n_cols, _BLOCK_SIZE))
-    _dequantize_nvfp4_kernel[grid](
-        qdata.view(torch.uint8),
-        scale,
-        global_scale_inv,
-        activation_buffer,
-        activation_buffer,
-        activation_offset,
-        condition,
-        qdata.stride(0),
-        scale_row_stride,
-        global_scale_inv.stride(0),
-        rows,
-        group_scale_elements,
-        n_col_blocks,
-        n_cols,
-        SCALE_LAYOUT=scale_layout.value,
-        OUTER_SCALE_PER_ROW=True,
-        WRITE_ACTIVATION_BUFFER=True,
-        HAS_CONDITION=True,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        num_warps=4,
-    )
-
-
 def dequantize_gathered_nvfp4_to_activation_buffer(
     gather_ptrs: torch.Tensor,
     num_rows: torch.Tensor,
