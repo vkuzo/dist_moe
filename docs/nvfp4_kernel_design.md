@@ -186,12 +186,15 @@ selector or per-operand VMM mapping policy. None of these inference views
 creates saved activation state, and concat remains the default weight layout.
 
 Training always uses GPU-planned offsets. Its hybrid layout combines dense
-BF16 saved operands with transient packed NVFP4 row bundles. Full-save retains
-`DQ(Q(X_gathered))`, H1, and H3; recompute retains local BF16 X. The row-bundle
-decoder converts Q(X) and Q(H2) before their scratch is reused. Its packed
-source and expanding BF16 destination remain disjoint for the full kernel
-lifetime because independently scheduled decoder programs have no grid-wide
-ordering.
+BF16 saved operands with packed NVFP4 row bundles. Full-save retains packed
+gathered X, H1, and H3; recompute retains local BF16 X and rebuilds packed
+gathered X in backward. Staged W13 copies canonical expert-padded X as part of
+its launch; Mega full-save follows its fused launch with a conditional packed
+gather copy into the same planner layout and an EP barrier protecting the peer
+dispatch lifetime. The row-bundle decoder converts Q(X) and Q(H2) into BF16
+backward scratch before their source storage is reused. Each packed source and
+expanding BF16 destination remain disjoint for the full kernel lifetime
+because independently scheduled decoder programs have no grid-wide ordering.
 
 G8 with GPU offsets requires the source high-throughput producer topology.
 Its padded allocation row bound is at least `16 * num_sms`, and the

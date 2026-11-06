@@ -697,6 +697,55 @@ def _run_nvfp4_forward_with_saved_activations(
     )
 
 
+def _decode_saved_nvfp4_x(
+    activation_buffer: ActivationBuffer,
+    state: list[torch.Tensor],
+    hidden_dim: int,
+) -> torch.Tensor:
+    """Decode the forward-retained gathered NVFP4 rows into test scratch.
+
+    Args:
+        activation_buffer: Planner-owned byte storage containing saved X.
+        state: Fixed registered-forward state.
+        hidden_dim: Logical gathered-X width.
+
+    Returns:
+        BF16 gathered rows with shape ``[num_recv_tokens, hidden_dim]``.
+    """
+    num_recv_tokens = int(state[15].item())
+    output_offset = torch.tensor(
+        [activation_buffer.activation_slot_bytes],
+        dtype=torch.int64,
+        device=activation_buffer.buffer.device,
+    )
+    output_bytes = num_recv_tokens * hidden_dim * torch.bfloat16.itemsize
+    if int(output_offset.item()) + output_bytes > activation_buffer.buffer.numel():
+        raise RuntimeError("test decode does not fit in activation-buffer scratch")
+    activation_offsets = state[18]
+    blockscaled_impl._dequantize_nvfp4_activation_buffer_to_buffer(
+        activation_buffer.buffer,
+        activation_offsets.narrow(0, blockscaled_impl.ACTIVATION_A_Q_OFFSET, 1),
+        activation_offsets.narrow(
+            0,
+            blockscaled_impl.ACTIVATION_A_SCALE_OFFSET,
+            1,
+        ),
+        state[15],
+        output_offset,
+        state[16],
+        num_recv_tokens,
+        hidden_dim,
+        True,
+    )
+    return (
+        activation_buffer.buffer[
+            output_offset.item() : output_offset.item() + output_bytes
+        ]
+        .view(torch.bfloat16)
+        .view(num_recv_tokens, hidden_dim)
+    )
+
+
 def _reference_swiglu_clip_stats(
     x_TD: torch.Tensor,
     topk_expert_ids_TK: torch.Tensor,
@@ -2443,6 +2492,21 @@ class DistMoeKernelTest(unittest.TestCase):
         self.assertEqual(weight.shape, (2, 129, 272))
         self.assertIs(weight.dtype, torch.bfloat16)
 
+    def test_nvfp4_packed_gather_copy_supports_fake_tensor_metadata(self) -> None:
+        """The mutable packed-X save boundary validates under FakeTensor."""
+        with FakeTensorMode():
+            blockscaled_impl._copy_gathered_nvfp4_activation_to_buffer(
+                torch.empty(128, dtype=torch.int64, device="cuda"),
+                torch.empty(1, dtype=torch.int32, device="cuda"),
+                torch.empty(1 << 20, dtype=torch.uint8, device="cuda"),
+                torch.empty(1, dtype=torch.int64, device="cuda"),
+                torch.empty(1, dtype=torch.int64, device="cuda"),
+                torch.empty(1, dtype=torch.int32, device="cuda"),
+                128,
+                256,
+                True,
+            )
+
     def test_nvfp4_token_scale_writes_directly_to_strided_output(self) -> None:
         """Dynamic NVFP4 quantization writes its inverse scale in place."""
         rows, cols = 32, 256
@@ -4047,14 +4111,14 @@ class DistMoeKernelTest(unittest.TestCase):
             )
 
     def test_nvfp4_forward_saves_reference_backward_activations(self) -> None:
-        """Save dense Q-DQ inputs and real GEMM boundaries for backward.
+        """Save packed X and real BF16 GEMM boundaries for backward.
 
         Staged and Mega must preserve their current output bitwise. The saved
-        ``X_bw``, ``H1``, and ``H3`` are compared with the real-quantized
-        per-expert reference at tight bounds. X_bw is also checked bitwise
-        against Dist-MoE's independent per-token Q-DQ primitive.
-        Guard bytes and empty weight-state slots prove that H2 and quantized
-        tensors do not persist in the activation slot or fixed state schema.
+        packed X is decoded from the activation slot and compared bitwise with
+        Dist-MoE's independent per-token Q-DQ primitive. H1 and H3 are compared
+        with the real-quantized per-expert reference at tight bounds. Guard
+        bytes and empty weight-state slots prove that H2 and dynamic weight
+        quants do not persist in the activation slot or fixed state schema.
         """
         for pipeline in ("staged", "mega"):
             with self.subTest(pipeline=pipeline):
@@ -4123,17 +4187,39 @@ class DistMoeKernelTest(unittest.TestCase):
                 self.assertTrue(all(tensor.numel() == 0 for tensor in state[:10]))
                 self.assertFalse(state[16].item())
                 offsets = state[17].tolist()
+                self.assertEqual(offsets[1], 0)
                 self.assertEqual(offsets[3], 0)
                 self.assertEqual(state[20].numel(), 0)
                 num_recv_tokens = int(state[15].item())
                 split_sizes = state[10].tolist()
-                x_bw_MD = (
-                    activation_buffer.buffer[
-                        offsets[1] : offsets[1]
-                        + num_recv_tokens * x_TD.shape[1] * torch.bfloat16.itemsize
-                    ]
-                    .view(torch.bfloat16)
-                    .view(num_recv_tokens, x_TD.shape[1])
+                storage = activation_buffer.model_config.blockscaled_storage
+                assert storage is not None
+                x_q_size, x_scale_size = storage.row_quant_sizes(
+                    num_recv_tokens,
+                    x_TD.shape[1],
+                )
+                activation_offsets = state[18]
+                self.assertEqual(
+                    int(
+                        activation_offsets[
+                            blockscaled_impl.ACTIVATION_A_Q_OFFSET
+                        ].item()
+                    ),
+                    offsets[5],
+                )
+                self.assertEqual(
+                    int(
+                        activation_offsets[
+                            blockscaled_impl.ACTIVATION_A_SCALE_OFFSET
+                        ].item()
+                    ),
+                    offsets[5] + x_q_size,
+                )
+                self.assertEqual(offsets[2], offsets[5] + x_q_size + x_scale_size)
+                x_q_dq_MD = _decode_saved_nvfp4_x(
+                    activation_buffer,
+                    state,
+                    x_TD.shape[1],
                 )
                 h1_M2F = (
                     activation_buffer.buffer[
@@ -4164,7 +4250,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 cursor = 0
                 for expert, split_size in enumerate(split_sizes):
                     active_rows = expected_x_by_expert[expert].shape[0]
-                    actual_x = x_bw_MD[cursor : cursor + active_rows]
+                    actual_x = x_q_dq_MD[cursor : cursor + active_rows]
                     expected_x = expected_x_by_expert[expert]
                     exact_x = dist_moe_x_bw_TKD[ids_TK == expert]
                     self.assertTrue(
@@ -4197,7 +4283,7 @@ class DistMoeKernelTest(unittest.TestCase):
                     )
                     self.assertEqual(
                         torch.count_nonzero(
-                            x_bw_MD[cursor + active_rows : cursor + split_size]
+                            x_q_dq_MD[cursor + active_rows : cursor + split_size]
                         ).item(),
                         0,
                     )
@@ -4310,9 +4396,10 @@ class DistMoeKernelTest(unittest.TestCase):
         self.assertEqual(state[20].numel(), 0)
 
     def test_nvfp4_forward_saved_state_is_graph_visible(self) -> None:
-        """Preserve the fixed state schema in FakeTensor, make_fx, and capture."""
+        """Preserve Mega saved state in FakeTensor, make_fx, and capture."""
         policy = dist_moe.BlockScaledConfig(
             format=dist_moe.BlockScaledFormat.NVFP4,
+            pipeline="mega",
         )
         context, case_a, _, w13_EFD, w2_EDF = self._create_case(
             block_scaled=policy,
@@ -7395,13 +7482,13 @@ class DistMoeTwoRankTest(unittest.TestCase):
         )
 
     @with_comms
-    def test_nvfp4_saved_x_bw_exercises_peer_gather_paths(self) -> None:
-        """Match saved Q-DQ rows gathered through real two-rank peer pointers.
+    def test_nvfp4_saved_packed_x_exercises_peer_gather_paths(self) -> None:
+        """Match saved packed rows gathered through real two-rank peer pointers.
 
         Every local expert receives tokens from both ranks. Comparing the
-        expert-grouped activation slot with Dist-MoE's independent per-token
-        Q-DQ primitive proves that X_bw follows the routed row order and masks
-        padding without retaining the packed communication representation.
+        decoded expert-grouped activation slot with Dist-MoE's independent
+        per-token Q-DQ primitive proves that saved NVFP4 X follows routed row
+        order and masks padding.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -7496,21 +7583,19 @@ class DistMoeTwoRankTest(unittest.TestCase):
             )
 
             offsets = state[17].tolist()
+            self.assertEqual(offsets[1], 0)
             num_recv_tokens = int(state[15].item())
-            x_bw_MD = (
-                activation_buffer.buffer[
-                    offsets[1] : offsets[1]
-                    + num_recv_tokens * hidden_dim * torch.bfloat16.itemsize
-                ]
-                .view(torch.bfloat16)
-                .view(num_recv_tokens, hidden_dim)
+            x_q_dq_MD = _decode_saved_nvfp4_x(
+                activation_buffer,
+                state,
+                hidden_dim,
             )
             split_sizes = state[10].tolist()
             cursor = 0
             for local_expert, split_size in enumerate(split_sizes):
                 global_expert = expert_start + local_expert
                 exact = dist_moe_x_bw_TKD[global_ids == global_expert]
-                actual = x_bw_MD[cursor : cursor + exact.shape[0]]
+                actual = x_q_dq_MD[cursor : cursor + exact.shape[0]]
                 self.assertTrue(
                     torch.equal(
                         actual.view(torch.uint16),
@@ -7519,7 +7604,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     torch.count_nonzero(
-                        x_bw_MD[cursor + exact.shape[0] : cursor + split_size]
+                        x_q_dq_MD[cursor + exact.shape[0] : cursor + split_size]
                     ).item(),
                     0,
                 )

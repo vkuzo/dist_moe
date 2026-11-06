@@ -402,7 +402,7 @@ def _validate_nvfp4_activation_buffer_metadata(
         activation_offset_1: One-element int64 device byte offset.
         conditional_execution_1: One-element bool or int32 device predicate.
         device: Device shared by the NVFP4 operands.
-        required_bytes: BF16 output size before applying the dynamic offset.
+        required_bytes: Destination storage size before the dynamic offset.
     """
     if activation_buffer.dtype != torch.uint8:
         raise TypeError("activation_buffer must have dtype uint8")
@@ -428,22 +428,16 @@ def _validate_nvfp4_activation_buffer_metadata(
     validate_conditional_execution(conditional_execution_1, device=device)
 
 
-def _validate_nvfp4_gather_dequantization(
+def _validate_nvfp4_gather_metadata(
     gather_ptrs_M: torch.Tensor,
     num_rows_1: torch.Tensor,
-    activation_buffer: torch.Tensor,
-    activation_offset_1: torch.Tensor,
-    conditional_execution_1: torch.Tensor,
     n_cols: int,
 ) -> None:
-    """Validate gather-addressed NVFP4 activation dequantization metadata.
+    """Validate common gather-addressed NVFP4 source metadata.
 
     Args:
         gather_ptrs_M: Capacity-sized peer row-address table.
         num_rows_1: Device scalar with the valid padded-row count.
-        activation_buffer: Planner-owned byte storage.
-        activation_offset_1: Device scalar destination offset.
-        conditional_execution_1: Device execution predicate.
         n_cols: Logical BF16 feature width.
     """
     if (
@@ -468,6 +462,18 @@ def _validate_nvfp4_gather_dequantization(
             "NVFP4 gathered activation width must be positive and aligned to "
             f"{BLOCKSCALED_DISPATCH_DIM_ALIGNMENT}"
         )
+
+
+def _validate_nvfp4_gather_dequantization(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    activation_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    n_cols: int,
+) -> None:
+    """Validate gather-addressed NVFP4 activation dequantization metadata."""
+    _validate_nvfp4_gather_metadata(gather_ptrs_M, num_rows_1, n_cols)
     _validate_nvfp4_activation_buffer_metadata(
         activation_buffer,
         activation_offset_1,
@@ -475,6 +481,40 @@ def _validate_nvfp4_gather_dequantization(
         device=gather_ptrs_M.device,
         required_bytes=(gather_ptrs_M.numel() * n_cols * torch.bfloat16.itemsize),
     )
+
+
+def _validate_nvfp4_gather_copy(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    capacity_rows: int,
+    n_cols: int,
+) -> None:
+    """Validate metadata for a gathered packed-row copy."""
+    _validate_nvfp4_gather_metadata(gather_ptrs_M, num_rows_1, n_cols)
+    if capacity_rows <= 0 or capacity_rows > gather_ptrs_M.numel():
+        raise ValueError("capacity_rows must fit the gather-pointer capacity")
+    from .kernels.activation_buffer import ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+
+    qdata_bytes = capacity_rows * n_cols // 2
+    scale_bytes = (
+        capacity_rows * ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE * (n_cols // 16)
+        + capacity_rows * torch.float32.itemsize
+    )
+    for offset, required_bytes in (
+        (qdata_offset_1, qdata_bytes),
+        (scale_offset_1, scale_bytes),
+    ):
+        _validate_nvfp4_activation_buffer_metadata(
+            activation_buffer,
+            offset,
+            conditional_execution_1,
+            device=gather_ptrs_M.device,
+            required_bytes=required_bytes,
+        )
 
 
 @torch.library.custom_op(
@@ -548,6 +588,91 @@ def _dequantize_gathered_nvfp4_activation_to_buffer_fake(
         activation_buffer,
         activation_offset_1,
         conditional_execution_1,
+        n_cols,
+    )
+
+
+@torch.library.custom_op(
+    "dist_moe::copy_gathered_nvfp4_activation_to_buffer_",
+    mutates_args=("activation_buffer",),
+)
+def _copy_gathered_nvfp4_activation_to_buffer(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool = False,
+) -> None:
+    """Conditionally copy packed peer rows into planner-owned storage.
+
+    Args:
+        gather_ptrs_M: Capacity-sized peer row-address table.
+        num_rows_1: Device scalar with the valid padded-row count.
+        activation_buffer: Planner-owned byte storage.
+        qdata_offset_1: Device scalar destination for packed E2M1 values.
+        scale_offset_1: Device scalar destination for blocked scales and row scales.
+        conditional_execution_1: Device execution predicate.
+        capacity_rows: Static maximum row count for graph-stable launch.
+        n_cols: Logical BF16 feature width.
+        execute_when_zero: Whether a zero predicate selects this operation.
+    """
+    _validate_nvfp4_gather_copy(
+        gather_ptrs_M,
+        num_rows_1,
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        conditional_execution_1,
+        capacity_rows,
+        n_cols,
+    )
+    validate_activation_buffer_storage(activation_buffer)
+
+    from .kernels.activation_buffer import ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+    from .kernels.triton_quantization.blockscaled_dequantize import (
+        copy_gathered_nvfp4_to_activation_buffer,
+    )
+
+    copy_gathered_nvfp4_to_activation_buffer(
+        gather_ptrs_M,
+        num_rows_1,
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        conditional_execution_1,
+        capacity_rows=capacity_rows,
+        n_cols=n_cols,
+        execute_when_zero=execute_when_zero,
+        row_scale_storage_multiple=ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
+    )
+
+
+@_copy_gathered_nvfp4_activation_to_buffer.register_fake
+def _copy_gathered_nvfp4_activation_to_buffer_fake(
+    gather_ptrs_M: torch.Tensor,
+    num_rows_1: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool = False,
+) -> None:
+    """Validate fake metadata for a gathered packed-row copy."""
+    del execute_when_zero
+    _validate_nvfp4_gather_copy(
+        gather_ptrs_M,
+        num_rows_1,
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        conditional_execution_1,
+        capacity_rows,
         n_cols,
     )
 
@@ -1301,19 +1426,24 @@ class _Nvfp4Bf16BackwardAdapter:
             derive_pipeline_depth=True,
         )
 
-        # X's row bundle shares scratch with H2 in the staged recompute. Decode
-        # it before the combine producer reuses that storage.
+        # The backward planner selects either the saved or recomputed packed-X
+        # row bundle. Decode it before the combine producer can reuse recompute
+        # row scratch for H2.
         dispatch_offsets = backward_plan.blockscaled.recompute_dispatch_offsets
-        _dequantize_nvfp4_activation_buffer_to_buffer(
-            activation_buffer.buffer,
-            dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
-            dispatch_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
-            num_recv_rows_1,
-            backward_plan.x_gathered_offset,
-            forward_plan.need_recompute,
-            capacity_rows,
-            hidden_dim,
-        )
+        for execute_when_zero in (False, True):
+            _dequantize_nvfp4_activation_buffer_to_buffer(
+                activation_buffer.buffer,
+                dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+                dispatch_offsets[
+                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
+                ],
+                num_recv_rows_1,
+                backward_plan.x_gathered_offset,
+                forward_plan.need_recompute,
+                capacity_rows,
+                hidden_dim,
+                execute_when_zero,
+            )
 
         h1_placeholder = _activation_buffer_placeholder(
             activation_buffer.buffer,
@@ -2162,7 +2292,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
             or not save_for_backward
         ):
             raise ValueError(
-                "dequantized activation saving requires an internal NVFP4 "
+                "BF16 backward activation saving requires an internal NVFP4 "
                 "training forward"
             )
         # NVFP4 always publishes packed source rows, including a forward-only
@@ -2451,17 +2581,6 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 activation_offset=forward_plan.x_offset,
                 condition=recompute_condition,
             )
-            if save_dequantized_activations:
-                _dequantize_gathered_nvfp4_activation_to_buffer(
-                    dispatch_fwd_gather_ptrs,
-                    num_recv_tokens,
-                    activation_buffer.buffer,
-                    forward_plan.x_gathered_offset,
-                    recompute_condition,
-                    hidden_dim,
-                    True,
-                )
-
         # 5. Execute either the staged or Mega fused expert pipeline. Both
         # produce route-wise H3 before the common postprocessing boundary.
         _initialize_fake_peer_scatter_output(combine_buffer)
@@ -2537,6 +2656,36 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         )
                     )
                     h3_MD = mega_result[0]
+                    if save_dequantized_activations:
+                        assert (
+                            forward_plan is not None
+                            and forward_plan.blockscaled is not None
+                        )
+                        dispatch_offsets = forward_plan.blockscaled.dispatch_offsets
+                        _copy_gathered_nvfp4_activation_to_buffer(
+                            dispatch_fwd_gather_ptrs,
+                            num_recv_tokens,
+                            activation_buffer.buffer,
+                            dispatch_offsets[
+                                ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                            ],
+                            dispatch_offsets[
+                                ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                + 1
+                            ],
+                            forward_plan.blockscaled.recompute_condition,
+                            capacity_rows,
+                            hidden_dim,
+                            True,
+                        )
+                        # The copied peer rows must stay published until every
+                        # rank has finished reading them.
+                        _ep_barrier(
+                            dispatch_buffer,
+                            conditional_execution=torch.logical_not(
+                                forward_plan.need_recompute
+                            ),
+                        )
                 else:
                     assert (
                         forward_plan is not None
@@ -2854,7 +3003,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
         if blockscaled_cfg.format is BlockScaledFormat.NVFP4:
             if not blockscaled_cfg.save_dequantized_activations:
                 raise RuntimeError(
-                    "NVFP4 backward requires dequantized forward activations"
+                    "NVFP4 backward requires its BF16-backward activation policy"
                 )
             execution_context = ctx.execution_context
             if execution_context is None:

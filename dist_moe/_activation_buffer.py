@@ -1230,9 +1230,9 @@ class ModelConfig:
     # persistent -- row instead of column -- and makes the backward's working set
     # dense, so both halves of the plan change shape. Block-scaled planning only.
     native_backward: bool = False
-    # Persist dense dequantized forward operands for a future BF16 backward
-    # while retaining block-scaled row scratch for the forward GEMMs. Unlike
-    # native_backward, no quantized activation bundle survives the forward.
+    # Persist packed gathered X plus dense H1/H3 for a future BF16 backward.
+    # Backward dequantizes X into dense scratch before the native WGRAD. Unlike
+    # native_backward, H2's quantized activation bundle does not survive forward.
     save_dequantized_activations: bool = False
     # Interleaved FC13 consumes its epilogue output directly and therefore does
     # not materialize dense h1. This inference-only layout requires Mega.
@@ -1263,7 +1263,7 @@ class ModelConfig:
                 "save_dequantized_activations and native_backward are mutually exclusive"
             )
         if self.save_dequantized_activations and self.interleaved_fc13:
-            raise ValueError("saved dequantized activations require materialized H1")
+            raise ValueError("BF16 backward activation saving requires materialized H1")
         if storage is None:
             return
         self._validate_blockscaled_storage(storage)
@@ -1430,14 +1430,15 @@ class ModelConfig:
     def saved_act_mem_size(self, num_recv_tokens: int, recompute: bool) -> int:
         """Calculate memory size for saved activations.
 
-        With blockscaled_storage and no recompute, x and h2 are saved as
-        column-quantized bundles.
+        With blockscaled_storage and no recompute, x and h2 are normally saved
+        as column-quantized bundles. The NVFP4-to-BF16 backward adapter instead
+        saves packed row-quantized X with dense H1/H3.
 
         With recompute=True, saved activations:
         - x: [num_tokens, hidden_dim]
 
         With recompute=False, saved activations:
-        - x_gathered: [num_recv_tokens, hidden_dim]
+        - x_gathered: dense or packed [num_recv_tokens, hidden_dim]
         - h1: [num_recv_tokens, 2 * intermediate_dim]
         - h3_saved: [num_tokens * topk, hidden_dim]
 
@@ -1458,9 +1459,20 @@ class ModelConfig:
                     self.num_tokens * self.hidden_dim * self.element_size
                 )
             return x_size
-        elif self.blockscaled_storage is not None and not (
-            self.save_dequantized_activations
-        ):
+        elif self.blockscaled_storage is not None and self.save_dequantized_activations:
+            storage = self.blockscaled_storage
+            x_q_size, x_scale_size = storage.row_quant_sizes(
+                num_recv_tokens,
+                self.hidden_dim,
+            )
+            h1_size = _align_bytes(
+                num_recv_tokens * 2 * self.intermediate_dim * self.element_size
+            )
+            h3_size = _align_bytes(
+                self.num_tokens * self.topk * self.hidden_dim * self.element_size
+            )
+            return x_q_size + x_scale_size + h1_size + h3_size
+        elif self.blockscaled_storage is not None:
             return self._blockscaled_no_recompute_saved_size(num_recv_tokens)
         else:
             # x_gathered + h1 + h3_saved
@@ -1627,7 +1639,7 @@ class ModelConfig:
         num_recv_tokens: int,
         recompute: bool,
     ) -> int:
-        """Peak forward bytes for dense saved state plus block-scaled scratch.
+        """Peak forward bytes for packed-X/dense-H1/H3 state plus row scratch.
 
         Args:
             num_recv_tokens: Capacity-padded received rows.
@@ -1654,8 +1666,9 @@ class ModelConfig:
         """Conservatively reserve the future dense-backward working set.
 
         The BF16 gradient workspace reuses dense tensors according to their
-        kernel-level lifetimes. The packed H2 source remains disjoint from its
-        expanding BF16 dequantization destination until that kernel completes.
+        kernel-level lifetimes. Packed X and H2 sources remain disjoint from
+        their expanding BF16 dequantization destinations until those kernels
+        complete.
 
         Args:
             num_recv_tokens: Capacity-padded received rows.
@@ -1676,6 +1689,9 @@ class ModelConfig:
         gradient_scratch = grad_h1_size + grad_h2_size
         if self.hidden_dim > self.intermediate_dim:
             gradient_scratch += grad_h3_size
+        x_gathered_size = _align_bytes(
+            num_recv_tokens * self.hidden_dim * self.element_size
+        )
         if not recompute:
             storage = self.blockscaled_storage
             assert storage is not None
@@ -1683,11 +1699,8 @@ class ModelConfig:
                 num_recv_tokens,
                 self.intermediate_dim,
             )
-            return h2_row_size + gradient_scratch
+            return h2_row_size + gradient_scratch + x_gathered_size
 
-        x_gathered_size = _align_bytes(
-            num_recv_tokens * self.hidden_dim * self.element_size
-        )
         h1_size = _align_bytes(
             num_recv_tokens * 2 * self.intermediate_dim * self.element_size
         )
@@ -2027,7 +2040,7 @@ class BlockscaledForwardPlan:
     staged kernels and occupy disjoint sub-slots for a Mega kernel.
     """
 
-    # x_gathered, row-quantized: FC13 input.
+    # x_gathered, row-quantized: FC13 input and optional saved backward source.
     x_row_offset: torch.Tensor
     # x_gathered, column-quantized: FC13 weight-gradient operand.
     x_col_offset: torch.Tensor
@@ -2188,10 +2201,12 @@ class BackwardPlan:
 
     Contains memory offsets for activation tensors during backward pass.
     If recompute was used in forward, x_gathered and h1 are allocated fresh.
-    Otherwise, they reference the saved activations from forward pass.
+    Otherwise, h1 references its saved forward activation. For the NVFP4
+    BF16-backward adapter, x_gathered is always dense backward scratch decoded
+    from either saved or recomputed packed X.
     """
 
-    # Memory offset for x_gathered tensor (saved or recomputed)
+    # Memory offset for dense x_gathered (saved, recomputed, or decoded)
     x_gathered_offset: torch.Tensor
     # Memory offset for h1 tensor (saved or recomputed)
     h1_offset: torch.Tensor
@@ -2398,10 +2413,10 @@ def _get_blockscaled_backward_plan(
         native_backward=model_config.native_backward,
         save_dequantized_activations=model_config.save_dequantized_activations,
     )
-    # chunks are ordered as the kernel stores them into bwd_offsets_ptr. Of the
-    # The dequantized-activation mode populates every dense slot for the shared
-    # BF16 backward. Other block-scaled modes use only h1 (1) and grad_h2 (3);
-    # bundles in slots 6..13 replace the remaining dense operands.
+    # Chunks are ordered as the kernel stores them into bwd_offsets_ptr. The
+    # BF16-backward adapter populates every dense slot for the shared gradient
+    # kernels, decoding X into slot 0. Other block-scaled modes use only h1 (1)
+    # and grad_h2 (3); bundles in slots 6..13 replace the remaining operands.
     chunks = offsets.chunk(_BLOCKSCALED_BACKWARD_PLAN_OFFSET_COUNT)
     return BackwardPlan(
         x_gathered_offset=chunks[0],
@@ -2438,7 +2453,8 @@ def get_forward_plan(
     It also computes memory offsets for the activation buffer:
     - Saved activations allocated front to back:
       - Recompute mode: x
-      - No-recompute mode: x_gathered, h1, h3_saved
+      - No-recompute mode: x_gathered, h1, h3_saved. The NVFP4 BF16-backward
+        adapter stores x_gathered as packed qdata and scales.
     - Temporary activations (h2, or all if recomputing) allocated back to front
 
     Args:
@@ -2595,7 +2611,9 @@ def get_backward_plan(
     pass, avoiding device-to-host transfers. The offsets depend on whether
     recompute was used in the forward pass:
     - With recompute: x_gathered and h1 are allocated fresh from scratch region
-    - Without recompute: x_gathered and h1 use saved offsets from forward pass
+    - Without recompute: x_gathered and h1 normally use saved forward offsets
+    - With the NVFP4 BF16-backward adapter: packed X is saved or recomputed, then
+      decoded into a fresh dense x_gathered scratch allocation in both modes
 
     All temporary tensors (h2, grad_h2, grad_h3_gathered, grad_h1) are allocated
     from the scratch region (back to front).
@@ -2605,7 +2623,7 @@ def get_backward_plan(
 
     saved_activation_bytes_per_rank update:
     - If recompute: decrease by x_mem_size (scalar, same for all ranks)
-    - If no recompute: decrease by per-rank allocation (x_gathered + h1 + h3)
+    - If no recompute: decrease by the per-rank saved allocation
 
     Args:
         num_recv_tokens: Tensor [1] containing rows received in this backward pass.
