@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Triton dequantization kernels for NVFP4 backward operands."""
+"""Triton transfer and dequantization kernels for NVFP4 backward operands."""
 
 from __future__ import annotations
 
@@ -212,6 +212,87 @@ def _dequantize_nvfp4_gather_kernel(
 
 
 @triton.jit
+def _copy_gathered_nvfp4_to_activation_buffer_kernel(
+    gather_ptrs,
+    num_rows_ptr,
+    activation_buffer_ptr,
+    qdata_offset_ptr,
+    scale_offset_ptr,
+    condition_ptr,
+    n_cols,
+    EXECUTE_WHEN_ZERO: tl.constexpr,
+    ROW_SCALE_STORAGE_MULTIPLE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy peer-addressed packed rows into one planner-owned row bundle."""
+    condition = tl.load(condition_ptr, eviction_policy="evict_last")
+    should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
+    if not should_execute:
+        return
+
+    row = tl.program_id(0)
+    byte_cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    num_rows = tl.load(num_rows_ptr, eviction_policy="evict_last").to(tl.int64)
+    row_i64 = row.to(tl.int64)
+    valid_row = row_i64 < num_rows
+    row_address = tl.load(gather_ptrs + row, mask=valid_row, other=0)
+    valid_source = valid_row & (row_address != 0)
+    source = row_address.to(tl.pointer_type(tl.uint8))
+
+    q_cols = n_cols // 2
+    valid_q = byte_cols < q_cols
+    packed = tl.load(source + byte_cols, mask=valid_q & valid_source, other=0)
+    qdata_offset = tl.load(qdata_offset_ptr, eviction_policy="evict_last").to(tl.int64)
+    qdata = activation_buffer_ptr + qdata_offset
+    tl.store(
+        qdata + row_i64 * q_cols + byte_cols.to(tl.int64),
+        packed,
+        mask=valid_q & valid_row,
+    )
+
+    scale_cols = n_cols // 16
+    valid_scale = byte_cols < scale_cols
+    scale = tl.load(
+        source + q_cols + byte_cols,
+        mask=valid_scale & valid_source,
+        other=0,
+    )
+    scale_offset = tl.load(scale_offset_ptr, eviction_policy="evict_last").to(tl.int64)
+    scales = activation_buffer_ptr + scale_offset
+    n_col_blocks = (
+        scale_cols + _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM - 1
+    ) // _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
+    blocked_scale_offset = _cublas_blocked_scale_offset(
+        row,
+        byte_cols,
+        n_col_blocks,
+    ).to(tl.int64)
+    tl.store(
+        scales + blocked_scale_offset,
+        scale,
+        mask=valid_scale & valid_row,
+    )
+
+    source_global_scale_inv = tl.load(
+        (source + q_cols + scale_cols).to(tl.pointer_type(tl.float32))
+        + tl.zeros((BLOCK_SIZE,), tl.int64),
+        mask=(byte_cols == 0) & valid_source,
+        other=0.0,
+    )
+    global_scale_offset = (
+        scale_offset + num_rows * ROW_SCALE_STORAGE_MULTIPLE * scale_cols
+    )
+    global_scale_inv = (activation_buffer_ptr + global_scale_offset).to(
+        tl.pointer_type(tl.float32)
+    )
+    tl.store(
+        global_scale_inv + row_i64 + tl.zeros((BLOCK_SIZE,), tl.int64),
+        source_global_scale_inv,
+        mask=(byte_cols == 0) & valid_row,
+    )
+
+
+@triton.jit
 def _dequantize_nvfp4_activation_buffer_kernel(
     activation_buffer_ptr,
     qdata_offset_ptr,
@@ -382,6 +463,51 @@ def dequantize_gathered_nvfp4_to_activation_buffer(
         condition,
         n_cols,
         EXECUTE_WHEN_ZERO=execute_when_zero,
+        BLOCK_SIZE=_BLOCK_SIZE,
+        num_warps=4,
+    )
+
+
+def copy_gathered_nvfp4_to_activation_buffer(
+    gather_ptrs: torch.Tensor,
+    num_rows: torch.Tensor,
+    activation_buffer: torch.Tensor,
+    qdata_offset: torch.Tensor,
+    scale_offset: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool,
+    row_scale_storage_multiple: int,
+) -> None:
+    """Copy peer-addressed packed NVFP4 rows into planner-owned storage.
+
+    Args:
+        gather_ptrs: Capacity-sized table of packed symmetric-memory row addresses.
+        num_rows: Device scalar containing the valid padded-row count.
+        activation_buffer: Planner-owned one-dimensional byte storage.
+        qdata_offset: Device scalar byte offset of the packed E2M1 destination.
+        scale_offset: Device scalar byte offset of the blocked E4M3-scale bundle.
+        condition: One-element device predicate.
+        capacity_rows: Static maximum row count used for graph-stable launch.
+        n_cols: Logical BF16 feature width.
+        execute_when_zero: Whether a zero predicate selects this operation.
+        row_scale_storage_multiple: Physical row-scale padding multiplier.
+    """
+    if capacity_rows == 0 or n_cols == 0:
+        return
+    grid = (capacity_rows, triton.cdiv(n_cols // 2, _BLOCK_SIZE))
+    _copy_gathered_nvfp4_to_activation_buffer_kernel[grid](
+        gather_ptrs,
+        num_rows,
+        activation_buffer,
+        qdata_offset,
+        scale_offset,
+        condition,
+        n_cols,
+        EXECUTE_WHEN_ZERO=execute_when_zero,
+        ROW_SCALE_STORAGE_MULTIPLE=row_scale_storage_multiple,
         BLOCK_SIZE=_BLOCK_SIZE,
         num_warps=4,
     )

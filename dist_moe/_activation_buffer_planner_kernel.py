@@ -262,6 +262,35 @@ def _tl_blockscaled_no_recompute_alloc_per_rank(
 
 
 @triton.jit
+def _tl_packed_x_dense_backward_no_recompute_alloc_per_rank(
+    rank_counts,
+    h3_mem_size,
+    hidden_dim,
+    intermediate_dim,
+    element_size,
+    operand_element_size,
+    operand_values_per_storage_element,
+    scale_element_size,
+    row_scale_storage_multiple,
+    row_global_scale_element_size,
+    sf_vec_size,
+):
+    """Return per-rank bytes for packed X plus dense H1/H3 saved state."""
+    x_q_size, x_scale_size = _tl_row_quant_sizes(
+        rank_counts,
+        hidden_dim,
+        operand_element_size,
+        operand_values_per_storage_element,
+        scale_element_size,
+        row_scale_storage_multiple,
+        row_global_scale_element_size,
+        sf_vec_size,
+    )
+    h1_size = _tl_align(rank_counts * 2 * intermediate_dim * element_size)
+    return x_q_size + x_scale_size + h1_size + h3_mem_size
+
+
+@triton.jit
 def _tl_store_activation_offsets(
     offsets_ptr,
     base: tl.constexpr,
@@ -367,11 +396,11 @@ def _triton_get_blockscaled_forward_plan(
       no-recompute  slot [x_row | h1 | h2_row | h3];  scratch []
       recompute     slot [x packed]; scratch [row scratch | h1]
 
-    With save_dequantized_activations, the forward keeps only the dense BF16
-    values a future BF16 backward will consume. Quantized operands remain
-    transient row scratch:
+    With save_dequantized_activations, the forward keeps packed gathered X and
+    the dense H1/H3 values. A future BF16 backward dequantizes X into scratch;
+    H2's quantized operand remains transient row scratch:
 
-      no-recompute  slot [x_bw | h1 | h3]; scratch [row scratch]
+      no-recompute  slot [x_row | h1 | h3]; scratch [row scratch]
       recompute     slot [x dense];        scratch [row scratch | h1]
     """
     rank_offsets = tl.arange(0, EP)
@@ -382,7 +411,6 @@ def _triton_get_blockscaled_forward_plan(
     padded_rows = tl.load(num_recv_tokens_ptr).to(tl.int64)
     tl.device_assert(padded_rows <= capacity_rows, "padded receive capacity exceeded")
     rows = padded_rows
-    x_gathered_size = _tl_align(rows * hidden_dim * element_size)
     h1_size = _tl_align(rows * 2 * intermediate_dim * element_size)  # h1 dense
     x_row_q_size, x_row_scale_size = _tl_row_quant_sizes(
         rows,
@@ -490,10 +518,20 @@ def _triton_get_blockscaled_forward_plan(
             x_mem_size = _tl_align(num_tokens * hidden_dim * element_size)
         h3_mem_size = _tl_align(num_tokens * topk * hidden_dim * element_size)
         if save_dequantized_activations:
-            x_gathered_per_rank = _tl_align(rank_counts * hidden_dim * element_size)
-            h1_per_rank = _tl_align(rank_counts * 2 * intermediate_dim * element_size)
             no_recompute_alloc_per_rank = (
-                x_gathered_per_rank + h1_per_rank + h3_mem_size
+                _tl_packed_x_dense_backward_no_recompute_alloc_per_rank(
+                    rank_counts,
+                    h3_mem_size,
+                    hidden_dim,
+                    intermediate_dim,
+                    element_size,
+                    operand_element_size,
+                    operand_values_per_storage_element,
+                    scale_element_size,
+                    row_scale_storage_multiple,
+                    row_global_scale_element_size,
+                    sf_vec_size,
+                )
             )
         else:
             no_recompute_alloc_per_rank = _tl_blockscaled_no_recompute_alloc_per_rank(
@@ -560,13 +598,14 @@ def _triton_get_blockscaled_forward_plan(
             x_offset = zero
             scratch_bottom = scratch_end
         elif save_dequantized_activations:
-            # Persist exactly the dense operands consumed by the future BF16
-            # backward. Q(X) and Q(H2) remain in the shared row scratch.
-            x_gathered_offset = free_start
-            h1_offset = x_gathered_offset + x_gathered_size
+            # Persist gathered packed X for a backward-side decode, plus the
+            # dense H1/H3 operands. Q(H2) remains in shared row scratch.
+            x_row_offset = free_start
+            h1_offset = x_row_offset + x_row_size
             h3_offset = h1_offset + h1_size
             new_free_start = h3_offset + h3_mem_size
             x_offset = zero
+            x_gathered_offset = zero
             scratch_bottom = row_slot_offset
         else:
             # Save the operands backward needs, ascending from free_start in the
@@ -744,12 +783,13 @@ def _triton_get_blockscaled_backward_plan(
       no-recompute  scratch [x_gathered | h2 | grad_h3_gathered | grad_h2 | grad_h1]
       recompute     scratch [row slot | h1 | x_gathered | h2 | grad_h3_gathered | grad_h2 | grad_h1]
 
-    With save_dequantized_activations, X and H1 already use the BF16 backward
-    representation. Both decisions keep the active NVFP4 row bundle above the
-    same liveness-aware dense gradient workspace used by the BF16 planner:
+    With save_dequantized_activations, H1 already uses the BF16 backward
+    representation, while packed X is always decoded into dense backward
+    scratch. Both decisions keep the active NVFP4 row bundle above the same
+    liveness-aware dense gradient workspace used by the BF16 planner:
 
       no-recompute  scratch [h2 row | h2/grad_h1 | grad_h2 |
-                             grad_h3_gathered]
+                             grad_h3_gathered | x_gathered]
       recompute     scratch [row slot | h2/grad_h1 | grad_h2 |
                              grad_h3_gathered | h1 | x_gathered]
 
@@ -881,10 +921,10 @@ def _triton_get_blockscaled_backward_plan(
 
     cursor = row_slot_offset
     if save_dequantized_activations:
-        # Match the BF16 backward's liveness reuse. Recompute keeps the NVFP4
-        # row slot disjoint until X has been dequantized and H2 has been
-        # produced. A saved layer also needs a disjoint H2 destination because
-        # the parallel dequantizer cannot safely expand over its source bundle.
+        # Match the BF16 backward's liveness reuse while always reserving a
+        # dense X destination. Recompute keeps the NVFP4 row slot disjoint
+        # until X has been dequantized and H2 has been produced. A saved layer
+        # reads X from its persistent row bundle and uses row scratch only for H2.
         dense_scratch_end = row_slot_offset
         grad_h1_offset = dense_scratch_end - h1_size
         grad_h2_offset = grad_h1_offset - grad_h2_size
@@ -900,8 +940,9 @@ def _triton_get_blockscaled_backward_plan(
             scratch_bottom = x_gathered_offset
         else:
             h1_offset = tl.load(fwd_h1_offset_ptr)
-            x_gathered_offset = tl.load(fwd_x_gathered_offset_ptr)
-            scratch_bottom = scratch_grad_bottom
+            x_row_offset = tl.load(fwd_x_row_offset_ptr)
+            x_gathered_offset = scratch_grad_bottom - x_gathered_size
+            scratch_bottom = x_gathered_offset
 
         # No block-scaled backward GEMM consumes these descriptors. Keep the
         # fixed activation-offset table valid for conditional NVFP4 forward
@@ -1097,12 +1138,12 @@ def _triton_get_blockscaled_backward_plan(
 
     # Rewind this activation slot's high-water mark to where the matching forward
     # layer began: recompute saved dense x at fwd_x_offset; no-recompute saved
-    # the saved bundle starting at x_col_offset.
+    # the saved bundle starting at its first packed or dense operand.
     fwd_x_offset = tl.load(fwd_x_offset_ptr)
     if native_backward:
         saved_base = tl.load(fwd_x_row_offset_ptr)
     elif save_dequantized_activations:
-        saved_base = tl.load(fwd_x_gathered_offset_ptr)
+        saved_base = tl.load(fwd_x_row_offset_ptr)
     else:
         saved_base = x_col_offset
     new_free_start = tl.where(need_recompute, fwd_x_offset, saved_base)
@@ -1130,9 +1171,19 @@ def _triton_get_blockscaled_backward_plan(
     h3_mem_size = _tl_align(num_tokens * topk * hidden_dim * element_size)
     if save_dequantized_activations:
         no_recompute_alloc_per_rank = (
-            _tl_align(rank_counts * hidden_dim * element_size)
-            + _tl_align(rank_counts * 2 * intermediate_dim * element_size)
-            + h3_mem_size
+            _tl_packed_x_dense_backward_no_recompute_alloc_per_rank(
+                rank_counts,
+                h3_mem_size,
+                hidden_dim,
+                intermediate_dim,
+                element_size,
+                operand_element_size,
+                operand_values_per_storage_element,
+                scale_element_size,
+                row_scale_storage_multiple,
+                row_global_scale_element_size,
+                sf_vec_size,
+            )
         )
     else:
         no_recompute_alloc_per_rank = _tl_blockscaled_no_recompute_alloc_per_rank(
