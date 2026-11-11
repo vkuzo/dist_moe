@@ -55,6 +55,14 @@ Training accepts only native BF16 weights. Forward quantizes them for FPROP.
 Backward quantizes them again, decodes packed E2M1 data and CUBLAS-blocked
 E4M3 scales with the per-expert inverse global scale, and supplies BF16
 `DQ(Q(W13))` and `DQ(Q(W2))` to native DGRAD. Packed weights are not saved.
+The contiguous weight decoder assigns one Triton program to each logical
+weight row and processes 1,024 packed bytes per tile. Each packed byte and
+each scale are loaded once: the Blackwell `e2m1x2` conversion produces a
+BF16 pair, one E4M3 scale is broadcast across its eight packed bytes, and the
+pair is written with one 32-bit store. The per-expert inverse global scale is
+loaded once per row and applied in FP32 before the final BF16 conversion.
+Natural scales, strided rows, and per-row outer scales retain the generic
+decoder.
 
 The default W13 rows concatenate gate and up projections for both staged and
 Mega execution. Opt-in `fuse_swiglu=True` preparation is restricted to Mega

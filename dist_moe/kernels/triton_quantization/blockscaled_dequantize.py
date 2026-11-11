@@ -24,6 +24,8 @@ from .formats import (
 _BLOCK_SIZE = 256
 _ACTIVATION_DEQUANT_BLOCK_Q_SIZE = 2048
 _ACTIVATION_DEQUANT_NUM_WARPS = 8
+_WEIGHT_DEQUANT_BLOCK_Q_SIZE = 1024
+_WEIGHT_DEQUANT_NUM_WARPS = 4
 _TL_SCALE_FACTOR_LAYOUT_NATURAL = tl.constexpr(ScaleFactorLayoutId.NATURAL.value)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ATOM = tl.constexpr(CUBLAS_BLOCKED_ENTRIES_PER_ATOM)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE = tl.constexpr(
@@ -186,6 +188,72 @@ def _dequantize_nvfp4_kernel(
         values * inner_scale * global_scale_inv,
         mask=valid,
     )
+
+
+@triton.jit
+def _dequantize_nvfp4_weight_kernel(
+    qdata_ptr,
+    scale_ptr,
+    global_scale_inv_ptr,
+    output_ptr,
+    global_scale_inv_stride,
+    N_COLS: tl.constexpr,
+    ROWS_PER_GROUP: tl.constexpr,
+    GROUP_SCALE_ELEMENTS: tl.constexpr,
+    N_COL_BLOCKS: tl.constexpr,
+    BLOCK_Q_SIZE: tl.constexpr,
+):
+    """Decode grouped CUBLAS-blocked NVFP4 weights into contiguous BF16."""
+    row = tl.program_id(0)
+    row_i64 = row.to(tl.int64)
+    group = row // ROWS_PER_GROUP
+    row_in_group = row - group * ROWS_PER_GROUP
+    global_scale_inv = tl.load(
+        global_scale_inv_ptr + group.to(tl.int64) * global_scale_inv_stride,
+    ).to(tl.float32)
+
+    qdata = qdata_ptr.to(tl.pointer_type(tl.uint8))
+    scales = scale_ptr.to(tl.pointer_type(tl.uint8))
+    output = output_ptr.to(tl.pointer_type(tl.uint32))
+    q_cols: tl.constexpr = N_COLS // 2
+    scale_cols: tl.constexpr = triton.cdiv(N_COLS, 16)
+    num_q_blocks: tl.constexpr = triton.cdiv(q_cols, BLOCK_Q_SIZE)
+    q_lanes = tl.arange(0, BLOCK_Q_SIZE)
+    scale_lanes = tl.arange(0, BLOCK_Q_SIZE // 8)
+    for block_idx in tl.static_range(0, num_q_blocks):
+        q_cols_in_block = block_idx * BLOCK_Q_SIZE + q_lanes
+        valid_q = q_cols_in_block < q_cols
+        packed = tl.load(
+            qdata + row_i64 * q_cols + q_cols_in_block.to(tl.int64),
+            mask=valid_q,
+            other=0,
+        )
+        scale_cols_in_block = block_idx * (BLOCK_Q_SIZE // 8) + scale_lanes
+        inner_scale = tl.load(
+            scales
+            + group.to(tl.int64) * GROUP_SCALE_ELEMENTS
+            + _cublas_blocked_scale_offset(
+                row_in_group,
+                scale_cols_in_block,
+                N_COL_BLOCKS,
+            ).to(tl.int64),
+            mask=scale_cols_in_block < scale_cols,
+            other=0,
+        )
+        scale_per_q = tl.broadcast_to(
+            inner_scale[:, None],
+            (BLOCK_Q_SIZE // 8, 8),
+        ).reshape((BLOCK_Q_SIZE,))
+        decoded = _decode_scaled_nvfp4x2_to_bf16x2(
+            packed,
+            scale_per_q,
+            global_scale_inv,
+        )
+        tl.store(
+            output + row_i64 * q_cols + q_cols_in_block.to(tl.int64),
+            decoded,
+            mask=valid_q,
+        )
 
 
 @triton.jit
@@ -456,6 +524,27 @@ def dequantize_nvfp4(
     group_scale_elements = (
         padded_rows * n_col_blocks * CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
     )
+    if (
+        scale_layout == ScaleFactorLayoutId.CUBLAS_BLOCKED
+        and not outer_scale_per_row
+        and qdata.is_contiguous()
+        and scale.is_contiguous()
+    ):
+        _dequantize_nvfp4_weight_kernel[(rows,)](
+            qdata.view(torch.uint8),
+            scale,
+            global_scale_inv,
+            output,
+            global_scale_inv.stride(0),
+            N_COLS=n_cols,
+            ROWS_PER_GROUP=rows_per_group,
+            GROUP_SCALE_ELEMENTS=group_scale_elements,
+            N_COL_BLOCKS=n_col_blocks,
+            BLOCK_Q_SIZE=_WEIGHT_DEQUANT_BLOCK_Q_SIZE,
+            num_warps=_WEIGHT_DEQUANT_NUM_WARPS,
+        )
+        return output
+
     scale_row_stride = (
         scale.stride(0) if scale_layout == ScaleFactorLayoutId.NATURAL else 0
     )
