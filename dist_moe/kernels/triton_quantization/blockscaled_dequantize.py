@@ -22,6 +22,8 @@ from .formats import (
 )
 
 _BLOCK_SIZE = 256
+_ACTIVATION_DEQUANT_BLOCK_Q_SIZE = 2048
+_ACTIVATION_DEQUANT_NUM_WARPS = 8
 _TL_SCALE_FACTOR_LAYOUT_NATURAL = tl.constexpr(ScaleFactorLayoutId.NATURAL.value)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ATOM = tl.constexpr(CUBLAS_BLOCKED_ENTRIES_PER_ATOM)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE = tl.constexpr(
@@ -48,6 +50,43 @@ def _decode_fp4_e2m1(code):
         ),
     )
     return tl.where((code & 0x8) != 0, -magnitude, magnitude)
+
+
+@triton.jit
+def _decode_scaled_nvfp4x2_to_bf16x2(packed, scale, global_scale_inv):
+    """Decode and scale one packed FP4 pair into one BF16x2 word."""
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .b8 q, scale_byte;
+            .reg .b16 scale_pair, lo, hi;
+            .reg .b32 value_bf16x2, scale_bf16x2;
+            .reg .f32 lo_f32, hi_f32;
+
+            cvt.u8.u32 q, $1;
+            cvt.u8.u32 scale_byte, $2;
+            mov.b16 scale_pair, {scale_byte, scale_byte};
+            cvt.rn.bf16x2.e2m1x2 value_bf16x2, q;
+            cvt.rn.bf16x2.e4m3x2 scale_bf16x2, scale_pair;
+            mul.rn.bf16x2 value_bf16x2, value_bf16x2, scale_bf16x2;
+            mov.b32 {lo, hi}, value_bf16x2;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $3;
+            mul.rn.f32 hi_f32, hi_f32, $3;
+            cvt.rn.bf16x2.f32 $0, hi_f32, lo_f32;
+        }
+        """,
+        constraints="=r,r,r,f",
+        args=[
+            packed.to(tl.uint32),
+            scale.to(tl.uint32),
+            global_scale_inv,
+        ],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -300,69 +339,84 @@ def _dequantize_nvfp4_activation_buffer_kernel(
     num_rows_ptr,
     output_offset_ptr,
     condition_ptr,
-    n_cols,
+    N_COLS: tl.constexpr,
     EXECUTE_WHEN_ZERO: tl.constexpr,
+    EXECUTE_UNCONDITIONALLY: tl.constexpr,
     ROW_SCALE_STORAGE_MULTIPLE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_Q_SIZE: tl.constexpr,
 ):
     """Decode one planner-owned row bundle into planner-owned BF16 storage."""
-    condition = tl.load(condition_ptr, eviction_policy="evict_last")
-    should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
-    if not should_execute:
-        return
+    if not EXECUTE_UNCONDITIONALLY:
+        condition = tl.load(condition_ptr, eviction_policy="evict_last")
+        should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
+        if not should_execute:
+            return
 
     row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     num_rows = tl.load(num_rows_ptr, eviction_policy="evict_last").to(tl.int64)
-    valid = (row.to(tl.int64) < num_rows) & (cols < n_cols)
     row_i64 = row.to(tl.int64)
-    cols_i64 = cols.to(tl.int64)
+    if row_i64 >= num_rows:
+        return
+
     qdata_offset = tl.load(qdata_offset_ptr, eviction_policy="evict_last").to(tl.int64)
     scale_offset = tl.load(scale_offset_ptr, eviction_policy="evict_last").to(tl.int64)
     qdata = (activation_buffer_ptr + qdata_offset).to(tl.pointer_type(tl.uint8))
-    packed = tl.load(
-        qdata + row_i64 * (n_cols // 2) + cols_i64 // 2,
-        mask=valid,
-        other=0,
-    )
-    code = tl.where((cols & 1) == 0, packed & 0xF, packed >> 4)
-    values = _decode_fp4_e2m1(code)
+    scales = (activation_buffer_ptr + scale_offset).to(tl.pointer_type(tl.uint8))
 
-    scale_cols = n_cols // 16
-    scales = (activation_buffer_ptr + scale_offset).to(tl.pointer_type(tl.float8e4nv))
+    scale_cols: tl.constexpr = N_COLS // 16
     n_col_blocks = (scale_cols + _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM - 1) // (
         _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
     )
-    inner_scale = tl.load(
-        scales
-        + _cublas_blocked_scale_offset(
-            row,
-            cols // 16,
-            n_col_blocks,
-        ).to(tl.int64),
-        mask=valid,
-        other=0.0,
-    ).to(tl.float32)
     global_scale_offset = (
         scale_offset + num_rows * ROW_SCALE_STORAGE_MULTIPLE * scale_cols
     )
     global_scale_inv = tl.load(
         (activation_buffer_ptr + global_scale_offset).to(tl.pointer_type(tl.float32))
         + row_i64,
-        mask=row_i64 < num_rows,
-        other=0.0,
     ).to(tl.float32)
 
     output_offset = tl.load(
         output_offset_ptr,
         eviction_policy="evict_last",
     ).to(tl.int64)
-    output = (activation_buffer_ptr + output_offset).to(tl.pointer_type(tl.bfloat16))
-    tl.store(
-        output + row_i64 * n_cols + cols_i64,
-        values * inner_scale * global_scale_inv,
-        mask=valid,
-    )
+    output = (activation_buffer_ptr + output_offset).to(tl.pointer_type(tl.uint32))
+    q_cols: tl.constexpr = N_COLS // 2
+    num_q_blocks: tl.constexpr = triton.cdiv(q_cols, BLOCK_Q_SIZE)
+    q_lanes = tl.arange(0, BLOCK_Q_SIZE)
+    scale_lanes = tl.arange(0, BLOCK_Q_SIZE // 8)
+    for block_idx in tl.static_range(0, num_q_blocks):
+        q_cols_in_block = block_idx * BLOCK_Q_SIZE + q_lanes
+        valid_q = q_cols_in_block < q_cols
+        packed = tl.load(
+            qdata + row_i64 * q_cols + q_cols_in_block.to(tl.int64),
+            mask=valid_q,
+            other=0,
+        )
+        scale_cols_in_block = block_idx * (BLOCK_Q_SIZE // 8) + scale_lanes
+        inner_scale = tl.load(
+            scales
+            + _cublas_blocked_scale_offset(
+                row,
+                scale_cols_in_block,
+                n_col_blocks,
+            ).to(tl.int64),
+            mask=scale_cols_in_block < scale_cols,
+            other=0,
+        )
+        scale_per_q = tl.broadcast_to(
+            inner_scale[:, None],
+            (BLOCK_Q_SIZE // 8, 8),
+        ).reshape((BLOCK_Q_SIZE,))
+        decoded = _decode_scaled_nvfp4x2_to_bf16x2(
+            packed,
+            scale_per_q,
+            global_scale_inv,
+        )
+        tl.store(
+            output + row_i64 * q_cols + q_cols_in_block.to(tl.int64),
+            decoded,
+            mask=valid_q,
+        )
 
 
 def dequantize_nvfp4(
@@ -524,6 +578,7 @@ def dequantize_nvfp4_activation_buffer_to_activation_buffer(
     capacity_rows: int,
     n_cols: int,
     execute_when_zero: bool,
+    execute_unconditionally: bool,
     row_scale_storage_multiple: int,
 ) -> None:
     """Dequantize one offset-backed NVFP4 row bundle into BF16 storage.
@@ -538,11 +593,12 @@ def dequantize_nvfp4_activation_buffer_to_activation_buffer(
         capacity_rows: Static maximum row count used for graph-stable launch.
         n_cols: Logical BF16 feature width.
         execute_when_zero: Whether a zero predicate selects this operation.
+        execute_unconditionally: Whether to ignore the predicate and always decode.
         row_scale_storage_multiple: Physical row-scale padding multiplier.
     """
     if capacity_rows == 0 or n_cols == 0:
         return
-    grid = (capacity_rows, triton.cdiv(n_cols, _BLOCK_SIZE))
+    grid = (capacity_rows,)
     _dequantize_nvfp4_activation_buffer_kernel[grid](
         activation_buffer,
         qdata_offset,
@@ -550,9 +606,10 @@ def dequantize_nvfp4_activation_buffer_to_activation_buffer(
         num_rows,
         output_offset,
         condition,
-        n_cols,
+        N_COLS=n_cols,
         EXECUTE_WHEN_ZERO=execute_when_zero,
+        EXECUTE_UNCONDITIONALLY=execute_unconditionally,
         ROW_SCALE_STORAGE_MULTIPLE=row_scale_storage_multiple,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        num_warps=4,
+        BLOCK_Q_SIZE=_ACTIVATION_DEQUANT_BLOCK_Q_SIZE,
+        num_warps=_ACTIVATION_DEQUANT_NUM_WARPS,
     )

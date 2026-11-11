@@ -729,6 +729,7 @@ def _dequantize_nvfp4_activation_buffer_to_buffer(
     capacity_rows: int,
     n_cols: int,
     execute_when_zero: bool = False,
+    execute_unconditionally: bool = False,
 ) -> None:
     """Conditionally decode a planner-owned NVFP4 row bundle to BF16.
 
@@ -742,6 +743,7 @@ def _dequantize_nvfp4_activation_buffer_to_buffer(
         capacity_rows: Static maximum row count for graph-stable launch.
         n_cols: Logical BF16 feature width.
         execute_when_zero: Whether zero selects the operation.
+        execute_unconditionally: Whether to ignore the predicate and always decode.
     """
     _validate_nvfp4_activation_buffer_dequantization(
         activation_buffer,
@@ -768,6 +770,7 @@ def _dequantize_nvfp4_activation_buffer_to_buffer(
         capacity_rows=capacity_rows,
         n_cols=n_cols,
         execute_when_zero=execute_when_zero,
+        execute_unconditionally=execute_unconditionally,
         row_scale_storage_multiple=ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
     )
 
@@ -783,9 +786,10 @@ def _dequantize_nvfp4_activation_buffer_to_buffer_fake(
     capacity_rows: int,
     n_cols: int,
     execute_when_zero: bool = False,
+    execute_unconditionally: bool = False,
 ) -> None:
     """Validate fake metadata for an offset-backed NVFP4 decode."""
-    del execute_when_zero
+    del execute_when_zero, execute_unconditionally
     _validate_nvfp4_activation_buffer_dequantization(
         activation_buffer,
         qdata_offset_1,
@@ -1426,24 +1430,21 @@ class _Nvfp4Bf16BackwardAdapter:
             derive_pipeline_depth=True,
         )
 
-        # The backward planner selects either the saved or recomputed packed-X
-        # row bundle. Decode it before the combine producer can reuse recompute
-        # row scratch for H2.
+        # The planner publishes the selected saved/recomputed packed-X offset
+        # before this graph-stable launch. Decode it before the combine
+        # producer can reuse recompute row scratch for H2.
         dispatch_offsets = backward_plan.blockscaled.recompute_dispatch_offsets
-        for execute_when_zero in (False, True):
-            _dequantize_nvfp4_activation_buffer_to_buffer(
-                activation_buffer.buffer,
-                dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
-                dispatch_offsets[
-                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
-                ],
-                num_recv_rows_1,
-                backward_plan.x_gathered_offset,
-                forward_plan.need_recompute,
-                capacity_rows,
-                hidden_dim,
-                execute_when_zero,
-            )
+        _dequantize_nvfp4_activation_buffer_to_buffer(
+            activation_buffer.buffer,
+            dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+            dispatch_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
+            num_recv_rows_1,
+            backward_plan.x_gathered_offset,
+            forward_plan.need_recompute,
+            capacity_rows,
+            hidden_dim,
+            execute_unconditionally=True,
+        )
 
         h1_placeholder = _activation_buffer_placeholder(
             activation_buffer.buffer,
@@ -1477,24 +1478,20 @@ class _Nvfp4Bf16BackwardAdapter:
             derive_pipeline_depth=True,
         )
 
-        # Exactly one predicate polarity executes on each replay. Keeping both
-        # launches makes dynamic save/recompute decisions graph-stable while
-        # always materializing H2_bw = DQ(Q(SwiGLU(H1))).
+        # The planner likewise publishes the selected H2 row-bundle offset
+        # before one graph-stable unconditional decode.
         combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
-        for execute_when_zero in (False, True):
-            _dequantize_nvfp4_activation_buffer_to_buffer(
-                activation_buffer.buffer,
-                combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
-                combine_offsets[
-                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
-                ],
-                num_recv_rows_1,
-                backward_plan.h2_offset,
-                forward_plan.need_recompute,
-                capacity_rows,
-                intermediate_dim,
-                execute_when_zero,
-            )
+        _dequantize_nvfp4_activation_buffer_to_buffer(
+            activation_buffer.buffer,
+            combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+            combine_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
+            num_recv_rows_1,
+            backward_plan.h2_offset,
+            forward_plan.need_recompute,
+            capacity_rows,
+            intermediate_dim,
+            execute_unconditionally=True,
+        )
         return h3_MD
 
 
