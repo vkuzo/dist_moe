@@ -51,6 +51,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--activation", choices=(*ACTIVATIONS, "all"))
     parser.add_argument("--pipeline", choices=PIPELINES, default="bf16")
+    parser.add_argument("--use-four-over-six", action="store_true")
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--windows", type=int, default=5)
@@ -84,6 +85,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             parser.error("NVFP4 activations must run in separate processes")
         if args.activation == "situ_glu":
             parser.error("SiTU-GLU currently supports BF16 execution only")
+    elif args.use_four_over_six:
+        parser.error("--use-four-over-six requires an NVFP4 pipeline")
     return args
 
 
@@ -102,6 +105,7 @@ def make_config(args: argparse.Namespace, activation: str) -> dist_moe.Config:
         block_scaled = dist_moe.BlockScaledConfig(
             format=dist_moe.BlockScaledFormat.NVFP4,
             pipeline=args.pipeline.removeprefix("nvfp4-"),
+            use_four_over_six=args.use_four_over_six,
         )
     return dist_moe.Config(
         max_num_local_input_tokens=args.tokens,
@@ -374,6 +378,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = {
                 "source_label": args.source_label,
                 "pipeline": args.pipeline,
+                "use_four_over_six": args.use_four_over_six,
                 "mode": args.mode,
                 "world_size": world_size,
                 "local_tokens": args.tokens,

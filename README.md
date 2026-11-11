@@ -371,6 +371,7 @@ torchrun --standalone --local-addr=127.0.0.1 --nproc-per-node=2 examples/block_s
 policy = dist_moe.BlockScaledConfig(
     format=dist_moe.BlockScaledFormat.NVFP4,
     pipeline="staged",
+    use_four_over_six=False,
 )
 config = dist_moe.Config(
     max_num_local_input_tokens=T,
@@ -384,6 +385,10 @@ config = dist_moe.Config(
     inference=True,
 )
 ```
+
+Set `use_four_over_six=True` to evaluate adaptive scale-for-4 and scale-for-6
+candidates in each NVFP4 block. The packed qdata and scale layouts are
+unchanged.
 
 For training, set `inference=False`, reserve at least one activation slot, pass
 native BF16 weights, and call `backward()` as in the BF16 quickstart.

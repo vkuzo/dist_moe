@@ -336,6 +336,7 @@ def _get_dist_blockscaled_kernel(
     dispatch_source_dtype: type[cutlass.Numeric] | None = None,
     blockscaled_dispatch: bool = False,
     nvfp4_high_throughput: bool = False,
+    use_four_over_six: bool = False,
     combine_swiglu_k: int | None = None,
     interleaved_fc13: bool = False,
     vector_dispatch_scale_copy: bool = False,
@@ -356,6 +357,7 @@ def _get_dist_blockscaled_kernel(
         dispatch_source_dtype,
         blockscaled_dispatch,
         nvfp4_high_throughput,
+        use_four_over_six,
         combine_swiglu_k,
         interleaved_fc13,
         vector_dispatch_scale_copy,
@@ -374,6 +376,7 @@ def _get_dist_blockscaled_kernel(
             dispatch_source_dtype=dispatch_source_dtype,
             blockscaled_dispatch=blockscaled_dispatch,
             nvfp4_high_throughput=nvfp4_high_throughput,
+            use_four_over_six=use_four_over_six,
             combine_swiglu_k=combine_swiglu_k,
             interleaved_fc13=interleaved_fc13,
             schedule_rotation=schedule_rotation,
@@ -415,6 +418,7 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
     combine_swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
     combine_swiglu_row_quant_only: bool = False,
     combine_precomputed_swiglu: bool = False,
+    use_four_over_six: bool = False,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -733,6 +737,7 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
         world_size=world_size,
         dispatch_source_dtype=dispatch_source_dtype,
         nvfp4_high_throughput=nvfp4_high_throughput,
+        use_four_over_six=use_four_over_six,
         combine_swiglu_k=combine_swiglu_k,
         schedule_rotation=not pre_shuffled_rows,
     )
@@ -1056,6 +1061,7 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
         combine_cache_tag,
         dispatch_source_dtype,
         nvfp4_high_throughput,
+        use_four_over_six,
         combine_swiglu_x_layout,
         combine_swiglu_y_layout,
         pre_shuffled_rows,
@@ -1124,6 +1130,7 @@ def _fused_dist_blockscaled_grouped_gemm_dispatch_quant_impl(  # noqa: C901
     m_multiple_of: int,
     return_wgrad_quant: bool,
     blockscaled_dispatch: bool = False,
+    use_four_over_six: bool = False,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -1465,6 +1472,7 @@ def _fused_dist_blockscaled_grouped_gemm_dispatch_quant_impl(  # noqa: C901
         dispatch_source_dtype=dispatch_quant_source_dtype,
         blockscaled_dispatch=blockscaled_dispatch,
         nvfp4_high_throughput=nvfp4_high_throughput,
+        use_four_over_six=use_four_over_six,
         interleaved_fc13=interleaved_fc13,
         # See _use_vector_dispatch_scale_copy: the byte-granular scale copy is
         # the decode latency bottleneck for the MX formats. NVFP4 keeps its
@@ -1680,6 +1688,7 @@ def _fused_dist_blockscaled_grouped_gemm_dispatch_quant_impl(  # noqa: C901
         dtype,
         blockscaled_dispatch,
         nvfp4_high_throughput,
+        use_four_over_six,
         use_device_tensormaps,
         use_activation_buffer,
         use_conditional_execution,
@@ -1753,6 +1762,7 @@ def dist_blockscaled_grouped_gemm_fprop_dispatch(
     m_multiple_of: int = _DEFAULT_M_MULTIPLE_OF,
     return_wgrad_quant: bool = False,
     blockscaled_dispatch: bool = False,
+    use_four_over_six: bool = False,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -1767,6 +1777,9 @@ def dist_blockscaled_grouped_gemm_fprop_dispatch(
     pre_shuffled_rows: bool = False,
 ):
     """Gather+quantize A over NVLink, then run block-scaled FPROP GEMM.
+
+    ``use_four_over_six`` applies adaptive NVFP4 scaling during the fused
+    activation quantization.
 
     With `activation_buffer`, activation-backed return tensors are shape-only
     aliases at buffer offset zero; consume results through `activation_offsets`.
@@ -1812,6 +1825,7 @@ def dist_blockscaled_grouped_gemm_fprop_dispatch(
             m_multiple_of=m_multiple_of,
             return_wgrad_quant=return_wgrad_quant,
             blockscaled_dispatch=blockscaled_dispatch,
+            use_four_over_six=use_four_over_six,
             activation_buffer=activation_buffer,
             activation_offsets=activation_offsets,
             conditional_execution=conditional_execution,
@@ -1856,6 +1870,7 @@ def dist_blockscaled_grouped_gemm_dgrad_dispatch(
     config: dict | None = None,
     m_multiple_of: int = _DEFAULT_M_MULTIPLE_OF,
     return_wgrad_quant: bool = False,
+    use_four_over_six: bool = False,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -1899,6 +1914,7 @@ def dist_blockscaled_grouped_gemm_dgrad_dispatch(
                 config=config,
                 m_multiple_of=m_multiple_of,
                 return_wgrad_quant=return_wgrad_quant,
+                use_four_over_six=use_four_over_six,
                 activation_buffer=activation_buffer,
                 activation_offsets=activation_offsets,
                 conditional_execution=conditional_execution,
@@ -1934,6 +1950,7 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(  # noqa: C901
     m_multiple_of: int = _DEFAULT_M_MULTIPLE_OF,
     num_output_tokens: int | None = None,
     return_wgrad_quant: bool = False,
+    use_four_over_six: bool = False,
     swiglu_fast_math: bool = False,
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
@@ -1956,6 +1973,9 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(  # noqa: C901
     pre_shuffled_rows: bool = False,
 ):
     """Run SwiGLU fwd + activation quant + FC2 FPROP GEMM + peer scatter.
+
+    ``use_four_over_six`` applies adaptive NVFP4 scaling during the fused
+    activation quantization.
 
     Activation-buffer launches address the input through `activation_offsets`
     and use `h1.dtype` to interpret its bytes; `h1` storage is consumed only by
@@ -2147,6 +2167,7 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(  # noqa: C901
         combine_swiglu_limit=swiglu_limit,
         combine_swiglu_row_quant_only=not return_wgrad_quant,
         combine_precomputed_swiglu=precomputed_swiglu,
+        use_four_over_six=use_four_over_six,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,

@@ -8,6 +8,7 @@
 
 import dataclasses
 import datetime
+import itertools
 import tempfile
 import unittest
 from functools import partial, wraps
@@ -67,6 +68,7 @@ from dist_moe.formats import (
     FP4_E2M1_MAX_RECIP,
     FP4_E2M1_TABLE,
     FP8_E4M3_MAX,
+    NVFP4_FOUR_OVER_SIX_MAX,
     NVFP4_GLOBAL_SCALE_EPS,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
@@ -252,7 +254,7 @@ def _nvfp4_outer_quant_scale(
             dim=tuple(range(tensor.ndim)),
             dtype=torch.float32,
         ).clamp(min=NVFP4_GLOBAL_SCALE_EPS)
-    normalizer = FP4_E2M1_MAX * 256.0 if use_four_over_six else NVFP4_MAX
+    normalizer = NVFP4_FOUR_OVER_SIX_MAX if use_four_over_six else NVFP4_MAX
     return normalizer * torch.reciprocal(amax)
 
 
@@ -1771,6 +1773,8 @@ class DistMoeConfigTest(unittest.TestCase):
                 format=dist_moe.BlockScaledFormat.NVFP4,
                 fast_math=True,
             )
+        with self.assertRaisesRegex(ValueError, "use_four_over_six"):
+            dist_moe.BlockScaledConfig(use_four_over_six=True)
 
     def test_nvfp4_training_accepts_aligned_dimensions(self) -> None:
         """Accept NVFP4 training while rejecting shapes outside its contract."""
@@ -3951,6 +3955,105 @@ class DistMoeKernelTest(unittest.TestCase):
             )
         )
 
+    def test_nvfp4_four_over_six_quant_kernels_match_reference(self) -> None:
+        """Match packed activation and weight operands bitwise to the reference."""
+        generator = torch.Generator(device="cuda").manual_seed(20261111)
+        activation_MD = torch.randn(
+            35,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        actual_q_MQ, actual_scale_MB, actual_scale_inv_M = (
+            blockscaled_impl._quantize_nvfp4_per_token(
+                activation_MD,
+                layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
+                use_four_over_six=True,
+            )
+        )
+        activation_outer_scale_M1 = _nvfp4_outer_quant_scale(
+            activation_MD,
+            per_token=True,
+            use_four_over_six=True,
+        )
+        expected_q_MQ, expected_scale_MB = _nvfp4_quantize_dist_moe_scale_order(
+            activation_MD,
+            activation_outer_scale_M1,
+            blocked_scales=False,
+            use_four_over_six=True,
+        )
+        expected_scale_inv_M = torch.div(
+            torch.ones_like(activation_outer_scale_M1[:, 0]),
+            activation_outer_scale_M1[:, 0],
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_q_MQ.view(torch.uint8),
+                expected_q_MQ.view(torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_scale_MB.view(torch.uint8),
+                expected_scale_MB.view(torch.uint8),
+            )
+        )
+        self.assertTrue(torch.equal(actual_scale_inv_M, expected_scale_inv_M))
+
+        weight_ENK = torch.randn(
+            2,
+            256,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        actual_q_ENQ, actual_scale_RB, actual_global_scale_E, _ = (
+            blockscaled_impl._prepare_nvfp4_weight_operands(
+                weight_ENK,
+                use_four_over_six=True,
+            )
+        )
+        expected_q = []
+        expected_scale = []
+        expected_global_scale = []
+        for expert_NK in weight_ENK:
+            outer_scale = _nvfp4_outer_quant_scale(
+                expert_NK,
+                per_token=False,
+                use_four_over_six=True,
+            )
+            qdata_NQ, scale_RB = _nvfp4_quantize_dist_moe_scale_order(
+                expert_NK,
+                outer_scale,
+                blocked_scales=True,
+                use_four_over_six=True,
+            )
+            expected_q.append(qdata_NQ)
+            expected_scale.append(scale_RB.flatten())
+            expected_global_scale.append(outer_scale)
+        expected_q_ENQ = torch.stack(expected_q)
+        expected_scale_RB = torch.cat(expected_scale).view_as(actual_scale_RB)
+        self.assertTrue(
+            torch.equal(
+                actual_q_ENQ.view(torch.uint8),
+                expected_q_ENQ.view(torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_scale_RB.view(torch.uint8),
+                expected_scale_RB.view(torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                actual_global_scale_E,
+                torch.stack(expected_global_scale),
+            )
+        )
+
     def test_nvfp4_four_over_six_improves_handcrafted_block_sqnr(self) -> None:
         """Select scale-for-4 for a block where it improves SQNR by over 8 dB.
 
@@ -4337,14 +4440,18 @@ class DistMoeKernelTest(unittest.TestCase):
     def test_nvfp4_training_backward_matches_real_quant_reference(self) -> None:
         """Match real-NVFP4 forward and BF16 STE backward for every path.
 
-        Matching Dist-MoE's inner-scale operation order makes forward, input
-        DGRAD, and W13 WGRAD bitwise identical. Score reduction and W2 WGRAD
-        retain only tightly bounded reduction-scheduling differences.
+        Matching Dist-MoE's inner-scale operation order makes forward bitwise
+        identical. The BF16 backward retains only tightly bounded
+        reduction-scheduling differences.
         """
-        for pipeline in ("staged", "mega"):
+        for pipeline, use_four_over_six in itertools.product(
+            ("staged", "mega"),
+            (False, True),
+        ):
             policy = dist_moe.BlockScaledConfig(
                 format=dist_moe.BlockScaledFormat.NVFP4,
                 pipeline=pipeline,
+                use_four_over_six=use_four_over_six,
             )
             base_context, case_a, _, w13_EFD, w2_EDF = self._create_case(
                 inference=False,
@@ -4353,6 +4460,7 @@ class DistMoeKernelTest(unittest.TestCase):
             for force_recompute in (False, True):
                 with self.subTest(
                     pipeline=pipeline,
+                    use_four_over_six=use_four_over_six,
                     force_recompute=force_recompute,
                 ):
                     context = base_context
@@ -4399,6 +4507,7 @@ class DistMoeKernelTest(unittest.TestCase):
                         reference[1],
                         reference[2],
                         reference[3],
+                        use_four_over_six=use_four_over_six,
                     )
                     grad_TD = torch.randn_like(actual_TD)
                     actual_TD.backward(grad_TD)
@@ -4412,10 +4521,15 @@ class DistMoeKernelTest(unittest.TestCase):
                         rtol=0,
                         atol=0,
                     )
+                    # Adaptive scaling changes enough BF16 operand bits to
+                    # expose the grouped-GEMM versus torch.mm accumulation
+                    # order. The quantized operands and forward stay bitwise;
+                    # only the separate BF16 backward reductions need bounds.
+                    adaptive_bf16_reduction_bound = 5e-3 if use_four_over_six else 0.0
                     gradient_bounds = {
-                        "x": 0.0,
+                        "x": adaptive_bf16_reduction_bound,
                         "topk_scores": 1e-6,
-                        "w13": 0.0,
+                        "w13": adaptive_bf16_reduction_bound,
                         "w2": 5e-4,
                     }
                     for name, actual_input, reference_input in zip(

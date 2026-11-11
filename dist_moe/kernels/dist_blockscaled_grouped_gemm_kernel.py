@@ -39,6 +39,7 @@ from .blockscaled_quantization_common import (
     _compute_row_amax_b16x2_x16,
     _cublas_blockscaled_qscale_offset,
     _load_tensor_row_as_b16x2,
+    _quantize_nvfp4_per_token_block_four_over_six,
     _reduce_nvfp4_block_amaxes,
     _scale_nvfp4_per_token_block,
     _warp_reduce_amax_f32,
@@ -265,6 +266,7 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
         dispatch_source_dtype: type[cutlass.Numeric] | None = None,
         blockscaled_dispatch: bool = False,
         nvfp4_high_throughput: bool = False,
+        use_four_over_six: bool = False,
         combine_swiglu_fast_math: bool = False,
         combine_swiglu_clamped: bool = False,
         combine_swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
@@ -300,6 +302,7 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
         self.DISPATCH_QUANT_QDATA_ELEMS_PER_WORD = 8 if self.is_fp4 else 4
         self.dispatch_quant_source_dtype = dispatch_source_dtype or cutlass.BFloat16
         self.blockscaled_dispatch = blockscaled_dispatch
+        self.use_four_over_six: cutlass.Constexpr[bool] = use_four_over_six
         (
             self.DISPATCH_QUANT_WARPS_PER_GROUP,
             self.DISPATCH_QUANT_GROUPS,
@@ -383,6 +386,7 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
         dispatch_source_dtype: type[cutlass.Numeric] | None = None,
         blockscaled_dispatch: bool = False,
         nvfp4_high_throughput: bool = False,
+        use_four_over_six: bool = False,
         combine_swiglu_k: int | None = None,
         interleaved_fc13: bool = False,
         schedule_rotation: bool = True,
@@ -392,6 +396,7 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
             dispatch_source_dtype=dispatch_source_dtype,
             blockscaled_dispatch=blockscaled_dispatch,
             nvfp4_high_throughput=nvfp4_high_throughput,
+            use_four_over_six=use_four_over_six,
             combine_swiglu_fast_math=bool(
                 config.get("COMBINE_SWIGLU_FAST_MATH", False)
             ),
@@ -958,7 +963,8 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
                     row_scale = cutlass.Float32(0.0)
                     if warp_lane == cutlass.Int32(0):
                         row_scale, token_scale_inv = _compute_nvfp4_token_scales(
-                            warpgroup_amax
+                            warpgroup_amax,
+                            self.use_four_over_six,
                         )
                         if warp_in_group == cutlass.Int32(0):
                             mRowGlobalScaleInv[row] = token_scale_inv
@@ -979,7 +985,8 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
                         warpgroup_amax = _warp_reduce_amax_f32(warpgroup_amax)
                         if warp_lane == cutlass.Int32(0):
                             row_scale, token_scale_inv = _compute_nvfp4_token_scales(
-                                warpgroup_amax
+                                warpgroup_amax,
+                                self.use_four_over_six,
                             )
                             cute.arch.store(
                                 reduction_smem + scale_slot,
@@ -1019,25 +1026,36 @@ class DistBlockScaledGroupedGemmKernel(BlockScaledGroupedGemmKernel):
                 for block_rep in cutlass.range_constexpr(blocks_per_lane):
                     scale_col = block_rep * num_threads + group_lane
                     if scale_col < scale_cols:
-                        scale_byte = _scale_nvfp4_per_token_block(
-                            packed,
-                            block_rep,
-                            block_amaxes[block_rep],
-                            row_scale,
-                            mNvfp4RecipLut,
-                            self.dispatch_quant_source_dtype,
-                            values,
-                        )
                         q_words = cute.make_rmem_tensor(2, cutlass.Uint32)
-                        _pack_fp4_e2m1_xn_to_u32_rn(
-                            values,
-                            q_words,
-                            base=0,
-                            packed_base=0,
-                            recip=cutlass.Float32(1.0),
-                            num_elems=values_per_block,
-                            scale_values=False,
-                        )
+                        if cutlass.const_expr(self.use_four_over_six):
+                            scale_byte = _quantize_nvfp4_per_token_block_four_over_six(
+                                packed,
+                                block_rep,
+                                block_amaxes[block_rep],
+                                row_scale,
+                                mNvfp4RecipLut,
+                                self.dispatch_quant_source_dtype,
+                                q_words,
+                            )
+                        else:
+                            scale_byte = _scale_nvfp4_per_token_block(
+                                packed,
+                                block_rep,
+                                block_amaxes[block_rep],
+                                row_scale,
+                                mNvfp4RecipLut,
+                                self.dispatch_quant_source_dtype,
+                                values,
+                            )
+                            _pack_fp4_e2m1_xn_to_u32_rn(
+                                values,
+                                q_words,
+                                base=0,
+                                packed_base=0,
+                                recip=cutlass.Float32(1.0),
+                                num_elems=values_per_block,
+                                scale_values=False,
+                            )
                         q_word_col = scale_col * 2
                         q_ptr = mRowQWords.iterator + cute.crd2idx(
                             (ring_row, q_word_col),

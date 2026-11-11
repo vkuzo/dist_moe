@@ -100,6 +100,8 @@ from .formats import (
     block_scaled_format_constants,
     BlockScaledFormat,
     FP4_FORMATS,
+    NVFP4_FOUR_OVER_SIX_MAX,
+    NVFP4_MAX,
     ScaleFactorLayout,
 )
 from .kernels.blockscaled_grouped_gemm import (
@@ -146,6 +148,7 @@ _BACKWARD_NON_WEIGHT_STATE = slice(10, None)
 def _prepare_nvfp4_weight_operands(
     weight_ENK: torch.Tensor,
     fuse_swiglu: bool = False,
+    use_four_over_six: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize grouped NVFP4 weights with the bundled Triton quantizer.
 
@@ -153,6 +156,8 @@ def _prepare_nvfp4_weight_operands(
         weight_ENK: Native grouped weight with expert, output, and input axes.
         fuse_swiglu: Interleave W13 qdata and natural scale rows for fused
             inference after quantization, preserving canonical scale groups.
+        use_four_over_six: Adaptively select the lower-error 4x or 6x NVFP4
+            block scale.
 
     Returns:
         Packed qdata ``[E, N, K / 2]``, blocked scales, per-expert global
@@ -173,7 +178,10 @@ def _prepare_nvfp4_weight_operands(
         nvfp4_weight_global_scale,
     )
 
-    global_scale_E = nvfp4_weight_global_scale(weight_ENK).detach()
+    global_scale_E = nvfp4_weight_global_scale(
+        weight_ENK,
+        numerator=(NVFP4_FOUR_OVER_SIX_MAX if use_four_over_six else NVFP4_MAX),
+    ).detach()
     global_scale_EN = expand_global_scale_for_rows(
         global_scale_E,
         weight_ENK.shape,
@@ -190,6 +198,7 @@ def _prepare_nvfp4_weight_operands(
         ),
         is_a=False,
         global_scale=global_scale_EN,
+        use_four_over_six=use_four_over_six,
     )
     if fuse_swiglu:
         from .kernels.scale_factor_layout import natural_to_cublas_blocked
@@ -205,12 +214,14 @@ def _prepare_nvfp4_weight_operands(
 def _prepare_nvfp4_weight_fake(
     weight_ENK: torch.Tensor,
     fuse_swiglu: bool = False,
+    use_four_over_six: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Describe inference operands without running quantization on fake data.
 
     Args:
         weight_ENK: Grouped BF16 weight with shape ``[E, N, K]``.
         fuse_swiglu: Whether the prepared W13 rows are interleaved.
+        use_four_over_six: Whether the real quantizer selects 4x/6x scales.
 
     Returns:
         Packed qdata, padded blocked scales and two per-expert FP32 scales.
@@ -1045,6 +1056,7 @@ def _stage_blockscaled_dispatch(
         _quantize_nvfp4_per_token(
             x,
             layout=ScaleFactorLayout.NATURAL,
+            use_four_over_six=cfg.use_four_over_six,
             q_out=q_out,
             scale_out=scale_out,
             token_scale_inv_out=token_scale_out[:, 0],
@@ -1111,6 +1123,7 @@ class _BlockscaledConfig:
 
     format: BlockScaledFormat
     fast_math: bool = False
+    use_four_over_six: bool = False
     mega: bool = False
     interleaved_fc13: bool = False
     routing_capacity: int | None = None
@@ -1291,6 +1304,7 @@ class _Nvfp4Bf16BackwardAdapter:
             m_multiple_of=m_multiple_of,
             return_wgrad_quant=False,
             blockscaled_dispatch=True,
+            use_four_over_six=self.blockscaled_cfg.use_four_over_six,
             activation_buffer=activation_buffer.buffer,
             activation_offsets=backward_plan.blockscaled.recompute_dispatch_offsets,
             conditional_execution=forward_plan.need_recompute,
@@ -1335,6 +1349,7 @@ class _Nvfp4Bf16BackwardAdapter:
             m_multiple_of=m_multiple_of,
             num_output_tokens=num_local_input_tokens,
             return_wgrad_quant=False,
+            use_four_over_six=self.blockscaled_cfg.use_four_over_six,
             swiglu_fast_math=self.blockscaled_cfg.fast_math,
             swiglu_clamped=self.execution_context.config.activation == _SWIGLU_CLAMPED,
             swiglu_alpha=self.execution_context.config.swiglu_alpha,
@@ -1531,7 +1546,10 @@ def _prepare_blockscaled_weight_impl(
         )
     if cfg.format is BlockScaledFormat.NVFP4:
         w_q_fprop, w_scale_fprop, _, w_global_scale_inv = (
-            _prepare_nvfp4_weight_operands(w)
+            _prepare_nvfp4_weight_operands(
+                w,
+                use_four_over_six=cfg.use_four_over_six,
+            )
         )
         # Native BF16 weights are quantized again in backward and dequantized
         # for the shared dense gradient path. Mirror FPROP in the fixed DGRAD
@@ -2496,6 +2514,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             swiglu_limit=swiglu_limit,
                             return_x_wgrad_quant=save_col_quant,
                             blockscaled_dispatch=blockscaled_dispatch,
+                            use_four_over_six=blockscaled_cfg.use_four_over_six,
                             return_h2_wgrad_quant=save_col_quant,
                             activation_buffer=(
                                 None
@@ -2580,6 +2599,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         m_multiple_of=gemm_m_multiple,
                         return_wgrad_quant=save_col_quant,
                         blockscaled_dispatch=blockscaled_dispatch,
+                        use_four_over_six=blockscaled_cfg.use_four_over_six,
                         activation_buffer=activation_buffer.buffer,
                         activation_offsets=forward_plan.blockscaled.dispatch_offsets,
                         w_global_scale_inv=(w13_handle.blockscaled.w_global_scale_inv),
@@ -2607,6 +2627,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             m_multiple_of=gemm_m_multiple,
                             num_output_tokens=num_tokens,
                             return_wgrad_quant=save_col_quant,
+                            use_four_over_six=blockscaled_cfg.use_four_over_six,
                             swiglu_fast_math=blockscaled_cfg.fast_math,
                             swiglu_clamped=activation == _SWIGLU_CLAMPED,
                             swiglu_alpha=swiglu_alpha,
@@ -3064,6 +3085,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         swiglu_alpha=swiglu_alpha,
                         swiglu_limit=swiglu_limit,
                         blockscaled_dispatch=False,
+                        use_four_over_six=blockscaled_cfg.use_four_over_six,
                         return_x_wgrad_quant=save_col_quant,
                         return_h2_wgrad_quant=save_col_quant,
                         activation_buffer=activation_buffer.buffer,
@@ -3090,6 +3112,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         m_multiple_of=dist_bs_gemm.DEFAULT_M_MULTIPLE_OF,
                         return_wgrad_quant=save_col_quant,
                         blockscaled_dispatch=False,
+                        use_four_over_six=blockscaled_cfg.use_four_over_six,
                         activation_buffer=activation_buffer.buffer,
                         activation_offsets=backward_plan.blockscaled.recompute_dispatch_offsets,
                         conditional_execution=conditional_recompute,
@@ -3117,6 +3140,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         m_multiple_of=dist_bs_gemm.DEFAULT_M_MULTIPLE_OF,
                         num_output_tokens=num_tokens,
                         return_wgrad_quant=save_col_quant,
+                        use_four_over_six=blockscaled_cfg.use_four_over_six,
                         swiglu_fast_math=blockscaled_cfg.fast_math,
                         swiglu_clamped=activation == _SWIGLU_CLAMPED,
                         swiglu_alpha=swiglu_alpha,
@@ -3940,7 +3964,11 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
                 scale_RB,
                 global_scale_E,
                 global_scale_inv_E,
-            ) = _prepare_nvfp4_weight_operands(weight, fuse_swiglu=fuse_swiglu)
+            ) = _prepare_nvfp4_weight_operands(
+                weight,
+                fuse_swiglu=fuse_swiglu,
+                use_four_over_six=config.use_four_over_six,
+            )
         return PreparedWeight._create(
             source=weight,
             format=config.format,
@@ -4084,6 +4112,7 @@ def _blockscaled_compute_config(
     blockscaled_cfg = _BlockscaledConfig(
         format=_kernel_block_scaled_format(policy.format),
         fast_math=policy.fast_math,
+        use_four_over_six=policy.use_four_over_six,
         mega=policy.pipeline == "mega",
         static_inference_storage=context.config.inference
         and context.config.vmm is None,

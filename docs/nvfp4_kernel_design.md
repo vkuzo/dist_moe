@@ -146,6 +146,15 @@ reduce its block maxima, and publish packed H2, blocked E4M3 scales, and the
 FP32 inverse row scale. MXFP8 has no per-token global scale and can quantize
 interleaved H2 in the epilogue without this dense staging.
 
+When `use_four_over_six=True`, the quant producers reserve an outer range of
+256 instead of 448 and form scale-for-6 and scale-for-4 candidates per
+16-value block. They cast packed E2M1 and E4M3 pairs directly to FP16, multiply
+in FP16x2, widen the products to FP32, and select the smaller FP32 squared
+error. This follows [Four-over-Six](https://github.com/mit-han-lab/fouroversix)
+and the optimized product-domain contract described in
+[NVFP4 RL](https://humansand.ai/blog/nvfp4-rl). The selected qdata and E4M3
+scale use the ordinary NVFP4 wire layout.
+
 Eligible Mega configurations use a scheduler relay to publish shared chunk
 work records to TMA, MMA, and epilogue roles. FC2 consumes H2 only after its
 quantization counter is ready. Relay records do not replace the row-readiness

@@ -366,18 +366,8 @@ def _compute_e8m0_scale_rceil(
 
 
 @triton.jit
-def _compute_nvfp4_scale_rtne(max_abs):
-    """Round-to-nearest-even NVFP4 block scale and its fp32 reciprocal.
-
-    Inf/NaN in ``max_abs`` maps to the E4M3 NaN byte 0x7F -- NVFP4 can't signal
-    NaN in the E2M1 data byte, so it rides the scale byte (and 1/NaN then poisons
-    the block). The scale is returned as ``float8e4nv`` (not bitcast) so its byte
-    never co-lives with the reciprocal across a scale ``tl.store`` (NVFP4 Triton
-    miscompile).
-    """
-    tl.static_assert(max_abs.dtype == tl.float32, "max_abs must be fp32")
-    block_amax = tl.where(max_abs == float("inf"), float("nan"), max_abs)
-    scale_input = block_amax * _TL_FP4_E2M1_MAX_RECIP
+def _cast_nvfp4_scale_rtne(scale_input):
+    """Round an already-normalized FP32 value to an NVFP4 E4M3 scale."""
     # ``satfinite`` covers the top (>448 -> 448) + NaN -> 0x7F; the clamp's lower
     # bound is the EPS rule keeping scale off zero so 1/scale stays finite.
     scale_input = tl.clamp(
@@ -407,6 +397,21 @@ def _compute_nvfp4_scale_rtne(max_abs):
     scale_fp8 = scale_u8.to(tl.float8e4nv, bitcast=True)
     recip_scale = _TL_FP32_ONE / scale_fp8.to(tl.float32)
     return scale_fp8, recip_scale
+
+
+@triton.jit
+def _compute_nvfp4_scale_rtne(max_abs):
+    """Round-to-nearest-even NVFP4 block scale and its fp32 reciprocal.
+
+    Inf/NaN in ``max_abs`` maps to the E4M3 NaN byte 0x7F -- NVFP4 can't signal
+    NaN in the E2M1 data byte, so it rides the scale byte (and 1/NaN then poisons
+    the block). The scale is returned as ``float8e4nv`` (not bitcast) so its byte
+    never co-lives with the reciprocal across a scale ``tl.store`` (NVFP4 Triton
+    miscompile).
+    """
+    tl.static_assert(max_abs.dtype == tl.float32, "max_abs must be fp32")
+    block_amax = tl.where(max_abs == float("inf"), float("nan"), max_abs)
+    return _cast_nvfp4_scale_rtne(block_amax * _TL_FP4_E2M1_MAX_RECIP)
 
 
 @triton.jit
@@ -951,6 +956,221 @@ def _pack_fp4_e2m1_blocks_to_u32(
     v1, v5 = tl.split(odd_lo)
     v3, v7 = tl.split(odd_hi)
     return _pack_fp4_e2m1x8_to_u32(v0, v1, v2, v3, v4, v5, v6, v7)
+
+
+@triton.jit
+def _four_over_six_word_errors(q4_word, q6_word, packed_scales, targets):
+    """Score eight packed FP4 values for both Four-over-Six candidates.
+
+    E2M1 and E4M3 are converted directly to FP16x2 and multiplied there, as
+    described by https://humansand.ai/blog/nvfp4-rl and implemented in
+    https://github.com/mit-han-lab/fouroversix. Only the loss accumulation is
+    widened to FP32.
+    """
+    n_blocks: tl.constexpr = targets.numel // 8
+    even, odd = tl.split(tl.reshape(targets, (n_blocks, 4, 2)))
+    even_lo, even_hi = tl.split(tl.reshape(even, (n_blocks, 2, 2)))
+    odd_lo, odd_hi = tl.split(tl.reshape(odd, (n_blocks, 2, 2)))
+    target0, target4 = tl.split(even_lo)
+    target2, target6 = tl.split(even_hi)
+    target1, target5 = tl.split(odd_lo)
+    target3, target7 = tl.split(odd_hi)
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .b8 q40, q41, q42, q43;
+            .reg .b8 q60, q61, q62, q63;
+            .reg .b16 scale_pair, scale4_h, scale6_h, product_lo, product_hi;
+            .reg .b32 scale_h2, scale4_h2, scale6_h2, q_h2, product_h2;
+            .reg .f32 candidate, diff, square;
+
+            mov.f32 $0, 0f00000000;
+            mov.f32 $1, 0f00000000;
+            cvt.u16.u32 scale_pair, $4;
+            cvt.rn.f16x2.e4m3x2 scale_h2, scale_pair;
+            mov.b32 {scale4_h, scale6_h}, scale_h2;
+            mov.b32 scale4_h2, {scale4_h, scale4_h};
+            mov.b32 scale6_h2, {scale6_h, scale6_h};
+            mov.b32 {q40, q41, q42, q43}, $2;
+            mov.b32 {q60, q61, q62, q63}, $3;
+
+            cvt.rn.f16x2.e2m1x2 q_h2, q40;
+            mul.rn.f16x2 product_h2, q_h2, scale4_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $5;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $6;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.rn.f16x2.e2m1x2 q_h2, q60;
+            mul.rn.f16x2 product_h2, q_h2, scale6_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $5;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $6;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+
+            cvt.rn.f16x2.e2m1x2 q_h2, q41;
+            mul.rn.f16x2 product_h2, q_h2, scale4_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $7;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $8;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.rn.f16x2.e2m1x2 q_h2, q61;
+            mul.rn.f16x2 product_h2, q_h2, scale6_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $7;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $8;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+
+            cvt.rn.f16x2.e2m1x2 q_h2, q42;
+            mul.rn.f16x2 product_h2, q_h2, scale4_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $9;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $10;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.rn.f16x2.e2m1x2 q_h2, q62;
+            mul.rn.f16x2 product_h2, q_h2, scale6_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $9;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $10;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+
+            cvt.rn.f16x2.e2m1x2 q_h2, q43;
+            mul.rn.f16x2 product_h2, q_h2, scale4_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $11;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $12;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $0, $0, square;
+            cvt.rn.f16x2.e2m1x2 q_h2, q63;
+            mul.rn.f16x2 product_h2, q_h2, scale6_h2;
+            mov.b32 {product_lo, product_hi}, product_h2;
+            cvt.f32.f16 candidate, product_lo;
+            sub.rn.f32 diff, candidate, $11;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+            cvt.f32.f16 candidate, product_hi;
+            sub.rn.f32 diff, candidate, $12;
+            mul.rn.f32 square, diff, diff;
+            add.rn.f32 $1, $1, square;
+        }
+        """,
+        constraints="=f,=f,r,r,r,f,f,f,f,f,f,f,f",
+        args=[
+            q4_word,
+            q6_word,
+            packed_scales,
+            target0,
+            target1,
+            target2,
+            target3,
+            target4,
+            target5,
+            target6,
+            target7,
+        ],
+        dtype=(tl.float32, tl.float32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _quantize_nvfp4_four_over_six(
+    x_values,
+    max_abs,
+    global_scale,
+    N_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Return selected E4M3 scales and already-packed E2M1 qdata."""
+    tl.static_assert(BLOCK_SIZE == 16, "Four-over-Six requires NVFP4 16-value blocks")
+    global_scale_safe = _safe_global_scale(global_scale)
+    # Keep this operation order synchronized with the public reference:
+    # raw6 = (amax * outer_scale) * fl(1/6), raw4 = raw6 * 1.5.
+    raw_scale6 = (max_abs * global_scale_safe) * _TL_FP4_E2M1_MAX_RECIP
+    scale6, _ = _cast_nvfp4_scale_rtne(raw_scale6)
+    scale4, _ = _cast_nvfp4_scale_rtne(raw_scale6 * 1.5)
+
+    multiplier4 = tl.div_rn(global_scale_safe, scale4.to(tl.float32))
+    multiplier6 = tl.div_rn(global_scale_safe, scale6.to(tl.float32))
+    q4 = _pack_fp4_e2m1_blocks_to_u32(
+        x_values * multiplier4[:, None],
+        N_BLOCKS=N_BLOCKS,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    q6 = _pack_fp4_e2m1_blocks_to_u32(
+        x_values * multiplier6[:, None],
+        N_BLOCKS=N_BLOCKS,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    q4_word0, q4_word1 = tl.split(q4)
+    q6_word0, q6_word1 = tl.split(q6)
+    target_words = tl.permute(
+        tl.reshape(
+            x_values * global_scale_safe[:, None],
+            (N_BLOCKS, 2, 8),
+        ),
+        (0, 2, 1),
+    )
+    target_word0, target_word1 = tl.split(target_words)
+    packed_scales = scale4.to(tl.uint8, bitcast=True).to(tl.uint32) | (
+        scale6.to(tl.uint8, bitcast=True).to(tl.uint32) << 8
+    )
+    error4_lo, error6_lo = _four_over_six_word_errors(
+        q4_word0,
+        q6_word0,
+        packed_scales,
+        target_word0,
+    )
+    error4_hi, error6_hi = _four_over_six_word_errors(
+        q4_word1,
+        q6_word1,
+        packed_scales,
+        target_word1,
+    )
+    error4 = error4_lo + error4_hi
+    error6 = error6_lo + error6_hi
+    select4 = error4 < error6
+    selected_scale = tl.where(select4, scale4, scale6)
+    selected_q = tl.join(
+        tl.where(select4, q4_word0, q6_word0),
+        tl.where(select4, q4_word1, q6_word1),
+    )
+    return selected_scale.to(tl.uint8, bitcast=True), selected_q
 
 
 @triton.jit
@@ -1730,8 +1950,18 @@ def _get_row1d_tile_kernel_config(format_id: int) -> _Row1dTileKernelConfig:
 
 def _get_row1d_cublas_blocked_kernel_config(
     format_id: int,
+    use_four_over_six: bool = False,
 ) -> _Row1dCublasBlockedKernelConfig | None:
     if format_id == BlockScaledFormatId.NVFP4.value:
+        if use_four_over_six:
+            # The adaptive scorer has enough packed conversion work to benefit
+            # from more threads per CTA. A local sweep over m_tile={32,64,128}
+            # and num_warps={1,4,8,16} selected 64/4 on B200.
+            return _Row1dCublasBlockedKernelConfig(
+                m_tile=64,
+                block_size=16,
+                num_warps=4,
+            )
         # m_tile=32, num_warps=1 was the sweep winner after the inf/NaN
         # correctness fixes and the llama4x-style refactor. The kernel became
         # compute-bound from the per-element NaN check, so smaller CTAs with
@@ -1975,6 +2205,7 @@ def _triton_quantize_blockscaled_row1d_tile(  # noqa: C901, TR001 -- format-spec
     # Quant / format config.
     FORMAT_ID: tl.constexpr,
     USE_HALF_RANGE_SCALE: tl.constexpr,
+    USE_FOUR_OVER_SIX: tl.constexpr,
     FAST_MATH: tl.constexpr,
     CLAMPED: tl.constexpr,
     ALPHA: tl.constexpr,
@@ -2057,7 +2288,19 @@ def _triton_quantize_blockscaled_row1d_tile(  # noqa: C901, TR001 -- format-spec
 
     # Per-vector block amax with NaN-preserving reduction.
     max_abs = _compute_block_amax_nonfinite(x, AXIS=1)
-    if FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4 and HAS_GLOBAL_SCALE:
+    if (
+        FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4
+        and HAS_GLOBAL_SCALE
+        and USE_FOUR_OVER_SIX
+    ):
+        scale_u8, packed_q = _quantize_nvfp4_four_over_six(
+            x,
+            max_abs,
+            global_scale,
+            N_BLOCKS=n_scale_blocks,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+    elif FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4 and HAS_GLOBAL_SCALE:
         scale_fp8, recip_scale = _nvfp4_scale_and_recip(
             max_abs,
             global_scale,
@@ -2076,19 +2319,37 @@ def _triton_quantize_blockscaled_row1d_tile(  # noqa: C901, TR001 -- format-spec
         mask=valid_blocks,
         cache_modifier=".cs",
     )
-    _store_row1d_qdata_row_major(
-        x_values=x,
-        recip_scale=recip_scale,
-        rows=rows,
-        scale_col=scale_col,
-        elem_mask=load_mask,
-        valid_blocks=valid_blocks,
-        q_ptr=q_ptr,
-        FORMAT_ID=FORMAT_ID,
-        Q_COLS=Q_COLS,
-        N_BLOCKS=n_scale_blocks,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    if (
+        FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4
+        and HAS_GLOBAL_SCALE
+        and USE_FOUR_OVER_SIX
+    ):
+        q_word_col = (
+            scale_col[:, None] * (BLOCK_SIZE // 8)
+            + tl.arange(0, BLOCK_SIZE // 8)[None, :]
+        )
+        _store_row1d_fp4_qdata_packed_u32_row_major(
+            q_ptr,
+            packed_q,
+            rows,
+            q_word_col,
+            valid_blocks,
+            Q_COLS,
+        )
+    else:
+        _store_row1d_qdata_row_major(
+            x_values=x,
+            recip_scale=recip_scale,
+            rows=rows,
+            scale_col=scale_col,
+            elem_mask=load_mask,
+            valid_blocks=valid_blocks,
+            q_ptr=q_ptr,
+            FORMAT_ID=FORMAT_ID,
+            Q_COLS=Q_COLS,
+            N_BLOCKS=n_scale_blocks,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
 
 
 # =============================================================================
@@ -2199,6 +2460,7 @@ def _triton_quantize_blockscaled_row1d_cublas_blocked(  # noqa: C901, TR001 -- c
     # Quant / format config.
     FORMAT_ID: tl.constexpr,
     USE_HALF_RANGE_SCALE: tl.constexpr,
+    USE_FOUR_OVER_SIX: tl.constexpr,
     FAST_MATH: tl.constexpr,
     CLAMPED: tl.constexpr,
     ALPHA: tl.constexpr,
@@ -2302,7 +2564,28 @@ def _triton_quantize_blockscaled_row1d_cublas_blocked(  # noqa: C901, TR001 -- c
     if USE_64BIT_OFFSETS:
         rows = rows.to(tl.int64)
 
-    if FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4 and HAS_GLOBAL_SCALE:
+    if (
+        FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4
+        and HAS_GLOBAL_SCALE
+        and USE_FOUR_OVER_SIX
+    ):
+        x_values = tl.reshape(x_blocks, (n_scale_blocks, BLOCK_SIZE))
+        global_scale_blocks = tl.reshape(
+            global_scale + tl.zeros_like(max_abs),
+            (n_scale_blocks,),
+        )
+        scale_u8, packed_q = _quantize_nvfp4_four_over_six(
+            x_values,
+            tl.reshape(max_abs, (n_scale_blocks,)),
+            global_scale_blocks,
+            N_BLOCKS=n_scale_blocks,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        scale_u8 = tl.reshape(
+            scale_u8,
+            (M_TILE, _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM),
+        )
+    elif FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4 and HAS_GLOBAL_SCALE:
         scale_fp8, recip_scale = _nvfp4_scale_and_recip(
             max_abs,
             global_scale,
@@ -2338,7 +2621,24 @@ def _triton_quantize_blockscaled_row1d_cublas_blocked(  # noqa: C901, TR001 -- c
             K_TILE=k_tile,
         )
     else:
-        if FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4:
+        if (
+            FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4
+            and HAS_GLOBAL_SCALE
+            and USE_FOUR_OVER_SIX
+        ):
+            q_word_col = (
+                scale_col[:, None] * (BLOCK_SIZE // 8)
+                + tl.arange(0, BLOCK_SIZE // 8)[None, :]
+            )
+            _store_row1d_fp4_qdata_packed_u32_row_major(
+                q_ptr,
+                packed_q,
+                rows,
+                q_word_col,
+                valid_blocks,
+                Q_COLS,
+            )
+        elif FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4:
             # NVFP4 reciprocal recomputed at point of use. The fp8 reciprocal
             # carried from the shared top-level scale+recip helper is corrupted
             # once it co-exists with the bitcast scale byte across the scale
@@ -2352,24 +2652,34 @@ def _triton_quantize_blockscaled_row1d_cublas_blocked(  # noqa: C901, TR001 -- c
                 )
             else:
                 _, recip_scale = _compute_nvfp4_scale_rtne(max_abs)
-        _store_row1d_qdata_row_major(
-            x_values=tl.reshape(x_blocks, (n_scale_blocks, BLOCK_SIZE)),
-            recip_scale=tl.reshape(recip_scale, (n_scale_blocks,)),
-            rows=rows,
-            scale_col=scale_col,
-            elem_mask=tl.reshape(
-                tl.reshape(
-                    mask, (M_TILE, _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM, BLOCK_SIZE)
+        if not (
+            FORMAT_ID == _TL_BLOCK_SCALED_FORMAT_NVFP4
+            and HAS_GLOBAL_SCALE
+            and USE_FOUR_OVER_SIX
+        ):
+            _store_row1d_qdata_row_major(
+                x_values=tl.reshape(x_blocks, (n_scale_blocks, BLOCK_SIZE)),
+                recip_scale=tl.reshape(recip_scale, (n_scale_blocks,)),
+                rows=rows,
+                scale_col=scale_col,
+                elem_mask=tl.reshape(
+                    tl.reshape(
+                        mask,
+                        (
+                            M_TILE,
+                            _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM,
+                            BLOCK_SIZE,
+                        ),
+                    ),
+                    (n_scale_blocks, BLOCK_SIZE),
                 ),
-                (n_scale_blocks, BLOCK_SIZE),
-            ),
-            valid_blocks=valid_blocks,
-            q_ptr=q_ptr,
-            FORMAT_ID=FORMAT_ID,
-            Q_COLS=Q_COLS,
-            N_BLOCKS=n_scale_blocks,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+                valid_blocks=valid_blocks,
+                q_ptr=q_ptr,
+                FORMAT_ID=FORMAT_ID,
+                Q_COLS=Q_COLS,
+                N_BLOCKS=n_scale_blocks,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
 
 
 # =============================================================================
@@ -3475,6 +3785,7 @@ def quantize_block_scaled(  # noqa: C901 -- host validation/launch setup is form
     layout_id: int,
     is_a: bool,
     half_range_scale: bool = False,
+    use_four_over_six: bool = False,
     fast_math: bool = False,
     clamped: bool = False,
     alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
@@ -3486,7 +3797,11 @@ def quantize_block_scaled(  # noqa: C901 -- host validation/launch setup is form
     make_contiguous: bool = True,
     global_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a tensor, optionally evaluating an elementwise producer first."""
+    """Quantize a tensor, optionally evaluating an elementwise producer first.
+
+    Four-over-Six is supported for dynamically scaled NVFP4 row quantization.
+    It changes only candidate selection; qdata and scale storage are unchanged.
+    """
     clamped, alpha, limit = canonical_swiglu_clamp(clamped, alpha, limit)
     if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise TypeError(
@@ -3514,6 +3829,12 @@ def quantize_block_scaled(  # noqa: C901 -- host validation/launch setup is form
             )
         if global_scale.device != x.device:
             raise ValueError("global_scale must be on the input device")
+    if use_four_over_six and (
+        format_id != BlockScaledFormatId.NVFP4.value or global_scale is None
+    ):
+        raise ValueError(
+            "use_four_over_six requires NVFP4 quantization with global_scale"
+        )
 
     if x.ndim == 2:
         x_storage = x
@@ -3599,6 +3920,7 @@ def quantize_block_scaled(  # noqa: C901 -- host validation/launch setup is form
         "Q_COLS": q_storage.shape[-1],
         "FORMAT_ID": format_id,
         "USE_HALF_RANGE_SCALE": half_range_scale,
+        "USE_FOUR_OVER_SIX": use_four_over_six,
         "FAST_MATH": fast_math,
         "CLAMPED": clamped,
         "ALPHA": alpha,
@@ -3613,7 +3935,7 @@ def quantize_block_scaled(  # noqa: C901 -- host validation/launch setup is form
     }
 
     blocked_config = (
-        _get_row1d_cublas_blocked_kernel_config(format_id)
+        _get_row1d_cublas_blocked_kernel_config(format_id, use_four_over_six)
         if layout_id == ScaleFactorLayoutId.CUBLAS_BLOCKED.value
         else None
     )
