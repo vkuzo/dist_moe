@@ -388,17 +388,22 @@ def _nvfp4_real_quant_linear(
     return _NVFP4RealQuantLinearSTE.apply(input_MK, weight_NK)
 
 
-def _dist_moe_nvfp4_activation_qdq(tensor: torch.Tensor) -> torch.Tensor:
-    """Run Dist-MoE's exact per-token NVFP4 quantize-dequantize pair."""
+def _reference_nvfp4_activation_qdq(tensor: torch.Tensor) -> torch.Tensor:
+    """Decode Dist-MoE's activation quantization with the independent recipe."""
     qdata, scale, global_scale_inv = blockscaled_impl._quantize_nvfp4_per_token(
         tensor,
         layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
     )
-    return blockscaled_impl._dequantize_nvfp4_activation(
-        qdata,
-        scale,
-        global_scale_inv,
+    inner_dequantized = nvfp4_gs_dq_f(
+        qdata.contiguous(),
+        scale.contiguous(),
+        torch.ones(
+            (tensor.shape[0], 1),
+            dtype=torch.float32,
+            device=tensor.device,
+        ),
     )
+    return (inner_dequantized * global_scale_inv[:, None]).to(tensor.dtype)
 
 
 def _reference_moe(
@@ -2309,69 +2314,6 @@ class DistMoeKernelTest(unittest.TestCase):
         self.assertTrue(any(tensor is prepared.global_scale for tensor in storage))
         self.assertTrue(any(tensor is prepared.global_scale_inv for tensor in storage))
 
-    def test_nvfp4_activation_dequantization_matches_gold(self) -> None:
-        """Activation DQ exactly decodes strided current-forward row bundles.
-
-        The input views exercise packed activation-buffer offsets. The golden
-        recipe independently decodes E2M1/E4M3 before the current wire inverse
-        is applied per token. Both scale layouts are bitwise equal in BF16.
-        """
-        rows, cols = 35, 256
-        generator = torch.Generator(device="cuda").manual_seed(20261029)
-        x = torch.randn(
-            rows,
-            cols,
-            dtype=torch.bfloat16,
-            device="cuda",
-            generator=generator,
-        )
-        q_cols, scale_cols = cols // 2, cols // 16
-        row_bytes = (q_cols + scale_cols + 4 + 31) // 32 * 32
-        packed = torch.empty((rows, row_bytes), dtype=torch.uint8, device="cuda")
-        qdata_MQ = packed[:, :q_cols].view(torch.float4_e2m1fn_x2)
-        scale_MB = packed[:, q_cols : q_cols + scale_cols].view(torch.float8_e4m3fn)
-        global_scale_inv_M = packed[
-            :, q_cols + scale_cols : q_cols + scale_cols + 4
-        ].view(torch.float32)[:, 0]
-        blockscaled_impl._quantize_nvfp4_per_token(
-            x,
-            layout=blockscaled_impl.ScaleFactorLayout.NATURAL,
-            q_out=qdata_MQ,
-            scale_out=scale_MB,
-            token_scale_inv_out=global_scale_inv_M,
-        )
-
-        actual = blockscaled_impl._dequantize_nvfp4_activation(
-            qdata_MQ,
-            scale_MB,
-            global_scale_inv_M,
-        )
-        blocked_scale_MB = natural_to_cublas_blocked(
-            scale_MB.contiguous(),
-            is_a=True,
-        )
-        blocked_actual = blockscaled_impl._dequantize_nvfp4_activation(
-            qdata_MQ,
-            blocked_scale_MB,
-            global_scale_inv_M,
-            blocked_scales=True,
-        )
-        inner_dequantized = nvfp4_gs_dq_f(
-            qdata_MQ.contiguous(),
-            scale_MB.contiguous(),
-            torch.ones((rows, 1), dtype=torch.float32, device="cuda"),
-        )
-        expected = (inner_dequantized * global_scale_inv_M[:, None]).to(torch.bfloat16)
-        self.assertFalse(qdata_MQ.is_contiguous())
-        self.assertFalse(scale_MB.is_contiguous())
-        self.assertGreater(global_scale_inv_M.stride(0), 1)
-        self.assertTrue(
-            torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
-        )
-        self.assertTrue(
-            torch.equal(blocked_actual.view(torch.uint16), expected.view(torch.uint16))
-        )
-
     def test_nvfp4_weight_dequantization_matches_gold(self) -> None:
         """Weight DQ exactly decodes grouped padded CUBLAS-blocked scales.
 
@@ -2433,44 +2375,37 @@ class DistMoeKernelTest(unittest.TestCase):
 
     def test_nvfp4_dequantization_decodes_all_e2m1_codes(self) -> None:
         """Packed DQ preserves every E2M1 code, including signed zero."""
-        packed = torch.tensor(
-            [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]],
-            dtype=torch.uint8,
-            device="cuda",
-        ).view(torch.float4_e2m1fn_x2)
-        actual = blockscaled_impl._dequantize_nvfp4_activation(
-            packed,
+        packed = (
+            torch.tensor(
+                [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]],
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            .view(1, 1, 8)
+            .view(torch.float4_e2m1fn_x2)
+        )
+        blocked_scale = natural_to_cublas_blocked(
             torch.ones((1, 1), dtype=torch.float8_e4m3fn, device="cuda"),
+            is_a=False,
+        )
+        actual = blockscaled_impl._dequantize_nvfp4_weight(
+            packed,
+            blocked_scale,
             torch.ones((1,), dtype=torch.float32, device="cuda"),
         )
         expected = torch.tensor(
             FP4_E2M1_TABLE,
             dtype=torch.bfloat16,
             device="cuda",
-        )[None, :]
+        )[None, None, :]
 
         self.assertTrue(
             torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
         )
 
-    def test_nvfp4_dequantization_supports_fake_tensor_metadata(self) -> None:
-        """Both DQ ops expose their exact BF16 shapes without CUDA execution."""
+    def test_nvfp4_weight_dequantization_supports_fake_tensor_metadata(self) -> None:
+        """Weight DQ exposes its exact BF16 shape without CUDA execution."""
         with FakeTensorMode():
-            activation = blockscaled_impl._dequantize_nvfp4_activation(
-                torch.empty(
-                    7,
-                    136,
-                    dtype=torch.float4_e2m1fn_x2,
-                    device="cuda",
-                ),
-                torch.empty(
-                    7,
-                    17,
-                    dtype=torch.float8_e4m3fn,
-                    device="cuda",
-                ),
-                torch.empty(7, dtype=torch.float32, device="cuda"),
-            )
             weight = blockscaled_impl._dequantize_nvfp4_weight(
                 torch.empty(
                     2,
@@ -2487,8 +2422,6 @@ class DistMoeKernelTest(unittest.TestCase):
                 ),
                 torch.empty(2, dtype=torch.float32, device="cuda"),
             )
-        self.assertEqual(activation.shape, (7, 272))
-        self.assertIs(activation.dtype, torch.bfloat16)
         self.assertEqual(weight.shape, (2, 129, 272))
         self.assertIs(weight.dtype, torch.bfloat16)
 
@@ -4115,8 +4048,8 @@ class DistMoeKernelTest(unittest.TestCase):
 
         Staged and Mega must preserve their current output bitwise. The saved
         packed X is decoded from the activation slot and compared bitwise with
-        Dist-MoE's independent per-token Q-DQ primitive. H1 and H3 are compared
-        with the real-quantized per-expert reference at tight bounds. Guard
+        the Dist-MoE quantizer plus independent golden decoder. H1 and H3 are
+        compared with the real-quantized per-expert reference at tight bounds. Guard
         bytes and empty weight-state slots prove that H2 and dynamic weight
         quants do not persist in the activation slot or fixed state schema.
         """
@@ -4151,7 +4084,7 @@ class DistMoeKernelTest(unittest.TestCase):
                     w2_EDF,
                     saved_activations=reference_state,
                 )
-                dist_moe_x_bw_TD = _dist_moe_nvfp4_activation_qdq(x_TD)
+                dist_moe_x_bw_TD = _reference_nvfp4_activation_qdq(x_TD)
                 dist_moe_x_bw_TKD = dist_moe_x_bw_TD[:, None, :].expand(
                     -1,
                     ids_TK.shape[1],
@@ -7575,7 +7508,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
 
             global_x = _all_gather_cat(x_TD)
             global_ids = _all_gather_cat(ids_TK)
-            dist_moe_x_bw_TD = _dist_moe_nvfp4_activation_qdq(global_x)
+            dist_moe_x_bw_TD = _reference_nvfp4_activation_qdq(global_x)
             dist_moe_x_bw_TKD = dist_moe_x_bw_TD[:, None, :].expand(
                 -1,
                 global_ids.shape[1],

@@ -232,12 +232,12 @@ def _prepare_nvfp4_weight_fake(
     )
 
 
-def _validate_nvfp4_dequantization_tensors(
+def _validate_nvfp4_weight_dequantization_tensors(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     global_scale_inv: torch.Tensor,
 ) -> None:
-    """Validate dtypes, devices, and row storage shared by NVFP4 DQ ops.
+    """Validate dtypes, devices, and storage for NVFP4 weight DQ.
 
     Args:
         qdata: Packed E2M1 rows.
@@ -254,137 +254,10 @@ def _validate_nvfp4_dequantization_tensors(
         raise ValueError("NVFP4 dequantization operands must share one device")
     if not qdata.is_cuda:
         raise ValueError("NVFP4 dequantization requires CUDA tensors")
-    for name, tensor in (("qdata", qdata), ("scale", scale)):
-        if tensor.stride(-1) != 1:
-            raise ValueError(f"{name} must have contiguous columns")
-        if tensor.shape[0] > 1 and tensor.stride(0) < tensor.shape[-1]:
-            raise ValueError(f"{name} rows must not overlap")
+    if not qdata.is_contiguous() or not scale.is_contiguous():
+        raise ValueError("NVFP4 weight qdata and scales must be contiguous")
     if global_scale_inv.ndim != 1 or global_scale_inv.stride(0) <= 0:
         raise ValueError("global_scale_inv must be a non-overlapping vector")
-
-
-def _validate_nvfp4_activation_dequantization(
-    qdata_MQ: torch.Tensor,
-    scale_MB: torch.Tensor,
-    global_scale_inv_M: torch.Tensor,
-    blocked_scales: bool,
-) -> tuple[int, int]:
-    """Validate an activation DQ request and return its logical shape.
-
-    Args:
-        qdata_MQ: Packed E2M1 data.
-        scale_MB: Natural or CUBLAS-blocked E4M3 scales.
-        global_scale_inv_M: Per-token inverse outer scales.
-        blocked_scales: Whether ``scale_MB`` uses CUBLAS-blocked layout.
-
-    Returns:
-        Logical row and column counts.
-    """
-    if qdata_MQ.ndim != 2 or scale_MB.ndim != 2:
-        raise ValueError("NVFP4 activation qdata and scales must be rank two")
-    _validate_nvfp4_dequantization_tensors(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-    )
-    rows, q_cols = qdata_MQ.shape
-    scale_cols = (2 * q_cols + 15) // 16
-    if blocked_scales:
-        expected_scale_shape = (
-            ((rows + 127) // 128) * 128,
-            ((scale_cols + 3) // 4) * 4,
-        )
-        if not scale_MB.is_contiguous():
-            raise ValueError("CUBLAS-blocked activation scales must be contiguous")
-    else:
-        expected_scale_shape = (rows, scale_cols)
-    if tuple(scale_MB.shape) != expected_scale_shape:
-        raise ValueError(
-            f"activation scale must have shape {expected_scale_shape}, "
-            f"got {tuple(scale_MB.shape)}"
-        )
-    if tuple(global_scale_inv_M.shape) != (rows,):
-        raise ValueError(
-            f"activation global_scale_inv must have shape ({rows},), "
-            f"got {tuple(global_scale_inv_M.shape)}"
-        )
-    return rows, 2 * q_cols
-
-
-@torch.library.custom_op(
-    "dist_moe::dequantize_nvfp4_activation",
-    mutates_args=(),
-)
-def _dequantize_nvfp4_activation(
-    qdata_MQ: torch.Tensor,
-    scale_MB: torch.Tensor,
-    global_scale_inv_M: torch.Tensor,
-    blocked_scales: bool = False,
-) -> torch.Tensor:
-    """Dequantize a per-token NVFP4 activation into BF16.
-
-    Args:
-        qdata_MQ: Packed E2M1 data with shape ``[M, K / 2]``. Its row
-            stride may point into the packed symmetric activation buffer.
-        scale_MB: Per-16-value E4M3 scales in natural or CUBLAS-blocked
-            layout. Natural scale rows may also be strided buffer views.
-        global_scale_inv_M: Per-token inverse outer scales with shape ``[M]``.
-        blocked_scales: Whether ``scale_MB`` uses CUBLAS-blocked layout.
-
-    Returns:
-        Contiguous BF16 values with shape ``[M, K]``.
-    """
-    rows, _ = _validate_nvfp4_activation_dequantization(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-        blocked_scales,
-    )
-
-    from .kernels.triton_quantization.blockscaled_dequantize import (
-        dequantize_nvfp4,
-    )
-    from .kernels.triton_quantization.formats import ScaleFactorLayoutId
-
-    return dequantize_nvfp4(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-        scale_layout=(
-            ScaleFactorLayoutId.CUBLAS_BLOCKED
-            if blocked_scales
-            else ScaleFactorLayoutId.NATURAL
-        ),
-        rows_per_group=rows,
-        outer_scale_per_row=True,
-    )
-
-
-@_dequantize_nvfp4_activation.register_fake
-def _dequantize_nvfp4_activation_fake(
-    qdata_MQ: torch.Tensor,
-    scale_MB: torch.Tensor,
-    global_scale_inv_M: torch.Tensor,
-    blocked_scales: bool = False,
-) -> torch.Tensor:
-    """Describe per-token NVFP4 activation dequantization for FakeTensor.
-
-    Args:
-        qdata_MQ: Packed E2M1 data with shape ``[M, K / 2]``.
-        scale_MB: Natural or CUBLAS-blocked E4M3 scales.
-        global_scale_inv_M: Per-token inverse outer scales with shape ``[M]``.
-        blocked_scales: Whether ``scale_MB`` uses CUBLAS-blocked layout.
-
-    Returns:
-        Fake contiguous BF16 values with shape ``[M, K]``.
-    """
-    rows, cols = _validate_nvfp4_activation_dequantization(
-        qdata_MQ,
-        scale_MB,
-        global_scale_inv_M,
-        blocked_scales,
-    )
-    return qdata_MQ.new_empty((rows, cols), dtype=torch.bfloat16)
 
 
 def _validate_nvfp4_activation_buffer_metadata(
@@ -819,13 +692,11 @@ def _validate_nvfp4_weight_dequantization(
     """
     if qdata_ENQ.ndim != 3 or scale_RB.ndim != 2:
         raise ValueError("NVFP4 weight qdata must be rank three and scales rank two")
-    _validate_nvfp4_dequantization_tensors(
+    _validate_nvfp4_weight_dequantization_tensors(
         qdata_ENQ,
         scale_RB,
         global_scale_inv_E,
     )
-    if not qdata_ENQ.is_contiguous() or not scale_RB.is_contiguous():
-        raise ValueError("NVFP4 weight qdata and scales must be contiguous")
     experts, rows, q_cols = qdata_ENQ.shape
     scale_cols = (2 * q_cols + 15) // 16
     expected_scale_shape = (
@@ -872,17 +743,14 @@ def _dequantize_nvfp4_weight(
     q_cols = qdata_ENQ.shape[-1]
 
     from .kernels.triton_quantization.blockscaled_dequantize import (
-        dequantize_nvfp4,
+        dequantize_nvfp4_weight,
     )
-    from .kernels.triton_quantization.formats import ScaleFactorLayoutId
 
-    output_RK = dequantize_nvfp4(
+    output_RK = dequantize_nvfp4_weight(
         qdata_ENQ.view(experts * rows, q_cols),
         scale_RB,
         global_scale_inv_E,
-        scale_layout=ScaleFactorLayoutId.CUBLAS_BLOCKED,
         rows_per_group=rows,
-        outer_scale_per_row=False,
     )
     return output_RK.view(experts, rows, cols)
 
