@@ -118,6 +118,7 @@ def _get_kernel(
     world_size: int,
     static_scheduler: bool,
     swap_ab: bool,
+    packed_nvfp4_b: bool = False,
     *,
     dtype: torch.dtype,
 ) -> "GroupedGemmKernel":
@@ -130,6 +131,7 @@ def _get_kernel(
         static_scheduler,
         dtype,
         swap_ab,
+        packed_nvfp4_b,
     )
     inst = _KERNEL_CACHE.get(key)
     if inst is None:
@@ -141,6 +143,7 @@ def _get_kernel(
             world_size=world_size,
             static_scheduler=static_scheduler,
             swap_ab=swap_ab,
+            packed_nvfp4_b=packed_nvfp4_b,
         )
         _KERNEL_CACHE[key] = inst
     return inst
@@ -656,6 +659,7 @@ def grouped_gemm_wgrad(
     world_size: int = 1,
     static_scheduler: bool = False,
     conditional_execution: torch.Tensor | None = None,
+    packed_nvfp4_x: bool = False,
 ) -> torch.Tensor:
     """Compute ``wgrad[g] = dy[g].T @ x[g]`` for each group.
 
@@ -670,14 +674,30 @@ def grouped_gemm_wgrad(
         ``hidden_dim_dy`` / ``hidden_dim_x`` / ``dtype`` describe the
         underlying bf16/fp16 view. The kernel reads bytes from
         ``activation_buffer + offset[0]``.
+        With ``packed_nvfp4_x=True``, ``x`` is the packed activation-offset
+        table: entry 0 addresses row-major E2M1 qdata and entry 3 addresses
+        CUBLAS-blocked E4M3 scales followed by per-row FP32 outer scales.
+        The TMA warp and two auxiliary warps decode each B panel directly into
+        BF16 shared memory.
     """
     use_ab = activation_buffer is not None
+    if packed_nvfp4_x and not use_ab:
+        raise ValueError("packed_nvfp4_x requires activation_buffer")
     if use_ab:
         if hidden_dim_dy is None or hidden_dim_x is None or dtype is None:
             raise ValueError(
                 "activation_buffer requires hidden_dim_dy, hidden_dim_x, and dtype"
             )
         _validate_activation_buffer_args(activation_buffer, dy, x)
+        if packed_nvfp4_x:
+            if dtype is not torch.bfloat16:
+                raise TypeError("packed NVFP4 WGRAD supports BF16 MMA only")
+            if x.numel() <= 3:
+                raise ValueError(
+                    "packed NVFP4 x must contain qdata and scale activation offsets"
+                )
+            if hidden_dim_x % 256:
+                raise ValueError("packed NVFP4 x width must be divisible by 256")
         # `dy` / `x` are offset tensors; build dummy real tensors of the
         # described dtype + hidden dim so the rest of the launcher can
         # derive TMA layouts and strides uniformly. The kernel only reads
@@ -727,6 +747,8 @@ def grouped_gemm_wgrad(
 
     cfg = grouped_gemm_configs_for_dtype(dy.dtype)[config]
     NUM_CTAS = cfg["NUM_CTAS"]
+    if packed_nvfp4_x and NUM_CTAS != 1:
+        raise ValueError("packed NVFP4 W13 WGRAD requires a 1-CTA config")
     num_clusters = max(1, num_sms // NUM_CTAS)
     if num_n_clusters is None:
         force_n_major, num_n_clusters = _wgrad_raster(
@@ -752,6 +774,7 @@ def grouped_gemm_wgrad(
         world_size=world_size,
         static_scheduler=static_scheduler,
         swap_ab=False,
+        packed_nvfp4_b=packed_nvfp4_x,
     )
 
     # Placeholders capture dtype and layout for compile caching. CuTeDSL
@@ -898,6 +921,7 @@ def grouped_gemm_wgrad(
         elem,
         wgrad.element_size(),
         use_ab,
+        packed_nvfp4_x,
         output_accum,
         conditional_execution.dtype if conditional_execution is not None else None,
     )

@@ -757,6 +757,7 @@ def _triton_get_blockscaled_backward_plan(
     mega: tl.constexpr,
     native_backward: tl.constexpr,
     save_dequantized_activations: tl.constexpr,
+    packed_w13_wgrad: tl.constexpr,
 ):
     """Compute the block-scaled backward plan (offsets only).
 
@@ -840,7 +841,12 @@ def _triton_get_blockscaled_backward_plan(
     h2_row_size = h2_row_q_size + h2_row_scale_size
     dxy_row_size = dxy_row_q_size + dxy_row_scale_size
     x_row_offset = scratch_end - x_row_size  # x_gathered row (FC13 DGRAD, recompute)
-    if save_dequantized_activations:
+    if save_dequantized_activations and packed_w13_wgrad:
+        # Inline W13 WGRAD decode keeps packed X live through backward, so its
+        # recompute row bundle cannot alias the transient H2 row bundle.
+        recompute_h2_row_offset = x_row_offset - h2_row_size
+        recompute_row_slot_size = x_row_size + h2_row_size
+    elif save_dequantized_activations:
         # The dense backward dequantizes X before the serialized H2 producer
         # reuses this row slot, including when the forward used Mega.
         recompute_h2_row_offset = scratch_end - h2_row_size
@@ -857,7 +863,11 @@ def _triton_get_blockscaled_backward_plan(
     dxy_row_offset = scratch_end - dxy_row_size
     # Tensormap preparation still materializes h2 pointers for a skipped recompute.
     if save_dequantized_activations:
-        h2_row_offset = scratch_end - h2_row_size
+        h2_row_offset = tl.where(
+            need_recompute,
+            recompute_h2_row_offset,
+            scratch_end - h2_row_size,
+        )
     else:
         h2_row_offset = tl.where(
             need_recompute, recompute_h2_row_offset, dxy_row_offset
@@ -921,10 +931,10 @@ def _triton_get_blockscaled_backward_plan(
 
     cursor = row_slot_offset
     if save_dequantized_activations:
-        # Match the BF16 backward's liveness reuse while always reserving a
-        # dense X destination. Recompute keeps the NVFP4 row slot disjoint
-        # until X has been dequantized and H2 has been produced. A saved layer
-        # reads X from its persistent row bundle and uses row scratch only for H2.
+        # Match the BF16 backward's liveness reuse. The default path reserves a
+        # dense X destination and can reuse row scratch after dequantization.
+        # Inline W13 WGRAD decode leaves dense X absent and keeps packed X live
+        # beside H2 until its later consumer runs.
         dense_scratch_end = row_slot_offset
         grad_h1_offset = dense_scratch_end - h1_size
         grad_h2_offset = grad_h1_offset - grad_h2_size
@@ -936,13 +946,21 @@ def _triton_get_blockscaled_backward_plan(
         scratch_grad_bottom = tl.minimum(grad_h2_offset, grad_h3_gathered_offset)
         if need_recompute:
             h1_offset = scratch_grad_bottom - h1_size
-            x_gathered_offset = h1_offset - x_gathered_size
-            scratch_bottom = x_gathered_offset
+            if packed_w13_wgrad:
+                x_gathered_offset = zero
+                scratch_bottom = h1_offset
+            else:
+                x_gathered_offset = h1_offset - x_gathered_size
+                scratch_bottom = x_gathered_offset
         else:
             h1_offset = tl.load(fwd_h1_offset_ptr)
             x_row_offset = tl.load(fwd_x_row_offset_ptr)
-            x_gathered_offset = scratch_grad_bottom - x_gathered_size
-            scratch_bottom = x_gathered_offset
+            if packed_w13_wgrad:
+                x_gathered_offset = zero
+                scratch_bottom = scratch_grad_bottom
+            else:
+                x_gathered_offset = scratch_grad_bottom - x_gathered_size
+                scratch_bottom = x_gathered_offset
 
         # No block-scaled backward GEMM consumes these descriptors. Keep the
         # fixed activation-offset table valid for conditional NVFP4 forward

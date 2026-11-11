@@ -729,6 +729,7 @@ def _dequantize_nvfp4_activation_buffer_to_buffer(
     capacity_rows: int,
     n_cols: int,
     execute_when_zero: bool = False,
+    execute_unconditionally: bool = False,
 ) -> None:
     """Conditionally decode a planner-owned NVFP4 row bundle to BF16.
 
@@ -742,6 +743,7 @@ def _dequantize_nvfp4_activation_buffer_to_buffer(
         capacity_rows: Static maximum row count for graph-stable launch.
         n_cols: Logical BF16 feature width.
         execute_when_zero: Whether zero selects the operation.
+        execute_unconditionally: Whether to ignore the predicate and always decode.
     """
     _validate_nvfp4_activation_buffer_dequantization(
         activation_buffer,
@@ -768,6 +770,7 @@ def _dequantize_nvfp4_activation_buffer_to_buffer(
         capacity_rows=capacity_rows,
         n_cols=n_cols,
         execute_when_zero=execute_when_zero,
+        execute_unconditionally=execute_unconditionally,
         row_scale_storage_multiple=ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
     )
 
@@ -783,9 +786,10 @@ def _dequantize_nvfp4_activation_buffer_to_buffer_fake(
     capacity_rows: int,
     n_cols: int,
     execute_when_zero: bool = False,
+    execute_unconditionally: bool = False,
 ) -> None:
     """Validate fake metadata for an offset-backed NVFP4 decode."""
-    del execute_when_zero
+    del execute_when_zero, execute_unconditionally
     _validate_nvfp4_activation_buffer_dequantization(
         activation_buffer,
         qdata_offset_1,
@@ -1244,6 +1248,7 @@ class _BlockscaledConfig:
     routing_capacity: int | None = None
     static_inference_storage: bool = False
     save_dequantized_activations: bool = False
+    packed_w13_wgrad: bool = False
 
     @property
     def policy(self) -> _FusedBlockscaledFormatPolicy:
@@ -1350,6 +1355,25 @@ class _Nvfp4Bf16BackwardAdapter:
     w2: _BlockscaledWeight
     num_sms: int | None
 
+    def w13_wgrad_input(
+        self,
+        backward_plan: BackwardPlan,
+    ) -> tuple[torch.Tensor, bool]:
+        """Select the saved-X representation consumed by W13 WGRAD.
+
+        Args:
+            backward_plan: Planner-owned dense and block-scaled activation
+                offsets for this invocation.
+
+        Returns:
+            The dense-X offset or packed activation-offset table, followed by
+            whether the packed tile decoder is required.
+        """
+        if not self.blockscaled_cfg.packed_w13_wgrad:
+            return backward_plan.x_gathered_offset, False
+        assert backward_plan.blockscaled is not None
+        return backward_plan.blockscaled.recompute_dispatch_offsets, True
+
     def recreate_forward_activations(
         self,
         *,
@@ -1427,10 +1451,11 @@ class _Nvfp4Bf16BackwardAdapter:
         )
 
         # The backward planner selects either the saved or recomputed packed-X
-        # row bundle. Decode it before the combine producer can reuse recompute
-        # row scratch for H2.
+        # row bundle. The legacy path expands it to dense scratch here. The
+        # packed-WGRAD path keeps it live and decodes only the B panels loaded
+        # by W13 WGRAD.
         dispatch_offsets = backward_plan.blockscaled.recompute_dispatch_offsets
-        for execute_when_zero in (False, True):
+        if not self.blockscaled_cfg.packed_w13_wgrad:
             _dequantize_nvfp4_activation_buffer_to_buffer(
                 activation_buffer.buffer,
                 dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
@@ -1442,7 +1467,7 @@ class _Nvfp4Bf16BackwardAdapter:
                 forward_plan.need_recompute,
                 capacity_rows,
                 hidden_dim,
-                execute_when_zero,
+                execute_unconditionally=True,
             )
 
         h1_placeholder = _activation_buffer_placeholder(
@@ -1477,24 +1502,21 @@ class _Nvfp4Bf16BackwardAdapter:
             derive_pipeline_depth=True,
         )
 
-        # Exactly one predicate polarity executes on each replay. Keeping both
-        # launches makes dynamic save/recompute decisions graph-stable while
-        # always materializing H2_bw = DQ(Q(SwiGLU(H1))).
+        # The planner publishes the selected saved/recomputed row-bundle offset
+        # before this graph-stable launch, so one unconditional decode handles
+        # either forward decision.
         combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
-        for execute_when_zero in (False, True):
-            _dequantize_nvfp4_activation_buffer_to_buffer(
-                activation_buffer.buffer,
-                combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
-                combine_offsets[
-                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
-                ],
-                num_recv_rows_1,
-                backward_plan.h2_offset,
-                forward_plan.need_recompute,
-                capacity_rows,
-                intermediate_dim,
-                execute_when_zero,
-            )
+        _dequantize_nvfp4_activation_buffer_to_buffer(
+            activation_buffer.buffer,
+            combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+            combine_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
+            num_recv_rows_1,
+            backward_plan.h2_offset,
+            forward_plan.need_recompute,
+            capacity_rows,
+            intermediate_dim,
+            execute_unconditionally=True,
+        )
         return h3_MD
 
 
@@ -2131,6 +2153,7 @@ def _async_model_config(
         max_num_recv_tokens=max_num_recv_tokens,
         mega=blockscaled_cfg.mega,
         save_dequantized_activations=(blockscaled_cfg.save_dequantized_activations),
+        packed_w13_wgrad=blockscaled_cfg.packed_w13_wgrad,
     )
 
 
@@ -4220,6 +4243,7 @@ def _blockscaled_compute_config(
         format=_kernel_block_scaled_format(policy.format),
         fast_math=policy.fast_math,
         mega=policy.pipeline == "mega",
+        packed_w13_wgrad=policy.packed_w13_wgrad,
         static_inference_storage=context.config.inference
         and context.config.vmm is None,
     )

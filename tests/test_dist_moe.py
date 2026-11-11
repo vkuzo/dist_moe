@@ -1629,6 +1629,42 @@ class DistMoeConfigTest(unittest.TestCase):
                 format=dist_moe.BlockScaledFormat.NVFP4,
                 fast_math=True,
             )
+        with self.assertRaisesRegex(ValueError, "packed_w13_wgrad"):
+            dist_moe.BlockScaledConfig(packed_w13_wgrad=True)
+        self.assertTrue(
+            dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+                packed_w13_wgrad=True,
+            ).packed_w13_wgrad
+        )
+        with self.assertRaisesRegex(ValueError, "1-CTA"):
+            dist_moe.Config(
+                max_num_local_input_tokens=1,
+                hidden_dim=256,
+                intermediate_dim=256,
+                top_k=1,
+                num_experts=1,
+                max_moe_layers_per_activation_slot=1,
+                bf16_grouped_gemm_preset="2cta1mma_bm256_bn256",
+                block_scaled=dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    packed_w13_wgrad=True,
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "training-only"):
+            dist_moe.Config(
+                max_num_local_input_tokens=1,
+                hidden_dim=256,
+                intermediate_dim=256,
+                top_k=1,
+                num_experts=1,
+                max_moe_layers_per_activation_slot=1,
+                inference=True,
+                block_scaled=dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    packed_w13_wgrad=True,
+                ),
+            )
 
     def test_nvfp4_training_accepts_aligned_dimensions(self) -> None:
         """Accept NVFP4 training while rejecting shapes outside its contract."""
@@ -1686,6 +1722,33 @@ class DistMoeConfigTest(unittest.TestCase):
 
         self.assertEqual(plan.balanced_recv_rows, 200)
         self.assertEqual(plan.device_scratch_capacity_rows, 768)
+
+    def test_packed_w13_wgrad_reduces_nvfp4_backward_scratch(self) -> None:
+        """Packed-X tile decode removes the full BF16 X scratch allocation."""
+        config = dist_moe.Config(
+            max_num_local_input_tokens=128,
+            hidden_dim=3584,
+            intermediate_dim=3072,
+            top_k=2,
+            num_experts=8,
+            max_moe_layers_per_activation_slot=1,
+            block_scaled=dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+            ),
+        )
+        materialized = dist_moe.plan_memory(config, ep_size=2)
+        packed = dist_moe.plan_memory(
+            dataclasses.replace(
+                config,
+                block_scaled=dataclasses.replace(
+                    config.block_scaled,
+                    packed_w13_wgrad=True,
+                ),
+            ),
+            ep_size=2,
+        )
+
+        self.assertLess(packed.device_scratch_bytes, materialized.device_scratch_bytes)
 
     def test_blockscaled_uses_activation_buffer_and_vmm_controls(self) -> None:
         """VMM preserves offset scratch rather than static inference layouts."""
@@ -3685,6 +3748,7 @@ class DistMoeKernelTest(unittest.TestCase):
             block_scaled=dist_moe.BlockScaledConfig(
                 format=dist_moe.BlockScaledFormat.NVFP4,
                 pipeline="staged",
+                packed_w13_wgrad=True,
             ),
             wgrad_dtype=torch.bfloat16,
         )
@@ -4082,6 +4146,96 @@ class DistMoeKernelTest(unittest.TestCase):
                                 ),
                                 bound,
                             )
+
+    def test_nvfp4_packed_w13_wgrad_is_bitwise_equivalent(self) -> None:
+        """Inline packed-X decode must exactly match materialized-BF16 W13 WGRAD.
+
+        Staged and Mega forward pipelines exercise both full-save and recompute
+        plans. Outputs and every gradient compare bitwise because the feature
+        changes only how the identical BF16 W13 MMA B operand reaches SMEM.
+        """
+        for pipeline in ("staged", "mega"):
+            base_policy = dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+                pipeline=pipeline,
+            )
+            _, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                inference=False,
+                block_scaled=base_policy,
+            )
+            x_TD, ids_TK, scores_TK = case_a
+            for force_recompute in (False, True):
+                grad_TD = torch.randn_like(x_TD)
+                results = []
+                for packed_w13_wgrad in (False, True):
+                    policy = dataclasses.replace(
+                        base_policy,
+                        packed_w13_wgrad=packed_w13_wgrad,
+                    )
+                    config = dist_moe.Config(
+                        max_num_local_input_tokens=x_TD.shape[0],
+                        hidden_dim=x_TD.shape[1],
+                        intermediate_dim=w2_EDF.shape[2],
+                        top_k=ids_TK.shape[1],
+                        num_experts=w13_EFD.shape[0],
+                        max_moe_layers_per_activation_slot=1,
+                        device_scratch_capacity_factor=1.0,
+                        activation_slot_capacity_factor=(
+                            None if force_recompute else 1.0
+                        ),
+                        block_scaled=policy,
+                    )
+                    if force_recompute:
+                        minimum = dist_moe.plan_memory(
+                            config,
+                            1,
+                            device=x_TD.device,
+                        ).minimum_activation_slot_bytes
+                        config = dataclasses.replace(
+                            config,
+                            activation_slot_bytes=minimum,
+                        )
+                    context = dist_moe.create_context(
+                        group=dist.group.WORLD,
+                        config=config,
+                    )
+                    self.addCleanup(context.close)
+                    inputs = tuple(
+                        tensor.detach().clone().requires_grad_()
+                        for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+                    )
+                    output_TD = dist_moe.routed_experts(
+                        inputs[0],
+                        ids_TK,
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        context,
+                    )
+                    output_TD.backward(grad_TD)
+                    assert context.activation_buffer is not None
+                    self._assert_planner_reset(context.activation_buffer)
+                    results.append(
+                        (
+                            output_TD.detach().clone(),
+                            *(tensor.grad.detach().clone() for tensor in inputs),
+                        )
+                    )
+                with self.subTest(
+                    pipeline=pipeline,
+                    force_recompute=force_recompute,
+                ):
+                    for materialized, packed in zip(
+                        results[0],
+                        results[1],
+                        strict=True,
+                    ):
+                        torch.testing.assert_close(
+                            packed,
+                            materialized,
+                            rtol=0,
+                            atol=0,
+                        )
 
     def test_nvfp4_training_rejects_prepared_weights(self) -> None:
         """Keep prepared NVFP4 operands inference-only after enabling training."""
@@ -5603,7 +5757,10 @@ class DistMoeKernelTest(unittest.TestCase):
                 torch.ops.dist_moe.block_scaled_backward_accumulate_.default,
             ),
             (
-                dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
+                dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    packed_w13_wgrad=True,
+                ),
                 torch.ops.dist_moe.block_scaled_backward_accumulate_.default,
             ),
         )
@@ -7331,6 +7488,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
             block_scaled=dist_moe.BlockScaledConfig(
                 format=dist_moe.BlockScaledFormat.NVFP4,
                 pipeline="mega",
+                packed_w13_wgrad=True,
             ),
         )
         context = dist_moe.create_context(

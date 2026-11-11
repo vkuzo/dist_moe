@@ -1234,6 +1234,9 @@ class ModelConfig:
     # Backward dequantizes X into dense scratch before the native WGRAD. Unlike
     # native_backward, H2's quantized activation bundle does not survive forward.
     save_dequantized_activations: bool = False
+    # Decode the saved NVFP4 X bundle into each BF16 W13 WGRAD shared-memory
+    # tile instead of reserving a dense BF16 X scratch tensor.
+    packed_w13_wgrad: bool = False
     # Interleaved FC13 consumes its epilogue output directly and therefore does
     # not materialize dense h1. This inference-only layout requires Mega.
     interleaved_fc13: bool = False
@@ -1264,6 +1267,10 @@ class ModelConfig:
             )
         if self.save_dequantized_activations and self.interleaved_fc13:
             raise ValueError("BF16 backward activation saving requires materialized H1")
+        if self.packed_w13_wgrad and not self.save_dequantized_activations:
+            raise ValueError(
+                "packed_w13_wgrad requires BF16-backward activation saving"
+            )
         if storage is None:
             return
         self._validate_blockscaled_storage(storage)
@@ -1663,12 +1670,12 @@ class ModelConfig:
         num_recv_tokens: int,
         recompute: bool,
     ) -> int:
-        """Conservatively reserve the future dense-backward working set.
+        """Reserve the BF16-backward working set.
 
         The BF16 gradient workspace reuses dense tensors according to their
-        kernel-level lifetimes. Packed X and H2 sources remain disjoint from
-        their expanding BF16 dequantization destinations until those kernels
-        complete.
+        kernel-level lifetimes. The default path keeps packed X and H2 sources
+        disjoint from their expanding BF16 destinations. Packed W13 WGRAD
+        instead keeps X packed and reserves disjoint packed X and H2 bundles.
 
         Args:
             num_recv_tokens: Capacity-padded received rows.
@@ -1689,9 +1696,6 @@ class ModelConfig:
         gradient_scratch = grad_h1_size + grad_h2_size
         if self.hidden_dim > self.intermediate_dim:
             gradient_scratch += grad_h3_size
-        x_gathered_size = _align_bytes(
-            num_recv_tokens * self.hidden_dim * self.element_size
-        )
         if not recompute:
             storage = self.blockscaled_storage
             assert storage is not None
@@ -1699,10 +1703,29 @@ class ModelConfig:
                 num_recv_tokens,
                 self.intermediate_dim,
             )
+            x_gathered_size = (
+                0
+                if self.packed_w13_wgrad
+                else _align_bytes(num_recv_tokens * self.hidden_dim * self.element_size)
+            )
             return h2_row_size + gradient_scratch + x_gathered_size
 
         h1_size = _align_bytes(
             num_recv_tokens * 2 * self.intermediate_dim * self.element_size
+        )
+        if self.packed_w13_wgrad:
+            storage = self.blockscaled_storage
+            assert storage is not None
+            packed_rows = storage.row_quant_size(
+                num_recv_tokens,
+                self.hidden_dim,
+            ) + storage.row_quant_size(
+                num_recv_tokens,
+                self.intermediate_dim,
+            )
+            return gradient_scratch + h1_size + packed_rows
+        x_gathered_size = _align_bytes(
+            num_recv_tokens * self.hidden_dim * self.element_size
         )
         return (
             gradient_scratch
@@ -2111,7 +2134,8 @@ class BlockscaledBackwardPlan:
     activation buffer. "row"/"col" denote row- vs column-quantized bundles
     (see BlockscaledStorageConfig). x/h2 offsets point at the operands saved in
     forward (no-recompute) or rebuilt in scratch (recompute). Recomputed x/h2
-    row bundles share storage for staged kernels and are disjoint for Mega.
+    row bundles may share storage when X is eagerly decoded, but are disjoint
+    when packed W13 WGRAD keeps X live.
     """
 
     # x_gathered, row-quantized: FC13 DGRAD input (recompute only).
@@ -2127,7 +2151,7 @@ class BlockscaledBackwardPlan:
 
     @property
     def recompute_dispatch_offsets(self) -> torch.Tensor:
-        """Return offsets for staged W13 forward recomputation."""
+        """Return packed-X offsets for W13 recompute and optional WGRAD decode."""
         return self.activation_offsets.narrow(
             0,
             BACKWARD_RECOMPUTE_DISPATCH_OFFSET_BASE,
@@ -2412,11 +2436,14 @@ def _get_blockscaled_backward_plan(
         mega=model_config.mega,
         native_backward=model_config.native_backward,
         save_dequantized_activations=model_config.save_dequantized_activations,
+        packed_w13_wgrad=model_config.packed_w13_wgrad,
     )
     # Chunks are ordered as the kernel stores them into bwd_offsets_ptr. The
-    # BF16-backward adapter populates every dense slot for the shared gradient
-    # kernels, decoding X into slot 0. Other block-scaled modes use only h1 (1)
-    # and grad_h2 (3); bundles in slots 6..13 replace the remaining operands.
+    # The BF16-backward adapter populates every dense slot used by the shared
+    # gradient kernels. Its optional packed W13 WGRAD leaves slot 0 unused and
+    # consumes activation_offsets directly. Other block-scaled modes use only
+    # h1 (1) and grad_h2 (3); bundles in slots 6..13 replace the remaining
+    # operands.
     chunks = offsets.chunk(_BLOCKSCALED_BACKWARD_PLAN_OFFSET_COUNT)
     return BackwardPlan(
         x_gathered_offset=chunks[0],

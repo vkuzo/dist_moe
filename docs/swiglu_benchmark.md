@@ -41,6 +41,11 @@ see
 [BF16 execution](bf16_execution.md) and
 [NVFP4 execution](nvfp4_execution.md).
 
+Pass `--packed-w13-wgrad` with either NVFP4 pipeline to measure the optional
+path that decodes saved packed X directly into BF16 W13 WGRAD tiles instead of
+materializing the full BF16 X scratch tensor. The result JSON records whether
+the option was enabled.
+
 Ten warmup calls precede compilation-free measurement. Graph mode additionally
 warms a separate stream, captures a complete training call, and requires exact
 eager/replay output and gradient parity. Each of five measurement windows

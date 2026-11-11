@@ -66,6 +66,11 @@ epilogue group   TMEM -> registers -> C SMEM -> 16-byte/TMA GMEM stores
 idle warps       participate only in required cluster/warpgroup ordering
 ```
 
+Packed-NVFP4 W13 WGRAD repurposes the two idle warps. The TMA warp publishes
+one command per B SMEM stage, and all three warps decode disjoint packed-X
+source blocks into that stage. Its full barrier expects the A TMA transaction
+and three decoder arrivals before the unchanged BF16 MMA consumes the tile.
+
 The distributed dispatch kernel adds gather warps. They load source rows using
 `gather_ptrs`; a pointer may address the local symmetric dispatch buffer or a
 peer rank's dispatch buffer. Gathered BF16 rows are written to the local
@@ -210,6 +215,11 @@ activation buffer. The kernel reads those offsets on device, so dynamic save or
 recompute policy causes no CPU synchronization. MMA accumulates in FP32 TMEM.
 The epilogue either overwrites a BF16/FP32 destination or uses reduce-add stores
 for configured in-place accumulation.
+
+For packed-NVFP4 W13 WGRAD, each decoder lane loads one aligned 64-bit qdata
+word for a 16-value block, one blocked E4M3 scale, and a warp-broadcast FP32
+row scale. It preserves the elementwise multiply and BF16 conversion order
+before storing the existing MN-major B SMEM layout.
 
 <a id="synchronization"></a>
 ## Synchronization

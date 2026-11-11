@@ -17,11 +17,21 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ..formats import CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
 from ._dsl_compat import thread_exit
-from .blockscaled_quantization_common import device_trap
+from .activation_buffer import (
+    ACTIVATION_A_SCALE_OFFSET,
+    ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
+)
+from .blockscaled_quantization_common import (
+    _cublas_blockscaled_qscale_offset,
+    device_trap,
+)
 from .config import blockscaled_epilogue_subtile_divisor
 from .grouped_gemm_tiles import (
     native_mma_tile,
@@ -206,7 +216,9 @@ def _packed_group_rows_byte_extent(
     return total_rows * cutlass.Int64(row_stride) * cutlass.Int64(element_size_bytes)
 
 
-# Warp-group layout: 4 epilogue + 1 MMA + 1 TMA producer + 2 idle = 8 warps.
+# Warp-group layout: 4 epilogue + 1 MMA + 1 TMA producer + 2 auxiliary = 8
+# warps. The auxiliary warps are idle normally and join the TMA warp for
+# packed-NVFP4 B decode.
 EPILOG_WARP_IDS: tuple[int, int, int, int] = (0, 1, 2, 3)
 
 
@@ -214,6 +226,12 @@ MMA_WARP_ID: int = 4
 
 
 TMA_WARP_ID: int = 5
+
+
+PACKED_DECODE_WARP_IDS: tuple[int, int] = (6, 7)
+PACKED_DECODE_WARPS: int = 1 + len(PACKED_DECODE_WARP_IDS)
+PACKED_DECODE_COMMAND_FIELDS: int = 5
+PACKED_DECODE_TERMINATION: int = -1
 
 
 TOTAL_WARPS: int = 8
@@ -456,6 +474,262 @@ def _clear_tma_oob_prefetch_bit(
     cute.arch.sync_warp()
 
 
+@dsl_user_op
+def _decode_nvfp4_block_to_scaled_bf16x2(
+    packed_lo: cutlass.Uint32,
+    packed_hi: cutlass.Uint32,
+    scale_byte: cutlass.Uint32,
+    global_scale_inv: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> tuple[cutlass.Uint32, ...]:
+    """Decode 16 FP4 values and return eight row-scaled BF16x2 words."""
+    result = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32, i32, i32, i32, i32, i32, i32)>"),
+        [
+            cutlass.Uint32(packed_lo).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(packed_hi).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(scale_byte).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(global_scale_inv).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b8 q0, q1, q2, q3, q4, q5, q6, q7, scale;
+            .reg .b16 scale_pair, lo, hi;
+            .reg .b32 scale_bf16x2;
+            .reg .f32 lo_f32, hi_f32;
+
+            mov.b32 {q0, q1, q2, q3}, $8;
+            mov.b32 {q4, q5, q6, q7}, $9;
+            cvt.u8.u32 scale, $10;
+            mov.b16 scale_pair, {scale, scale};
+            cvt.rn.bf16x2.e4m3x2 scale_bf16x2, scale_pair;
+
+            cvt.rn.bf16x2.e2m1x2 $0, q0;
+            cvt.rn.bf16x2.e2m1x2 $1, q1;
+            cvt.rn.bf16x2.e2m1x2 $2, q2;
+            cvt.rn.bf16x2.e2m1x2 $3, q3;
+            cvt.rn.bf16x2.e2m1x2 $4, q4;
+            cvt.rn.bf16x2.e2m1x2 $5, q5;
+            cvt.rn.bf16x2.e2m1x2 $6, q6;
+            cvt.rn.bf16x2.e2m1x2 $7, q7;
+            mul.rn.bf16x2 $0, $0, scale_bf16x2;
+            mul.rn.bf16x2 $1, $1, scale_bf16x2;
+            mul.rn.bf16x2 $2, $2, scale_bf16x2;
+            mul.rn.bf16x2 $3, $3, scale_bf16x2;
+            mul.rn.bf16x2 $4, $4, scale_bf16x2;
+            mul.rn.bf16x2 $5, $5, scale_bf16x2;
+            mul.rn.bf16x2 $6, $6, scale_bf16x2;
+            mul.rn.bf16x2 $7, $7, scale_bf16x2;
+
+            mov.b32 {lo, hi}, $0;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $0, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $1;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $1, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $2;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $2, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $3;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $3, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $4;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $4, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $5;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $5, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $6;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $6, hi_f32, lo_f32;
+
+            mov.b32 {lo, hi}, $7;
+            cvt.f32.bf16 lo_f32, lo;
+            cvt.f32.bf16 hi_f32, hi;
+            mul.rn.f32 lo_f32, lo_f32, $11;
+            mul.rn.f32 hi_f32, hi_f32, $11;
+            cvt.rn.bf16x2.f32 $7, hi_f32, lo_f32;
+        }
+        """,
+        "=r,=r,=r,=r,=r,=r,=r,=r,r,r,r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip))
+        for i in range(8)
+    )
+
+
+@cute.jit
+def _decode_nvfp4_b_tile_to_smem(
+    tBsB: cute.Tensor,
+    activation_buffer_base_ptr: cutlass.Int64,
+    qdata_offset: cutlass.Int64,
+    scale_offset: cutlass.Int64,
+    total_rows: cutlass.Int32,
+    split_prefix: cutlass.Int32,
+    tile_n_idx: cutlass.Int32,
+    k_tile_idx: cutlass.Int32,
+    stage: cutlass.Int32,
+    n_size: cutlass.Int32,
+    k_size: cutlass.Int32,
+    decode_warp_rank: cutlass.Int32,
+    NUM_DECODE_WARPS: cutlass.Constexpr[int],
+    BLOCK_SIZE_N: cutlass.Constexpr[int],
+    BLOCK_SIZE_K: cutlass.Constexpr[int],
+) -> None:
+    """Decode one warp's source-block partition into a BF16 MMA B stage."""
+    lane = cutlass.Int32(cute.arch.lane_idx())
+    qdata_words_ptr = cute.make_ptr(
+        cutlass.Uint32,
+        activation_buffer_base_ptr + qdata_offset,
+        cute.AddressSpace.gmem,
+        assumed_align=8,
+    )
+    scale_ptr = cute.make_ptr(
+        cutlass.Uint8,
+        activation_buffer_base_ptr + scale_offset,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    scale_cols = n_size // cutlass.Int32(16)
+    n_col_blocks = (
+        scale_cols
+        + cutlass.Int32(CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM)
+        - cutlass.Int32(1)
+    ) // cutlass.Int32(CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM)
+    global_scale_offset = scale_offset + cutlass.Int64(total_rows) * cutlass.Int64(
+        ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+    ) * cutlass.Int64(scale_cols)
+    global_scale_ptr = cute.make_ptr(
+        cutlass.Float32,
+        activation_buffer_base_ptr + global_scale_offset,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+
+    tile_smem = tBsB[(None, stage)]
+    blocks_per_row: cutlass.Constexpr[int] = BLOCK_SIZE_N // 16
+    block_count: cutlass.Constexpr[int] = BLOCK_SIZE_K * blocks_per_row
+    block_col = lane % cutlass.Int32(blocks_per_row)
+    row_lane_group = lane // cutlass.Int32(blocks_per_row)
+    row_scale_source_lane = row_lane_group * cutlass.Int32(blocks_per_row)
+
+    for block_linear in cutlass.range(
+        lane + decode_warp_rank * cutlass.Int32(32),
+        cutlass.Int32(block_count),
+        cutlass.Int32(32 * NUM_DECODE_WARPS),
+        unroll=1,
+    ):
+        local_row = block_linear // cutlass.Int32(blocks_per_row)
+        row_in_group = k_tile_idx * cutlass.Int32(BLOCK_SIZE_K) + local_row
+        row = split_prefix + row_in_group
+        global_scale_col = tile_n_idx * cutlass.Int32(blocks_per_row) + block_col
+        valid = (row_in_group < k_size) & (global_scale_col < scale_cols)
+
+        global_scale_inv = cutlass.Float32(0.0)
+        if valid & (lane == row_scale_source_lane):
+            global_scale_inv = cute.arch.load(
+                global_scale_ptr + cutlass.Int64(row),
+                cutlass.Float32,
+            )
+        global_scale_inv = cute.arch.shuffle_sync(
+            global_scale_inv,
+            row_scale_source_lane,
+        )
+
+        packed_lo = cutlass.Uint32(0)
+        packed_hi = cutlass.Uint32(0)
+        scale_byte = cutlass.Uint8(0)
+        if valid:
+            qdata_word_idx = (
+                cutlass.Int64(row) * cutlass.Int64(scale_cols * cutlass.Int32(2))
+                + cutlass.Int64(global_scale_col * cutlass.Int32(2))
+            )
+            packed_lo = cute.arch.load(
+                qdata_words_ptr + qdata_word_idx,
+                cutlass.Uint32,
+            )
+            packed_hi = cute.arch.load(
+                qdata_words_ptr + qdata_word_idx + cutlass.Int64(1),
+                cutlass.Uint32,
+            )
+            scale_entry = _cublas_blockscaled_qscale_offset(
+                cutlass.Int64(row),
+                cutlass.Int64(global_scale_col),
+                cutlass.Int64(n_col_blocks),
+            )
+            scale_byte = cute.arch.load(
+                scale_ptr + scale_entry,
+                cutlass.Uint8,
+            )
+        decoded_pairs = _decode_nvfp4_block_to_scaled_bf16x2(
+            packed_lo,
+            packed_hi,
+            cutlass.Uint32(scale_byte),
+            global_scale_inv,
+        )
+
+        local_col_base = block_col * cutlass.Int32(16)
+        for pair_idx in cutlass.range_constexpr(8):
+            pair_word = cute.make_rmem_tensor(
+                cute.make_layout((1,), stride=(1,)),
+                cutlass.Uint32,
+            )
+            pair_word[0] = decoded_pairs[pair_idx]
+            pair_values = cute.recast_tensor(pair_word, cutlass.BFloat16)
+            for value_in_pair in cutlass.range_constexpr(2):
+                local_col = local_col_base + cutlass.Int32(
+                    2 * pair_idx + value_in_pair
+                )
+                # MN-major BF16 B SMEM is flattened as 64-column panels, with K
+                # varying before the next panel. Preserve the exact TMA/MMA layout.
+                linear_idx = (
+                    (local_col // cutlass.Int32(64))
+                    * cutlass.Int32(BLOCK_SIZE_K * 64)
+                    + local_row * cutlass.Int32(64)
+                    + local_col % cutlass.Int32(64)
+                )
+                coord = cute.idx2crd(linear_idx, tile_smem.shape)
+                tile_smem[coord] = pair_values[value_in_pair]
+
+    cute.arch.fence_proxy("async.shared", space="cta")
+    cute.arch.sync_warp()
+
+
 class GroupedGemmKernel:
     """Persistent SM100 grouped GEMM (FPROP/DGRAD/WGRAD). __call__ takes
     torch tensors + a config dict and launches the device kernel."""
@@ -482,9 +756,14 @@ class GroupedGemmKernel:
         host_a_tensormap: bool = False,
         swap_ab: bool = False,
         schedule_rotation: bool = True,
+        packed_nvfp4_b: bool = False,
     ):
         if swap_ab and problem_type != _FPROP:
             raise ValueError("SWAP_AB is currently supported for FPROP only")
+        if packed_nvfp4_b and problem_type != _WGRAD:
+            raise ValueError("packed NVFP4 B is supported only for WGRAD")
+        if packed_nvfp4_b and config["NUM_CTAS"] != 1:
+            raise ValueError("packed NVFP4 B requires a 1-CTA config")
         self.config = dict(config)  # shallow copy so we can mutate locally
         self.problem_type = problem_type
         self.acc_dtype = acc_dtype
@@ -497,6 +776,7 @@ class GroupedGemmKernel:
         self.schedule_world_size = world_size if schedule_rotation else 1
         self.STATIC_SCHEDULER = static_scheduler
         self.SWAP_AB = swap_ab
+        self.PACKED_NVFP4_B = packed_nvfp4_b
         self.host_a_tensormap = host_a_tensormap and not swap_ab
         self.host_b_tensormap: bool = problem_type in (_FPROP, _DGRAD) and not swap_ab
 
@@ -557,6 +837,10 @@ class GroupedGemmKernel:
         n_tile_producer = NUM_TILE
         n_tile_cta_bar = 2 if NUM_CTAS == 2 else 0  # 2-CTA only
         n_tmem_dealloc = 1 if NUM_CTAS == 2 else 0  # 2-CTA only
+        n_packed_decode_ready = NUM_SMEM if self.PACKED_NVFP4_B else 0
+        n_packed_decode_command = (
+            NUM_SMEM * PACKED_DECODE_COMMAND_FIELDS if self.PACKED_NVFP4_B else 0
+        )
 
         @cute.struct
         class SharedStorage:
@@ -568,6 +852,9 @@ class GroupedGemmKernel:
             # tile_id slots — one per pipeline stage of the tile-info protocol.
             tile_id_smem: cute.struct.MemRange[cutlass.Int32, NUM_TILE]
             split_sizes_smem: cute.struct.MemRange[cutlass.Int32, G]
+            packed_decode_command: cute.struct.MemRange[
+                cutlass.Int32, n_packed_decode_command
+            ]
             # SMEM-staged broadcast of warp-leader's atomic_add result, needed
             # because elect_one() values cannot escape its scf.if region.
             # SMEM staging buffer for tensormap descriptors — 3 × 128B.
@@ -581,6 +868,9 @@ class GroupedGemmKernel:
 
             smem_empty_mbar: cute.struct.MemRange[cutlass.Int64, n_smem_empty]
             smem_full_mbar: cute.struct.MemRange[cutlass.Int64, n_smem_full]
+            packed_decode_ready_mbar: cute.struct.MemRange[
+                cutlass.Int64, n_packed_decode_ready
+            ]
             tmem_full_mbar: cute.struct.MemRange[cutlass.Int64, n_tmem_full]
             tmem_empty_mbar: cute.struct.MemRange[cutlass.Int64, n_tmem_empty]
             tile_id_consumer_mbar: cute.struct.MemRange[cutlass.Int64, n_tile_consumer]
@@ -698,6 +988,8 @@ class GroupedGemmKernel:
             storage.tmem_dealloc_mbar.data_ptr() if NUM_CTAS == 2 else None
         )
         tile_id_smem_ptr = storage.tile_id_smem.data_ptr()
+        packed_decode_command_ptr = storage.packed_decode_command.data_ptr()
+        packed_decode_ready_mbar = storage.packed_decode_ready_mbar.data_ptr()
         tmem_holding_buf = storage.tmem_holding_buf
 
         # mbarrier arrive_counts (one elected lane of one warp per CTA
@@ -717,7 +1009,12 @@ class GroupedGemmKernel:
             with cute.arch.elect_one():
                 for i in range(NUM_SMEM_BUFFERS):
                     cute.arch.mbarrier_init(ab_empty_mbar + i, 1)
-                    cute.arch.mbarrier_init(ab_full_mbar + i, 1)
+                    cute.arch.mbarrier_init(
+                        ab_full_mbar + i,
+                        1 + PACKED_DECODE_WARPS if self.PACKED_NVFP4_B else 1,
+                    )
+                    if cutlass.const_expr(self.PACKED_NVFP4_B):
+                        cute.arch.mbarrier_init(packed_decode_ready_mbar + i, 1)
                 for i in range(self.NUM_ACC_BARRIERS):
                     cute.arch.mbarrier_init(tmem_full_mbar + i, 1)
                     cute.arch.mbarrier_init(tmem_empty_mbar + i, NUM_CTAS)
@@ -828,7 +1125,6 @@ class GroupedGemmKernel:
             cute.group_modes(sB, 0, 3),
             cute.group_modes(tCgB, 0, 3),
         )
-
         # MMA fragments. partition_shape_C takes the
         # FULL (M, N) — tiled_mma already accounts for thr_id splitting and
         # atom-along-M tiling.
@@ -916,7 +1212,9 @@ class GroupedGemmKernel:
             cute.slice_(b_smem_layout_staged, (None, None, None, 0)),
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
-        num_tma_load_bytes = (a_copy_bytes + b_copy_bytes) * atom_thr_size
+        num_tma_load_bytes = (
+            a_copy_bytes if self.PACKED_NVFP4_B else a_copy_bytes + b_copy_bytes
+        ) * atom_thr_size
 
         # Tensormap manager + per-CTA workspace pointers.
         grid_dim = cute.arch.grid_dim()
@@ -971,11 +1269,12 @@ class GroupedGemmKernel:
             tensormap_manager.init_tensormap_from_atom(
                 tma_atom_a, tensormap_a_init_ptr, TMA_WARP_ID
             )
-            tensormap_manager.init_tensormap_from_atom(
-                tma_atom_b, tensormap_b_init_ptr, TMA_WARP_ID
-            )
             _clear_tma_oob_prefetch_bit(tensormap_a_smem_ptr)
-            _clear_tma_oob_prefetch_bit(tensormap_b_smem_ptr)
+            if cutlass.const_expr(not self.PACKED_NVFP4_B):
+                tensormap_manager.init_tensormap_from_atom(
+                    tma_atom_b, tensormap_b_init_ptr, TMA_WARP_ID
+                )
+                _clear_tma_oob_prefetch_bit(tensormap_b_smem_ptr)
         if warp_idx == EPILOG_WARP_IDS[0]:
             tensormap_manager.init_tensormap_from_atom(
                 tma_atom_c, tensormap_c_init_ptr, EPILOG_WARP_IDS[0]
@@ -991,7 +1290,8 @@ class GroupedGemmKernel:
         # the SAME `setmaxnreg.aligned` instruction with the SAME imm
         # count. Layout: WG0 (warps 0-3) = EPILOG (heavy register use,
         # holds accumulator + reg-staged store pipeline); WG1 (warps 4-7)
-        # = MMA + TMA + 2 IDLE (light use). Values mirror TLX's
+        # = MMA + TMA + 2 auxiliary warps (light use). The auxiliary warps
+        # decode packed B when enabled and otherwise remain idle. Values mirror TLX's
         # producer/MMA hint of 48 regs/thread.
         if warp_idx < 4:
             cute.arch.setmaxregister_increase(216)
@@ -1019,6 +1319,8 @@ class GroupedGemmKernel:
                 tensormap_b_smem_ptr=tensormap_b_smem_ptr,
                 ab_full_mbar=ab_full_mbar,
                 ab_empty_mbar=ab_empty_mbar,
+                packed_decode_command_ptr=packed_decode_command_ptr,
+                packed_decode_ready_mbar=packed_decode_ready_mbar,
                 tile_producer_mbar=tile_producer_mbar,
                 tile_consumer_mbar=tile_consumer_mbar,
                 tile_cta_bar_mbar=tile_cta_bar_mbar,
@@ -1059,6 +1361,26 @@ class GroupedGemmKernel:
                 BLOCK_SIZE_N=BLOCK_SIZE_N,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 NUM_CTAS=NUM_CTAS,
+            )
+        elif cutlass.const_expr(self.PACKED_NVFP4_B) and (
+            (warp_idx == PACKED_DECODE_WARP_IDS[0])
+            | (warp_idx == PACKED_DECODE_WARP_IDS[1])
+        ):
+            self._packed_nvfp4_b_decode_worker_body(
+                tBsB=tBsB,
+                activation_buffer_base_ptr=b_base_ptr,
+                b_offset_tensor=b_offset_tensor,
+                split_sizes=split_sizes,
+                packed_decode_command_ptr=packed_decode_command_ptr,
+                packed_decode_ready_mbar=packed_decode_ready_mbar,
+                ab_full_mbar=ab_full_mbar,
+                decode_warp_rank=warp_idx
+                - cutlass.Int32(PACKED_DECODE_WARP_IDS[0])
+                + cutlass.Int32(1),
+                G=G,
+                NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
             )
         elif warp_idx == MMA_WARP_ID:
             # Retrieve TMEM ptr and build accumulator tensor.
@@ -1209,7 +1531,7 @@ class GroupedGemmKernel:
                     self.num_tmem_alloc_cols,
                     is_two_cta=(NUM_CTAS == 2),
                 )
-        else:  # idle warp group (warp_id ∈ IDLE_WARP_IDS)
+        else:  # auxiliary warps are idle outside packed-NVFP4 B decode
             self._idle_body()
 
         if cutlass.const_expr(NUM_CTAS == 2):
@@ -1262,6 +1584,89 @@ class GroupedGemmKernel:
         return num_k_tiles
 
     @cute.jit
+    def _packed_nvfp4_b_decode_worker_body(
+        self,
+        tBsB: cute.Tensor,
+        activation_buffer_base_ptr: cutlass.Int64,
+        b_offset_tensor: cute.Tensor,
+        split_sizes: cute.Tensor,
+        packed_decode_command_ptr: cute.Pointer,
+        packed_decode_ready_mbar: cute.Pointer,
+        ab_full_mbar: cute.Pointer,
+        decode_warp_rank: cutlass.Int32,
+        G: cutlass.Constexpr[int],
+        NUM_SMEM_BUFFERS: cutlass.Constexpr[int],
+        BLOCK_SIZE_N: cutlass.Constexpr[int],
+        BLOCK_SIZE_K: cutlass.Constexpr[int],
+    ) -> None:
+        """Consume TMA-warp decode commands on one otherwise-idle warp."""
+        qdata_offset = cutlass.Int64(b_offset_tensor[0])
+        scale_offset = cutlass.Int64(b_offset_tensor[ACTIVATION_A_SCALE_OFFSET])
+        total_rows = _activation_buffer_rows(split_sizes, G)
+        command_count = cutlass.Int32(0)
+        keep_running = cutlass.Boolean(True)
+
+        while keep_running:
+            stage, phase = _get_bufidx_phase(
+                command_count,
+                NUM_SMEM_BUFFERS,
+            )
+            cute.arch.mbarrier_wait(
+                packed_decode_ready_mbar + stage,
+                phase,
+            )
+            command_base = stage * cutlass.Int32(PACKED_DECODE_COMMAND_FIELDS)
+            split_prefix = cute.arch.load(
+                packed_decode_command_ptr + command_base,
+                cutlass.Int32,
+                ss="cta",
+            )
+            if split_prefix == cutlass.Int32(PACKED_DECODE_TERMINATION):
+                keep_running = cutlass.Boolean(False)
+            else:
+                tile_n_idx = cute.arch.load(
+                    packed_decode_command_ptr + command_base + 1,
+                    cutlass.Int32,
+                    ss="cta",
+                )
+                k_tile_idx = cute.arch.load(
+                    packed_decode_command_ptr + command_base + 2,
+                    cutlass.Int32,
+                    ss="cta",
+                )
+                n_size = cute.arch.load(
+                    packed_decode_command_ptr + command_base + 3,
+                    cutlass.Int32,
+                    ss="cta",
+                )
+                k_size = cute.arch.load(
+                    packed_decode_command_ptr + command_base + 4,
+                    cutlass.Int32,
+                    ss="cta",
+                )
+                _decode_nvfp4_b_tile_to_smem(
+                    tBsB,
+                    activation_buffer_base_ptr,
+                    qdata_offset,
+                    scale_offset,
+                    total_rows,
+                    split_prefix,
+                    tile_n_idx,
+                    k_tile_idx,
+                    stage,
+                    n_size,
+                    k_size,
+                    decode_warp_rank,
+                    PACKED_DECODE_WARPS,
+                    BLOCK_SIZE_N,
+                    BLOCK_SIZE_K,
+                )
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(ab_full_mbar + stage)
+                cute.arch.sync_warp()
+                command_count += cutlass.Int32(1)
+
+    @cute.jit
     def _tma_producer_body(  # noqa: C901
         self,
         # ---- TMA copy infrastructure -----------------------------------------
@@ -1286,6 +1691,8 @@ class GroupedGemmKernel:
         # ---- Sync state ------------------------------------------------------
         ab_full_mbar: cute.Pointer,
         ab_empty_mbar: cute.Pointer,
+        packed_decode_command_ptr: cute.Pointer,
+        packed_decode_ready_mbar: cute.Pointer,
         tile_producer_mbar: cute.Pointer,
         tile_consumer_mbar: cute.Pointer,
         tile_cta_bar_mbar,  # may be None in 1-CTA mode
@@ -1385,9 +1792,16 @@ class GroupedGemmKernel:
         b_base_eff = b_base_ptr
         a_offset = cutlass.Int64(0)
         b_offset = cutlass.Int64(0)
+        b_scale_offset = cutlass.Int64(0)
+        activation_rows = cutlass.Int32(0)
         if cutlass.const_expr(use_activation_buffer):
             a_offset = cutlass.Int64(a_offset_tensor[0])
             b_offset = cutlass.Int64(b_offset_tensor[0])
+            if cutlass.const_expr(self.PACKED_NVFP4_B):
+                b_scale_offset = cutlass.Int64(
+                    b_offset_tensor[ACTIVATION_A_SCALE_OFFSET]
+                )
+                activation_rows = _activation_buffer_rows(split_sizes, G)
             a_base_eff = a_base_ptr + a_offset
             b_base_eff = b_base_ptr + b_offset
             if cutlass.const_expr(problem_type == _WGRAD):
@@ -1403,17 +1817,37 @@ class GroupedGemmKernel:
                         activation_buffer_size_bytes=activation_buffer_size_bytes,
                         warp_scoped_diagnostic=True,
                     )
-                    _require_valid_activation_buffer_range(
-                        byte_offset=b_offset,
-                        byte_extent=_packed_group_rows_byte_extent(
-                            split_sizes,
-                            b_s1,
-                            elem_size_bytes_b,
-                            G,
-                        ),
-                        activation_buffer_size_bytes=activation_buffer_size_bytes,
-                        warp_scoped_diagnostic=True,
-                    )
+                    if cutlass.const_expr(self.PACKED_NVFP4_B):
+                        scale_cols = N // cutlass.Int32(16)
+                        _require_valid_activation_buffer_range(
+                            byte_offset=b_offset,
+                            byte_extent=cutlass.Int64(activation_rows)
+                            * cutlass.Int64(N // cutlass.Int32(2)),
+                            activation_buffer_size_bytes=activation_buffer_size_bytes,
+                            warp_scoped_diagnostic=True,
+                        )
+                        _require_valid_activation_buffer_range(
+                            byte_offset=b_scale_offset,
+                            byte_extent=cutlass.Int64(activation_rows)
+                            * cutlass.Int64(
+                                ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE * scale_cols
+                            )
+                            + cutlass.Int64(activation_rows) * cutlass.Int64(4),
+                            activation_buffer_size_bytes=activation_buffer_size_bytes,
+                            warp_scoped_diagnostic=True,
+                        )
+                    else:
+                        _require_valid_activation_buffer_range(
+                            byte_offset=b_offset,
+                            byte_extent=_packed_group_rows_byte_extent(
+                                split_sizes,
+                                b_s1,
+                                elem_size_bytes_b,
+                                G,
+                            ),
+                            activation_buffer_size_bytes=activation_buffer_size_bytes,
+                            warp_scoped_diagnostic=True,
+                        )
 
         if cutlass.const_expr(self.STATIC_SCHEDULER):
             scheduler = StaticTileScheduler.create_producer(NUM_CTAS)
@@ -1539,7 +1973,8 @@ class GroupedGemmKernel:
                         problem_type=problem_type,
                     )
                 if cutlass.const_expr(
-                    not self.host_a_tensormap and self.host_b_tensormap
+                    not self.host_a_tensormap
+                    and (self.host_b_tensormap or self.PACKED_NVFP4_B)
                 ):
                     tensormap_manager.update_tensormap(
                         (real_tensor_a,),
@@ -1548,7 +1983,9 @@ class GroupedGemmKernel:
                         TMA_WARP_ID,
                         (tensormap_a_smem_ptr,),
                     )
-                elif cutlass.const_expr(not self.host_b_tensormap):
+                elif cutlass.const_expr(
+                    not self.host_b_tensormap and not self.PACKED_NVFP4_B
+                ):
                     b_base_g = b_base_eff + b_off_bytes
                     real_tensor_b = _make_tensor_for_tensormap_update(
                         b_base_g,
@@ -1582,7 +2019,9 @@ class GroupedGemmKernel:
                 # not per tile — the per-tile placement was wasteful.
                 if cutlass.const_expr(not self.host_a_tensormap):
                     tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
-                if cutlass.const_expr(not self.host_b_tensormap):
+                if cutlass.const_expr(
+                    not self.host_b_tensormap and not self.PACKED_NVFP4_B
+                ):
                     tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
 
                 # Loop while current tile_idx falls within this group.
@@ -1769,7 +2208,60 @@ class GroupedGemmKernel:
                                 mcast_mask=a_full_mcast_mask,
                                 tma_desc_ptr=a_desc_ptr,
                             )
-                        if cutlass.const_expr(self.host_b_tensormap):
+                        if cutlass.const_expr(self.PACKED_NVFP4_B):
+                            command_base = buf * cutlass.Int32(
+                                PACKED_DECODE_COMMAND_FIELDS
+                            )
+                            with cute.arch.elect_one():
+                                cute.arch.store(
+                                    packed_decode_command_ptr + command_base,
+                                    work.split_prefix,
+                                    ss="cta",
+                                )
+                                cute.arch.store(
+                                    packed_decode_command_ptr + command_base + 1,
+                                    tile_n_idx,
+                                    ss="cta",
+                                )
+                                cute.arch.store(
+                                    packed_decode_command_ptr + command_base + 2,
+                                    kk,
+                                    ss="cta",
+                                )
+                                cute.arch.store(
+                                    packed_decode_command_ptr + command_base + 3,
+                                    n_size,
+                                    ss="cta",
+                                )
+                                cute.arch.store(
+                                    packed_decode_command_ptr + command_base + 4,
+                                    k_size,
+                                    ss="cta",
+                                )
+                                cute.arch.mbarrier_arrive(
+                                    packed_decode_ready_mbar + buf
+                                )
+                            cute.arch.sync_warp()
+                            _decode_nvfp4_b_tile_to_smem(
+                                tBsB,
+                                b_base_ptr,
+                                b_offset,
+                                b_scale_offset,
+                                activation_rows,
+                                work.split_prefix,
+                                tile_n_idx,
+                                kk,
+                                buf,
+                                n_size,
+                                k_size,
+                                cutlass.Int32(0),
+                                PACKED_DECODE_WARPS,
+                                BLOCK_SIZE_N,
+                                BLOCK_SIZE_K,
+                            )
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive(ab_full_mbar + buf)
+                        elif cutlass.const_expr(self.host_b_tensormap):
                             cute.copy(
                                 tma_atom_b,
                                 tBgB[(None, tile_n_idx, kk, g)],
@@ -1814,6 +2306,25 @@ class GroupedGemmKernel:
                         accum_cnt_smem - cutlass.Int32(1), NUM_SMEM_BUFFERS
                     )
                     cute.arch.mbarrier_wait(ab_full_mbar + buf, phase)
+
+        if cutlass.const_expr(self.PACKED_NVFP4_B):
+            termination_buf, termination_phase = _get_bufidx_phase(
+                accum_cnt_smem,
+                NUM_SMEM_BUFFERS,
+            )
+            cute.arch.mbarrier_wait(
+                ab_empty_mbar + termination_buf,
+                termination_phase ^ 1,
+            )
+            command_base = termination_buf * cutlass.Int32(PACKED_DECODE_COMMAND_FIELDS)
+            with cute.arch.elect_one():
+                cute.arch.store(
+                    packed_decode_command_ptr + command_base,
+                    cutlass.Int32(PACKED_DECODE_TERMINATION),
+                    ss="cta",
+                )
+                cute.arch.mbarrier_arrive(packed_decode_ready_mbar + termination_buf)
+            cute.arch.sync_warp()
 
         scheduler.producer_publish_termination(accum_cnt_out)
 
@@ -2780,8 +3291,11 @@ class GroupedGemmKernel:
 
     @cute.jit
     def _idle_body(self):
-        """Idle padding warps (warps 6-7). They participate in the cluster
-        rendezvous in the kernel prologue and tail, but do no pipeline work.
+        """Run the non-packed role for auxiliary warps 6-7.
+
+        They participate in the cluster rendezvous in the kernel prologue and
+        tail, but do no pipeline work. Packed-NVFP4 B decode dispatches these
+        warps to ``_packed_nvfp4_b_decode_worker_body`` instead.
 
         TLX equivalent: `with tlx.async_task(num_warps=2, num_regs=48):
         if NUM_CTAS == 2: tlx.cluster_barrier()`.

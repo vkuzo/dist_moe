@@ -34,6 +34,7 @@ quickstart:
 policy = dist_moe.BlockScaledConfig(
     format=dist_moe.BlockScaledFormat.NVFP4,
     pipeline="staged",  # or "mega"
+    packed_w13_wgrad=False,  # opt in to packed-X tile decode
 )
 config = dist_moe.Config(
     max_num_local_input_tokens=T,
@@ -227,8 +228,24 @@ If the device planner selected recompute, backward republishes the saved local
 X as packed NVFP4 and repeats staged W13 forward compute, rebuilding gathered
 packed X and H1. This staged reconstruction is used for both original forward
 pipelines. If it selected full-save, packed X and H1 already occupy the
-activation slot. In both cases, backward decodes the selected packed X into
-BF16 `X_bw` scratch before the existing BF16 W13 WGRAD.
+activation slot.
+
+By default, backward decodes the selected packed X into BF16 `X_bw` scratch
+before the existing BF16 W13 WGRAD. Setting
+`BlockScaledConfig.packed_w13_wgrad=True` instead decodes each packed X panel
+directly into the W13 WGRAD kernel's BF16 shared-memory tile. The tensor-core
+MMA and accumulation order are unchanged, so this path is bitwise equivalent
+to the materialized-BF16 path while removing the full `X_bw` scratch tensor.
+Decode is source-block based: one 64-bit qdata load supplies sixteen FP4
+values, with one E4M3 block-scale load and one FP32 outer-scale load per row.
+The TMA producer publishes each stage through a shared-memory command ring;
+its warp and the two otherwise-idle auxiliary warps decode disjoint block
+partitions, and the MMA stage waits for all three arrivals.
+Packed X must remain live until W13 WGRAD consumes it; recompute therefore
+assigns its packed X and transient H2 row bundles disjoint scratch. This
+optional path uses the tuned one-CTA `1cta2mma_bm256_bn256` preset unless the
+context selects another one-CTA BF16 grouped-GEMM preset. Two-CTA presets are
+rejected for this mode.
 
 For both decisions, backward reruns SwiGLU and the NVFP4 W2 forward kernel,
 then dequantizes the quantized SwiGLU result as
@@ -241,7 +258,7 @@ grad_Y, scores, H3
   -> BF16 W2 WGRAD with H2_bw -> grad_W2
   -> SwiGLU backward with H1 -> grad_H1
   -> BF16 W13 DGRAD with DQ(Q(W13)) -> route grad_X
-  -> BF16 W13 WGRAD with X_bw -> grad_W13
+  -> BF16 W13 WGRAD with X_bw, or packed X decoded per tile -> grad_W13
   -> peer scatter and top-k reduction -> grad_X
 ```
 

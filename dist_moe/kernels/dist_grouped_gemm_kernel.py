@@ -1255,6 +1255,10 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     tensormap_b_smem_ptr=tensormap_b_smem_ptr,
                     ab_full_mbar=ab_full_mbar,
                     ab_empty_mbar=ab_empty_mbar,
+                    # Distributed kernels never enable packed B; these satisfy
+                    # the shared producer signature and are compile-time dead.
+                    packed_decode_command_ptr=ab_full_mbar,
+                    packed_decode_ready_mbar=ab_full_mbar,
                     tile_producer_mbar=tile_producer_mbar,
                     tile_consumer_mbar=tile_consumer_mbar,
                     tile_cta_bar_mbar=tile_cta_bar_mbar,
@@ -1868,6 +1872,10 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     tensormap_b_smem_ptr=tensormap_b_smem_ptr,
                     ab_full_mbar=ab_full_mbar,
                     ab_empty_mbar=ab_empty_mbar,
+                    # Distributed kernels never enable packed B; these satisfy
+                    # the shared producer signature and are compile-time dead.
+                    packed_decode_command_ptr=ab_full_mbar,
+                    packed_decode_ready_mbar=ab_full_mbar,
                     tile_producer_mbar=tile_producer_mbar,
                     tile_consumer_mbar=tile_consumer_mbar,
                     tile_cta_bar_mbar=tile_cta_bar_mbar,

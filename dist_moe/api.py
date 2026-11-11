@@ -115,6 +115,7 @@ Bf16GroupedGemmPreset = Literal[
     "2cta2mma_bm512_bn256",
 ]
 _BF16_GROUPED_GEMM_CONFIGS = frozenset(get_args(Bf16GroupedGemmPreset))
+_PACKED_NVFP4_W13_WGRAD_PRESET: Bf16GroupedGemmPreset = "1cta2mma_bm256_bn256"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -263,12 +264,16 @@ class BlockScaledConfig:
             forward pipeline.
         kernel_config: Optional expert pipeline override; ``None`` selects the
             shape-aware defaults.
+        packed_w13_wgrad: Whether NVFP4 training decodes saved packed X
+            directly into the BF16 W13 WGRAD tile load. This preserves BF16
+            MMA numerics and avoids materializing a full BF16 X scratch tensor.
     """
 
     format: BlockScaledFormat = BlockScaledFormat.MXFP8_E4M3
     fast_math: bool = False
     pipeline: Literal["staged", "mega"] = "staged"
     kernel_config: BlockScaledKernelConfig | None = None
+    packed_w13_wgrad: bool = False
 
     def __post_init__(self) -> None:
         """Validate the supported public precision surface.
@@ -284,6 +289,8 @@ class BlockScaledConfig:
             raise ValueError(f"unsupported DistMoE block-scaled format {self.format}")
         if self.fast_math and self.format is BlockScaledFormat.NVFP4:
             raise ValueError("fast_math is supported only by the MXFP8 fused path")
+        if self.packed_w13_wgrad and self.format is not BlockScaledFormat.NVFP4:
+            raise ValueError("packed_w13_wgrad is supported only by NVFP4")
         if self.pipeline not in ("staged", "mega"):
             raise ValueError("block-scaled pipeline must be 'staged' or 'mega'")
         if self.kernel_config is not None:
@@ -500,6 +507,21 @@ class Config:
                 "bf16_grouped_gemm_preset must name a supported BF16 preset; "
                 f"got {self.bf16_grouped_gemm_preset!r}"
             )
+        if (
+            self.block_scaled is not None
+            and self.block_scaled.packed_w13_wgrad
+            and self.bf16_grouped_gemm_preset is not None
+            and self.bf16_grouped_gemm_preset.startswith("2cta")
+        ):
+            raise ValueError(
+                "packed_w13_wgrad requires a 1-CTA BF16 grouped-GEMM preset"
+            )
+        if (
+            self.block_scaled is not None
+            and self.block_scaled.packed_w13_wgrad
+            and self.inference
+        ):
+            raise ValueError("packed_w13_wgrad is a training-only option")
         if self.wgrad_dtype is not None and self.wgrad_dtype not in (
             torch.bfloat16,
             torch.float32,
@@ -860,6 +882,11 @@ def _model_config(
         save_dequantized_activations=(
             config.block_scaled is not None
             and config.block_scaled.format is BlockScaledFormat.NVFP4
+            and not config.inference
+        ),
+        packed_w13_wgrad=(
+            config.block_scaled is not None
+            and config.block_scaled.packed_w13_wgrad
             and not config.inference
         ),
     )
@@ -2622,9 +2649,24 @@ class _Bf16Autograd(torch.autograd.Function):
                         device=w13_EFD.device,
                     )
                 w13_output_accum = wgrad_destinations[0].accumulate
+            w13_wgrad_x = backward_plan.x_gathered_offset
+            packed_nvfp4_x = False
+            if backward_adapter is not None:
+                w13_wgrad_x, packed_nvfp4_x = backward_adapter.w13_wgrad_input(
+                    backward_plan
+                )
+            # Inline decode currently uses a one-CTA producer. Among the
+            # replay-safe presets, the widest two-MMA tile was fastest at the
+            # default benchmark shape. Preserve an explicit one-CTA override
+            # so callers can retune for other shapes.
+            w13_wgrad_config = wgrad_config
+            if packed_nvfp4_x:
+                w13_wgrad_config = (
+                    config.bf16_grouped_gemm_preset or _PACKED_NVFP4_W13_WGRAD_PRESET
+                )
             grad_w13_EFD = grouped_gemm_wgrad(
                 dy=backward_plan.grad_h1_offset,
-                x=backward_plan.x_gathered_offset,
+                x=w13_wgrad_x,
                 split_sizes=num_recv_rows_per_local_expert_E,
                 activation_buffer=activation_buffer.buffer,
                 hidden_dim_dy=w13_EFD.shape[1],
@@ -2633,7 +2675,8 @@ class _Bf16Autograd(torch.autograd.Function):
                 output_accum=w13_output_accum,
                 wgrad=grad_w13_output_EFD,
                 num_sms=config.num_sms,
-                config=wgrad_config,
+                config=w13_wgrad_config,
+                packed_nvfp4_x=packed_nvfp4_x,
             )
             grad_w13_EFD = _postprocess_wgrad(
                 options.wgrad_postprocess_fn,
