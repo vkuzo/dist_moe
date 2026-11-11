@@ -195,6 +195,11 @@ dispatch lifetime. The row-bundle decoder converts Q(X) and Q(H2) into BF16
 backward scratch before their source storage is reused. Each packed source and
 expanding BF16 destination remain disjoint for the full kernel lifetime
 because independently scheduled decoder programs have no grid-wide ordering.
+The backward planner first publishes the selected saved or recomputed bundle,
+then one graph-stable launch decodes it. Each CTA owns one row and walks
+2,048-byte packed tiles. It loads each E2M1 byte once, loads each blocked E4M3
+scale once per 16 values, uses packed BF16x2 conversion and block-scale
+multiplication, applies the row scale in FP32, and writes one 32-bit BF16 pair.
 
 G8 with GPU offsets requires the source high-throughput producer topology.
 Its padded allocation row bound is at least `16 * num_sms`, and the
