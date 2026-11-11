@@ -145,6 +145,21 @@ def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
     )
 
 
+def _sqnr_db(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Compute signal-to-quantization-noise ratio in decibels.
+
+    Args:
+        actual: Quantized approximation.
+        expected: Unquantized reference.
+
+    Returns:
+        SQNR in decibels as a Python float.
+    """
+    signal = torch.sum(expected.float().square())
+    noise = torch.sum((actual.float() - expected.float()).square()).clamp_min(1e-12)
+    return float((10.0 * torch.log10(signal / noise)).detach())
+
+
 def _run_two_rank_test(rank: int, test_name: str, rendezvous_file: str) -> None:
     """Run one decorated test body in a two-rank NCCL process group."""
     torch.cuda.set_device(rank)
@@ -209,8 +224,19 @@ def _nvfp4_outer_quant_scale(
     tensor: torch.Tensor,
     *,
     per_token: bool,
+    use_four_over_six: bool = False,
 ) -> torch.Tensor:
-    """Return the golden NVFP4 outer quantization multiplier."""
+    """Return the golden NVFP4 outer quantization multiplier.
+
+    Args:
+        tensor: BF16 values to normalize.
+        per_token: Whether to reduce independently over each final-dimension row.
+        use_four_over_six: Whether to reserve E4M3 range for adaptive 4/6
+            scaling.
+
+    Returns:
+        FP32 quantization multiplier with per-token or per-tensor granularity.
+    """
     if per_token:
         amax = torch.linalg.vector_norm(
             tensor,
@@ -226,7 +252,8 @@ def _nvfp4_outer_quant_scale(
             dim=tuple(range(tensor.ndim)),
             dtype=torch.float32,
         ).clamp(min=NVFP4_GLOBAL_SCALE_EPS)
-    return NVFP4_MAX * torch.reciprocal(amax)
+    normalizer = FP4_E2M1_MAX * 256.0 if use_four_over_six else NVFP4_MAX
+    return normalizer * torch.reciprocal(amax)
 
 
 def _nvfp4_reference_to_blocked_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -253,25 +280,87 @@ def _nvfp4_quantize_dist_moe_scale_order(
     outer_scale: torch.Tensor,
     *,
     blocked_scales: bool,
+    use_four_over_six: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the golden NVFP4 cast with Dist-MoE's inner-scale operation order."""
+    """Run the golden NVFP4 cast with Dist-MoE's scale operation order.
+
+    Args:
+        tensor: Two-dimensional BF16 source.
+        outer_scale: FP32 per-row or scalar outer quantization multiplier.
+        blocked_scales: Whether to return the cuBLAS blocked scale layout.
+        use_four_over_six: Whether to select the lower-MSE scale-for-4 or
+            scale-for-6 candidate independently for each 16-value block.
+
+    Returns:
+        Packed NVFP4 data and E4M3 inner scales.
+    """
     rows, cols = tensor.shape
     blocks = tensor.reshape(rows, cols // 16, 16)
     outer = outer_scale.unsqueeze(-1) if outer_scale.ndim == 2 else outer_scale
     local_amax = blocks.abs().amax(dim=-1, keepdim=True).to(torch.float32)
     scaled_amax = local_amax * outer
-    inner_scale = torch.clamp(
-        scaled_amax * FP4_E2M1_MAX_RECIP,
-        min=E4M3_MIN_SUBNORMAL,
-        max=FP8_E4M3_MAX,
-    ).to(torch.float8_e4m3fn)
-    reciprocal_scale = outer / inner_scale.to(torch.float32)
-    scaled_data = torch.clamp(
-        blocks.to(torch.float32) * reciprocal_scale,
-        min=-FP4_E2M1_MAX,
-        max=FP4_E2M1_MAX,
-    )
-    packed = pack_uint4(f32_to_f4_unpacked(scaled_data))
+    scale_for_six = scaled_amax * FP4_E2M1_MAX_RECIP
+
+    def quantize_with_scale(
+        unrounded_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize blocks using one unrounded inner-scale candidate."""
+        candidate_scale = torch.clamp(
+            unrounded_scale,
+            min=E4M3_MIN_SUBNORMAL,
+            max=FP8_E4M3_MAX,
+        ).to(torch.float8_e4m3fn)
+        reciprocal_scale = outer / candidate_scale.to(torch.float32)
+        scaled_data = torch.clamp(
+            blocks.to(torch.float32) * reciprocal_scale,
+            min=-FP4_E2M1_MAX,
+            max=FP4_E2M1_MAX,
+        )
+        return f32_to_f4_unpacked(scaled_data), candidate_scale
+
+    unpacked, inner_scale = quantize_with_scale(scale_for_six)
+    if use_four_over_six:
+        # Four-over-Six adaptive scaling is based on the MIT HAN Lab work:
+        # https://github.com/mit-han-lab/fouroversix
+        # The optimized FP16 product-domain scoring contract follows:
+        # https://humansand.ai/blog/nvfp4-rl
+        unpacked_for_four, inner_scale_for_four = quantize_with_scale(
+            scale_for_six * 1.5
+        )
+        fp4_values_fp16 = torch.tensor(
+            FP4_E2M1_TABLE,
+            dtype=torch.float16,
+            device=tensor.device,
+        )
+        scaled_target = blocks.to(torch.float32) * outer
+
+        def squared_error(
+            candidate: torch.Tensor,
+            candidate_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            """Score one candidate with the optimized FP16 product contract."""
+            candidate_product = (
+                fp4_values_fp16[candidate.to(torch.long)]
+                * candidate_scale.to(torch.float16)
+            ).to(torch.float32)
+            return torch.sum(
+                (candidate_product - scaled_target).square(),
+                dim=-1,
+                keepdim=True,
+            )
+
+        select_four = squared_error(
+            unpacked_for_four,
+            inner_scale_for_four,
+        ) < squared_error(unpacked, inner_scale)
+        unpacked = torch.where(select_four, unpacked_for_four, unpacked)
+        inner_scale = torch.where(
+            select_four,
+            inner_scale_for_four,
+            inner_scale,
+        )
+
+    packed = pack_uint4(unpacked)
     qdata = packed.view(torch.float4_e2m1fn_x2).reshape(rows, cols // 2)
     natural_scale = inner_scale.squeeze(-1)
     if blocked_scales:
@@ -283,11 +372,16 @@ def _nvfp4_dist_moe_order_qdq(
     tensor: torch.Tensor,
     *,
     per_token: bool,
+    use_four_over_six: bool = False,
 ) -> torch.Tensor:
-    """Quantize-dequantize BF16 using Dist-MoE's inner-scale operation order."""
+    """Quantize-dequantize BF16 using the selected reference scale policy."""
     original_shape = tensor.shape
     flattened = tensor.reshape(-1, original_shape[-1])
-    outer_scale = _nvfp4_outer_quant_scale(tensor, per_token=per_token)
+    outer_scale = _nvfp4_outer_quant_scale(
+        tensor,
+        per_token=per_token,
+        use_four_over_six=use_four_over_six,
+    )
     flattened_outer_scale = (
         outer_scale.reshape(-1, 1) if outer_scale.ndim > 0 else outer_scale
     )
@@ -295,6 +389,7 @@ def _nvfp4_dist_moe_order_qdq(
         flattened,
         flattened_outer_scale,
         blocked_scales=False,
+        use_four_over_six=use_four_over_six,
     )
     dequantized = nvfp4_gs_dq_f(qdata, inner_scale, flattened_outer_scale)
     return dequantized.reshape(original_shape).to(tensor.dtype)
@@ -308,6 +403,7 @@ class _NVFP4RealQuantLinearSTE(torch.autograd.Function):
         ctx: Any,
         input_MK: torch.Tensor,
         weight_NK: torch.Tensor,
+        use_four_over_six: bool,
     ) -> torch.Tensor:
         """Evaluate ``input_MK @ weight_NK.T`` with real NVFP4 tensor cores."""
         if input_MK.ndim != 2 or weight_NK.ndim != 2:
@@ -327,20 +423,24 @@ class _NVFP4RealQuantLinearSTE(torch.autograd.Function):
         input_outer_scale = _nvfp4_outer_quant_scale(
             padded_input,
             per_token=True,
+            use_four_over_six=use_four_over_six,
         )
         weight_outer_scale = _nvfp4_outer_quant_scale(
             weight_NK,
             per_token=False,
+            use_four_over_six=use_four_over_six,
         )
         input_q, input_inner_scale = _nvfp4_quantize_dist_moe_scale_order(
             padded_input,
             input_outer_scale,
             blocked_scales=True,
+            use_four_over_six=use_four_over_six,
         )
         weight_q, weight_inner_scale = _nvfp4_quantize_dist_moe_scale_order(
             weight_NK,
             weight_outer_scale,
             blocked_scales=True,
+            use_four_over_six=use_four_over_six,
         )
 
         accumulator = F.scaled_mm(
@@ -360,32 +460,52 @@ class _NVFP4RealQuantLinearSTE(torch.autograd.Function):
         output = accumulator * torch.reciprocal(input_outer_scale)
         output = output * torch.reciprocal(weight_outer_scale)
         ctx.save_for_backward(input_MK, weight_NK)
+        ctx.use_four_over_six = use_four_over_six
         return output[:rows].to(input_MK.dtype)
 
     @staticmethod
     def backward(
         ctx: Any,
         grad_output_MN: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         """Recreate Q-DQ operands and evaluate both gradients in BF16."""
         input_MK, weight_NK = ctx.saved_tensors
-        input_qdq_MK = _nvfp4_dist_moe_order_qdq(input_MK, per_token=True)
-        weight_qdq_NK = _nvfp4_dist_moe_order_qdq(weight_NK, per_token=False)
+        input_qdq_MK = _nvfp4_dist_moe_order_qdq(
+            input_MK,
+            per_token=True,
+            use_four_over_six=ctx.use_four_over_six,
+        )
+        weight_qdq_NK = _nvfp4_dist_moe_order_qdq(
+            weight_NK,
+            per_token=False,
+            use_four_over_six=ctx.use_four_over_six,
+        )
         grad_output_MN = grad_output_MN.to(input_MK.dtype).contiguous()
         grad_input_MK = torch.mm(grad_output_MN, weight_qdq_NK)
         grad_weight_NK = torch.mm(
             grad_output_MN.t().contiguous(),
             input_qdq_MK,
         )
-        return grad_input_MK, grad_weight_NK
+        return grad_input_MK, grad_weight_NK, None
 
 
 def _nvfp4_real_quant_linear(
     input_MK: torch.Tensor,
     weight_NK: torch.Tensor,
+    *,
+    use_four_over_six: bool = False,
 ) -> torch.Tensor:
-    """Apply the test-only real-NVFP4 linear with a BF16 STE backward."""
-    return _NVFP4RealQuantLinearSTE.apply(input_MK, weight_NK)
+    """Apply the test-only real-NVFP4 linear with a BF16 STE backward.
+
+    Args:
+        input_MK: BF16 activation matrix.
+        weight_NK: BF16 weight matrix.
+        use_four_over_six: Whether to use adaptive 4/6 block scaling.
+
+    Returns:
+        BF16 matrix product evaluated through real NVFP4 tensor cores.
+    """
+    return _NVFP4RealQuantLinearSTE.apply(input_MK, weight_NK, use_four_over_six)
 
 
 def _reference_nvfp4_activation_qdq(tensor: torch.Tensor) -> torch.Tensor:
@@ -504,6 +624,7 @@ def _reference_moe_nvfp4_real_quant(
     situ_glu_beta: float = 4.0,
     situ_glu_linear_beta: float = 25.0,
     saved_activations: dict[str, Any] | None = None,
+    use_four_over_six: bool = False,
 ) -> torch.Tensor:
     """Evaluate routed experts with per-expert real NVFP4 forward GEMMs.
 
@@ -522,6 +643,8 @@ def _reference_moe_nvfp4_real_quant(
         situ_glu_linear_beta: Up-projection tanh bound for SiTU-GLU.
         saved_activations: Optional output dictionary populated with
             expert-grouped ``x_bw`` and ``h1`` rows plus route-ordered ``h3``.
+        use_four_over_six: Whether to use adaptive 4/6 scaling for both GEMMs
+            and saved BF16 STE operands.
 
     Returns:
         Real-quantized reference output with shape ``[T, D]``.
@@ -554,10 +677,20 @@ def _reference_moe_nvfp4_real_quant(
 
         token_indices = flat_token_indices.index_select(0, route_indices)
         expert_x = x.index_select(0, token_indices)
-        h13 = _nvfp4_real_quant_linear(expert_x, w13[expert])
+        h13 = _nvfp4_real_quant_linear(
+            expert_x,
+            w13[expert],
+            use_four_over_six=use_four_over_six,
+        )
         h1_by_expert.append(h13)
         if saved_activations is not None:
-            x_bw_by_expert.append(_nvfp4_dist_moe_order_qdq(expert_x, per_token=True))
+            x_bw_by_expert.append(
+                _nvfp4_dist_moe_order_qdq(
+                    expert_x,
+                    per_token=True,
+                    use_four_over_six=use_four_over_six,
+                )
+            )
         else:
             x_bw_by_expert.append(x.new_empty((0, hidden_dim), dtype=output_dtype))
 
@@ -586,7 +719,11 @@ def _reference_moe_nvfp4_real_quant(
             h2 = (gate_f32 * up_f32).to(output_dtype)
         else:
             h2 = (gate_f32 * torch.sigmoid(gate_f32) * up_f32).to(output_dtype)
-        expert_h3 = _nvfp4_real_quant_linear(h2, w2[expert])
+        expert_h3 = _nvfp4_real_quant_linear(
+            h2,
+            w2[expert],
+            use_four_over_six=use_four_over_six,
+        )
         for route_index, h3 in zip(
             route_indices.tolist(),
             expert_h3.unbind(),
@@ -3812,6 +3949,298 @@ class DistMoeKernelTest(unittest.TestCase):
                 actual_scale_RB.view(torch.uint8),
                 expected_scale_RB.view(torch.uint8),
             )
+        )
+
+    def test_nvfp4_four_over_six_improves_handcrafted_block_sqnr(self) -> None:
+        """Select scale-for-4 for a block where it improves SQNR by over 8 dB.
+
+        Exact scales also prove that adaptive mode changes only normalization
+        and per-block scale selection, while the explicit false path remains
+        bitwise identical to the default Dist-MoE reference.
+        """
+        block_MK = torch.tensor(
+            [
+                [
+                    1.0,
+                    0.8,
+                    0.75,
+                    0.5,
+                    0.25,
+                    0.8,
+                    0.75,
+                    0.5,
+                    0.25,
+                    0.8,
+                    0.75,
+                    0.5,
+                    0.25,
+                    0.8,
+                    0.75,
+                    0.5,
+                ]
+            ],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        default_qdq_MK = _nvfp4_dist_moe_order_qdq(block_MK, per_token=True)
+        static_qdq_MK = _nvfp4_dist_moe_order_qdq(
+            block_MK,
+            per_token=True,
+            use_four_over_six=False,
+        )
+        adaptive_qdq_MK = _nvfp4_dist_moe_order_qdq(
+            block_MK,
+            per_token=True,
+            use_four_over_six=True,
+        )
+        torch.testing.assert_close(default_qdq_MK, static_qdq_MK, rtol=0, atol=0)
+
+        adaptive_outer_M1 = _nvfp4_outer_quant_scale(
+            block_MK,
+            per_token=True,
+            use_four_over_six=True,
+        )
+        _, adaptive_scale_MB = _nvfp4_quantize_dist_moe_scale_order(
+            block_MK,
+            adaptive_outer_M1,
+            blocked_scales=False,
+            use_four_over_six=True,
+        )
+        self.assertEqual(adaptive_outer_M1.shape, (1, 1))
+        self.assertEqual(adaptive_outer_M1.item(), 1536.0)
+        self.assertEqual(adaptive_scale_MB.shape, (1, 1))
+        self.assertEqual(adaptive_scale_MB.float().item(), 384.0)
+        self.assertGreater(
+            _sqnr_db(adaptive_qdq_MK, block_MK),
+            _sqnr_db(static_qdq_MK, block_MK) + 8.0,
+        )
+
+    def test_nvfp4_four_over_six_uses_fp16_product_scoring(self) -> None:
+        """Select scale-for-4 when FP16 product-domain scoring breaks an FP32 tie.
+
+        Original-domain FP32 reconstruction gives both candidates the same
+        error for this block and therefore selects scale-for-6. Casting E2M1
+        data and E4M3 scales to FP16, multiplying them in FP16, and comparing
+        against the outer-scaled FP32 target instead selects scale-for-4.
+        """
+        tensor_MK = torch.tensor(
+            [
+                [
+                    -0.053955078125,
+                    -0.0230712890625,
+                    -0.0654296875,
+                    0.07666015625,
+                    -0.04248046875,
+                    -0.08837890625,
+                    0.158203125,
+                    -0.06591796875,
+                    0.0255126953125,
+                    -0.003265380859375,
+                    0.0308837890625,
+                    -0.07470703125,
+                    -0.0081787109375,
+                    -0.0263671875,
+                    -0.0086669921875,
+                    -0.03466796875,
+                ]
+            ],
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        outer_scale_M1 = _nvfp4_outer_quant_scale(
+            tensor_MK,
+            per_token=True,
+            use_four_over_six=True,
+        )
+        _, scale_MB = _nvfp4_quantize_dist_moe_scale_order(
+            tensor_MK,
+            outer_scale_M1,
+            blocked_scales=False,
+            use_four_over_six=True,
+        )
+
+        self.assertEqual(scale_MB.shape, (1, 1))
+        self.assertEqual(scale_MB.float().item(), 384.0)
+
+    def test_nvfp4_four_over_six_improves_reference_moe_sqnr(self) -> None:
+        """Improve full reference-MoE SQNR by at least 1 dB over static NVFP4.
+
+        A structured one-expert case makes both W13 and W2 contain blocks that
+        benefit from scale-for-4, distinct from the isolated selector test.
+        """
+        base_K = torch.tensor(
+            [
+                1.0,
+                0.8,
+                0.75,
+                0.5,
+                0.25,
+                0.8,
+                0.75,
+                0.5,
+                0.25,
+                0.8,
+                0.75,
+                0.5,
+                0.25,
+                0.8,
+                0.75,
+                0.5,
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        num_tokens, hidden_dim, intermediate_dim = 4, 128, 128
+        x_TD = torch.cat(
+            [base_K * (-1 if block % 2 else 1) for block in range(8)]
+        ).repeat(num_tokens, 1)
+        x_TD = (
+            x_TD
+            * torch.tensor(
+                [1.0, 0.875, 0.75, 0.625],
+                device="cuda",
+            )[:, None]
+        ).to(torch.bfloat16)
+        w13_EFD = (
+            torch.stack(
+                [
+                    torch.cat(
+                        [
+                            torch.roll(base_K, (row + 3 * block) % 16)
+                            * (-1 if (row + block) % 2 else 1)
+                            for block in range(8)
+                        ]
+                    )
+                    for row in range(2 * intermediate_dim)
+                ]
+            )
+            .div(hidden_dim**0.5)
+            .to(torch.bfloat16)[None]
+        )
+        w2_EDF = (
+            torch.stack(
+                [
+                    torch.cat(
+                        [
+                            torch.roll(base_K, (2 * row + block) % 16)
+                            * (-1 if (row + block) % 2 else 1)
+                            for block in range(8)
+                        ]
+                    )
+                    for row in range(hidden_dim)
+                ]
+            )
+            .div(intermediate_dim**0.5)
+            .to(torch.bfloat16)[None]
+        )
+        ids_TK = torch.zeros(
+            num_tokens,
+            1,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        scores_TK = torch.ones(
+            num_tokens,
+            1,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        bf16_TD = _reference_moe(x_TD, ids_TK, scores_TK, w13_EFD, w2_EDF)
+        static_TD = _reference_moe_nvfp4_real_quant(
+            x_TD,
+            ids_TK,
+            scores_TK,
+            w13_EFD,
+            w2_EDF,
+        )
+        saved_activations: dict[str, Any] = {}
+        adaptive_TD = _reference_moe_nvfp4_real_quant(
+            x_TD,
+            ids_TK,
+            scores_TK,
+            w13_EFD,
+            w2_EDF,
+            saved_activations=saved_activations,
+            use_four_over_six=True,
+        )
+        expected_x_bw_TD = _nvfp4_dist_moe_order_qdq(
+            x_TD,
+            per_token=True,
+            use_four_over_six=True,
+        )
+        self.assertEqual(len(saved_activations["x_bw_by_expert"]), 1)
+        torch.testing.assert_close(
+            saved_activations["x_bw_by_expert"][0],
+            expected_x_bw_TD,
+            rtol=0,
+            atol=0,
+        )
+        self.assertGreater(
+            _sqnr_db(adaptive_TD, bf16_TD),
+            _sqnr_db(static_TD, bf16_TD) + 1.0,
+        )
+
+    def test_nvfp4_four_over_six_uses_adaptive_qdq_in_backward(self) -> None:
+        """Match adaptive STE DGRAD and WGRAD to explicit BF16 GEMMs exactly."""
+        generator = torch.Generator(device="cuda").manual_seed(20261111)
+        input_MK = torch.randn(
+            5,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+            requires_grad=True,
+        )
+        weight_NK = torch.randn(
+            256,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+            requires_grad=True,
+        )
+        actual_MN = _nvfp4_real_quant_linear(
+            input_MK,
+            weight_NK,
+            use_four_over_six=True,
+        )
+        grad_output_MN = torch.randn(
+            actual_MN.shape,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        input_qdq_MK = _nvfp4_dist_moe_order_qdq(
+            input_MK.detach(),
+            per_token=True,
+            use_four_over_six=True,
+        )
+        weight_qdq_NK = _nvfp4_dist_moe_order_qdq(
+            weight_NK.detach(),
+            per_token=False,
+            use_four_over_six=True,
+        )
+        expected_input_grad_MK = torch.mm(grad_output_MN, weight_qdq_NK)
+        expected_weight_grad_NK = torch.mm(
+            grad_output_MN.t().contiguous(),
+            input_qdq_MK,
+        )
+
+        actual_MN.backward(grad_output_MN)
+        assert input_MK.grad is not None
+        assert weight_NK.grad is not None
+        torch.testing.assert_close(
+            input_MK.grad,
+            expected_input_grad_MK,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            weight_NK.grad,
+            expected_weight_grad_NK,
+            rtol=0,
+            atol=0,
         )
 
     def test_nvfp4_real_quant_linear_pads_and_uses_bf16_backward(self) -> None:
