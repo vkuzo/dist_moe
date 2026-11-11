@@ -346,6 +346,8 @@ FP4_E2M1_MAX = 6.0
 FP4_E2M1_MAX_RECIP = 1.0 / FP4_E2M1_MAX
 # Combined E4M3 scale and E2M1 data range used by NVIDIA FP4.
 NVFP4_MAX = FP8_E4M3_MAX * FP4_E2M1_MAX
+# Four-over-Six reserves the top of E4M3 and normalizes against 256 * 6.
+NVFP4_FOUR_OVER_SIX_MAX = 256.0 * FP4_E2M1_MAX
 # Half-range exponent-shift round boundaries (enabled by ``half_range_scale``).
 FP8_E4M3_HALF_RANGE_ROUND_BOUNDARY = 232.0
 FP8_E5M2_HALF_RANGE_ROUND_BOUNDARY = 30720.0

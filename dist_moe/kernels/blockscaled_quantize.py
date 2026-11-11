@@ -127,12 +127,14 @@ from .blockscaled_quantization_common import (
     _compute_scale_and_recip_from_amax,
     _compute_scale_and_recip_from_amax_with_optional_nvfp4_lut,
     _copy_load_f16xn_as_f32,
+    _copy_store_u32_words,
     _cublas_blockscaled_qscale_offset,
     _fmax_nan,
     _frag_amax_nonfinite,
     _load_gather_row_as_b16x2,
     _max_b16x2,
     _quantize_fp8_tile_values,
+    _quantize_nvfp4_per_token_block_four_over_six,
     _reduce_amax_b16x2,
     _reduce_amax_f32,
     _reduce_nvfp4_block_amaxes,
@@ -947,6 +949,7 @@ class _QuantizeNvfp4PerTokenRow:
         layout_id: int,
         producer_id: int,
         fast_math: bool,
+        use_four_over_six: bool,
         clamped: bool,
         alpha: float,
         limit: float,
@@ -957,6 +960,7 @@ class _QuantizeNvfp4PerTokenRow:
         self.layout_id: cutlass.Constexpr[int] = layout_id
         self.producer_id: cutlass.Constexpr[int] = producer_id
         self.fast_math: cutlass.Constexpr[bool] = fast_math
+        self.use_four_over_six: cutlass.Constexpr[bool] = use_four_over_six
         self.clamped: cutlass.Constexpr[bool] = clamped
         self.alpha: cutlass.Constexpr[float] = alpha
         self.limit: cutlass.Constexpr[float] = limit
@@ -1055,6 +1059,7 @@ class _QuantizeNvfp4PerTokenRow:
         layout_id: int,
         producer_id: int,
         fast_math: bool,
+        use_four_over_six: bool,
         clamped: bool,
         alpha: float,
         limit: float,
@@ -1062,10 +1067,12 @@ class _QuantizeNvfp4PerTokenRow:
         dtype_tag = _INPUT_DTYPE_TAG[input_dtype]
         producer_tag = _PRODUCER_TAG.get(producer_id, f"prod{producer_id}")
         fastmath_tag = "_fastmath" if fast_math else ""
+        four_over_six_tag = "_four_over_six" if use_four_over_six else ""
         clamp_tag = _build_swiglu_clamp_tag(clamped, alpha, limit)
         return (
             f"_cute_quantize_{producer_tag}_{dtype_tag}_nvfp4_per_token_"
-            f"{_LAYOUT_TAG[layout_id]}_k{K}{fastmath_tag}{clamp_tag}"
+            f"{_LAYOUT_TAG[layout_id]}_k{K}{fastmath_tag}"
+            f"{four_over_six_tag}{clamp_tag}"
         )
 
     @staticmethod
@@ -1076,13 +1083,22 @@ class _QuantizeNvfp4PerTokenRow:
         layout_id: int,
         producer_id: int,
         fast_math: bool,
+        use_four_over_six: bool,
         clamped: bool,
         alpha: float,
         limit: float,
     ) -> object:
         _QuantizeNvfp4PerTokenRow._validate_producer_k(K, producer_id)
         name_prefix = _QuantizeNvfp4PerTokenRow._name_prefix(
-            input_dtype, K, layout_id, producer_id, fast_math, clamped, alpha, limit
+            input_dtype,
+            K,
+            layout_id,
+            producer_id,
+            fast_math,
+            use_four_over_six,
+            clamped,
+            alpha,
+            limit,
         )
         with scoped_kernel_name_prefixes(
             ((_QuantizeNvfp4PerTokenRow.kernel, name_prefix),)
@@ -1094,6 +1110,7 @@ class _QuantizeNvfp4PerTokenRow:
                     layout_id,
                     producer_id,
                     fast_math,
+                    use_four_over_six,
                     clamped,
                     alpha,
                     limit,
@@ -1266,7 +1283,10 @@ class _QuantizeNvfp4PerTokenRow:
             )
             warpgroup_amax = _warp_reduce_amax_f32(warpgroup_amax)
             if lane == Int32(0):
-                row_scale, token_scale_inv = _compute_nvfp4_token_scales(warpgroup_amax)
+                row_scale, token_scale_inv = _compute_nvfp4_token_scales(
+                    warpgroup_amax,
+                    self.use_four_over_six,
+                )
                 sReduction[self.token_scale_inv_slot] = token_scale_inv
                 sReduction[self.row_scale_slot] = row_scale
                 mTokenScaleInv[row] = token_scale_inv
@@ -1278,26 +1298,45 @@ class _QuantizeNvfp4PerTokenRow:
         for block_rep in cutlass.range_constexpr(self.blocks_per_lane):
             scale_col = block_rep * self.num_threads + tidx
             if scale_col < self.scale_cols:
-                scale_byte = _scale_nvfp4_per_token_block(
-                    packed,
-                    block_rep,
-                    block_amaxes[block_rep],
-                    row_scale,
-                    mNvfp4RecipLut,
-                    self.input_dtype,
-                    values,
-                )
-                _store_blockscaled_xn_words(
-                    mQWords,
-                    row,
-                    scale_col * 2,
-                    values,
-                    recip=Float32(_FP32_ONE),
-                    num_elems=self.values_per_block,
-                    is_fp4=True,
-                    format_id=BLOCK_SCALED_FORMAT_NVFP4,
-                    scale_values=False,
-                )
+                if cutlass.const_expr(self.use_four_over_six):
+                    q_words = cute.make_rmem_tensor(2, Uint32)
+                    scale_byte = _quantize_nvfp4_per_token_block_four_over_six(
+                        packed,
+                        block_rep,
+                        block_amaxes[block_rep],
+                        row_scale,
+                        mNvfp4RecipLut,
+                        self.input_dtype,
+                        q_words,
+                    )
+                    _copy_store_u32_words(
+                        mQWords,
+                        row,
+                        scale_col * 2,
+                        q_words,
+                        2,
+                    )
+                else:
+                    scale_byte = _scale_nvfp4_per_token_block(
+                        packed,
+                        block_rep,
+                        block_amaxes[block_rep],
+                        row_scale,
+                        mNvfp4RecipLut,
+                        self.input_dtype,
+                        values,
+                    )
+                    _store_blockscaled_xn_words(
+                        mQWords,
+                        row,
+                        scale_col * 2,
+                        values,
+                        recip=Float32(_FP32_ONE),
+                        num_elems=self.values_per_block,
+                        is_fp4=True,
+                        format_id=BLOCK_SCALED_FORMAT_NVFP4,
+                        scale_values=False,
+                    )
                 if cutlass.const_expr(
                     self.layout_id == SCALE_FACTOR_LAYOUT_CUBLAS_BLOCKED
                 ):
@@ -1330,6 +1369,7 @@ class _QuantizeNvfp4PerTokenRowDecodeClear(_QuantizeNvfp4PerTokenRow):
         layout_id: int,
         producer_id: int,
         fast_math: bool,
+        use_four_over_six: bool,
         clamped: bool,
         alpha: float,
         limit: float,
@@ -1338,7 +1378,15 @@ class _QuantizeNvfp4PerTokenRowDecodeClear(_QuantizeNvfp4PerTokenRow):
         ids_tag = "i32" if expert_ids_dtype is Int32 else "i64"
         name_prefix = (
             _QuantizeNvfp4PerTokenRow._name_prefix(
-                input_dtype, K, layout_id, producer_id, fast_math, clamped, alpha, limit
+                input_dtype,
+                K,
+                layout_id,
+                producer_id,
+                fast_math,
+                use_four_over_six,
+                clamped,
+                alpha,
+                limit,
             )
             + f"_decode_clear_{ids_tag}"
         )
@@ -1356,6 +1404,7 @@ class _QuantizeNvfp4PerTokenRowDecodeClear(_QuantizeNvfp4PerTokenRow):
                     layout_id,
                     producer_id,
                     fast_math,
+                    use_four_over_six,
                     clamped,
                     alpha,
                     limit,
@@ -5084,6 +5133,7 @@ def _quantize_nvfp4_per_token(  # noqa: C901 -- producer-specific host validatio
     producer_b: torch.Tensor | None = None,
     producer_id: int = BLOCK_SCALED_PRODUCER_IDENTITY,
     fast_math: bool = False,
+    use_four_over_six: bool = False,
     clamped: bool = False,
     alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
@@ -5093,6 +5143,10 @@ def _quantize_nvfp4_per_token(  # noqa: C901 -- producer-specific host validatio
     decode_clear: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize each activation row with a fused dynamic NVFP4 global scale.
+
+    ``use_four_over_six`` evaluates the 4x and 6x per-block scale candidates
+    in the FP16 product domain while preserving the existing qdata, E4M3
+    scale, and inverse-outer-scale wire formats.
 
     With ``decode_clear`` (identity producer only), the same launch also
     zeroes the DistMoE decode routing state and publishes the int16 expert
@@ -5183,6 +5237,7 @@ def _quantize_nvfp4_per_token(  # noqa: C901 -- producer-specific host validatio
         SCALE_FACTOR_LAYOUT_IDS[layout],
         producer_id,
         fast_math,
+        use_four_over_six,
         clamped,
         alpha,
         limit,

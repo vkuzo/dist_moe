@@ -34,6 +34,7 @@ quickstart:
 policy = dist_moe.BlockScaledConfig(
     format=dist_moe.BlockScaledFormat.NVFP4,
     pipeline="staged",  # or "mega"
+    use_four_over_six=False,
 )
 config = dist_moe.Config(
     max_num_local_input_tokens=T,
@@ -57,6 +58,11 @@ y_TD = dist_moe.routed_experts(
 )
 y_TD.float().sum().backward()
 ```
+
+With `use_four_over_six=True`, every dynamic NVFP4 activation and weight
+producer uses the adaptive 4/6 scale rule. Prepared qdata, E4M3 scales, inverse
+outer scales, GEMM operands, and dequantization contracts retain the same
+layouts and dtypes.
 
 `D` and `F` must satisfy the NVFP4 alignment and maximum-dimension checks.
 Training applies straight-through-estimator semantics to quantization:

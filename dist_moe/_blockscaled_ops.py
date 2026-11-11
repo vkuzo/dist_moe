@@ -191,6 +191,7 @@ def dist_blockscaled_grouped_gemm_fprop_dispatch(
     m_multiple_of: int = DEFAULT_M_MULTIPLE_OF,
     return_wgrad_quant: bool = False,
     blockscaled_dispatch: bool = False,
+    use_four_over_six: bool = False,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -227,6 +228,8 @@ def dist_blockscaled_grouped_gemm_fprop_dispatch(
         m_multiple_of: Per-expert row padding multiple.
         return_wgrad_quant: Whether to return column-oriented WGRAD input.
         blockscaled_dispatch: Whether ``x`` is already packed and quantized.
+        use_four_over_six: Whether NVFP4 activation quantization evaluates the
+            Four-over-Six scale candidates.
         activation_buffer: Optional activation buffer.
         activation_offsets: Optional device-side activation-buffer offsets.
         conditional_execution: Optional device recompute predicate.
@@ -262,6 +265,7 @@ def dist_blockscaled_grouped_gemm_fprop_dispatch(
         m_multiple_of=m_multiple_of,
         return_wgrad_quant=return_wgrad_quant,
         blockscaled_dispatch=blockscaled_dispatch,
+        use_four_over_six=use_four_over_six,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,
@@ -293,6 +297,7 @@ def dist_blockscaled_grouped_gemm_dgrad_dispatch(
     backend: str = DEFAULT_BACKEND,
     m_multiple_of: int = DEFAULT_M_MULTIPLE_OF,
     return_wgrad_quant: bool = False,
+    use_four_over_six: bool = False,
     activation_buffer: torch.Tensor | None = None,
     activation_offsets: torch.Tensor | None = None,
     conditional_execution: torch.Tensor | None = None,
@@ -320,6 +325,8 @@ def dist_blockscaled_grouped_gemm_dgrad_dispatch(
         backend: Kernel backend name.
         m_multiple_of: Per-expert row padding multiple.
         return_wgrad_quant: Whether to return column-oriented WGRAD input.
+        use_four_over_six: Whether NVFP4 activation quantization evaluates the
+            Four-over-Six scale candidates.
         activation_buffer: Optional activation buffer.
         activation_offsets: Optional device-side activation-buffer offsets.
         conditional_execution: Optional device recompute predicate.
@@ -346,6 +353,7 @@ def dist_blockscaled_grouped_gemm_dgrad_dispatch(
         config=config,
         m_multiple_of=m_multiple_of,
         return_wgrad_quant=return_wgrad_quant,
+        use_four_over_six=use_four_over_six,
         activation_buffer=activation_buffer,
         activation_offsets=activation_offsets,
         conditional_execution=conditional_execution,
@@ -462,6 +470,7 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
     m_multiple_of: int = DEFAULT_M_MULTIPLE_OF,
     num_output_tokens: int | None = None,
     return_wgrad_quant: bool = False,
+    use_four_over_six: bool = False,
     swiglu_fast_math: bool = False,
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
@@ -509,6 +518,8 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
         m_multiple_of: Per-expert row padding multiple.
         num_output_tokens: Optional local output-row count.
         return_wgrad_quant: Whether to return column-oriented H2.
+        use_four_over_six: Whether NVFP4 activation quantization evaluates the
+            Four-over-Six scale candidates.
         swiglu_fast_math: Whether SwiGLU uses fast math.
         swiglu_clamped: Whether to use clamped SwiGLU.
         swiglu_alpha: Clamped-SwiGLU alpha.
@@ -547,6 +558,7 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
         m_multiple_of=m_multiple_of,
         num_output_tokens=num_output_tokens,
         return_wgrad_quant=return_wgrad_quant,
+        use_four_over_six=use_four_over_six,
         swiglu_fast_math=swiglu_fast_math,
         swiglu_clamped=swiglu_clamped,
         swiglu_alpha=swiglu_alpha,
@@ -590,6 +602,7 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
     return_x_wgrad_quant: bool = False,
     blockscaled_dispatch: bool = False,
+    use_four_over_six: bool = False,
     return_h2_wgrad_quant: bool = True,
     activation_buffer: torch.Tensor | None = None,
     operand_storage: torch.Tensor | None = None,
@@ -639,6 +652,8 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
         swiglu_limit: Clamped-SwiGLU input limit.
         return_x_wgrad_quant: Whether to return column-oriented dispatched X.
         blockscaled_dispatch: Whether dispatch input is already quantized.
+        use_four_over_six: Whether NVFP4 activation quantization evaluates the
+            Four-over-Six scale candidates.
         return_h2_wgrad_quant: Whether to return column-oriented H2.
         activation_buffer: Optional context-owned CUDA byte arena paired with
             ``activation_offsets``. GPU-offset-backed operands require device
@@ -723,6 +738,7 @@ def dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
         chunk_rows=chunk_rows,
         return_x_wgrad_quant=return_x_wgrad_quant,
         blockscaled_dispatch=blockscaled_dispatch,
+        use_four_over_six=use_four_over_six,
         return_h2_wgrad_quant=return_h2_wgrad_quant,
         activation_buffer=activation_buffer,
         operand_storage=operand_storage,

@@ -257,6 +257,9 @@ class BlockScaledConfig:
         format: MXFP8 E4M3 or NVIDIA FP4 training/inference operands.
         fast_math: Whether MXFP8 fused SwiGLU uses approximate sigmoid math.
             NVFP4 does not support this option.
+        use_four_over_six: Whether NVFP4 quantization adaptively chooses the
+            lower-MSE scale-for-4 or scale-for-6 encoding for each 16-value
+            block. Unsupported by other formats.
         pipeline: ``"staged"`` for separate expert GEMMs or ``"mega"`` for
             the fused chunk-pipelined forward. MXFP8 Mega also fuses each
             DGRAD/WGRAD pair. NVFP4 reuses the BF16 backward for either
@@ -267,6 +270,7 @@ class BlockScaledConfig:
 
     format: BlockScaledFormat = BlockScaledFormat.MXFP8_E4M3
     fast_math: bool = False
+    use_four_over_six: bool = False
     pipeline: Literal["staged", "mega"] = "staged"
     kernel_config: BlockScaledKernelConfig | None = None
 
@@ -284,6 +288,8 @@ class BlockScaledConfig:
             raise ValueError(f"unsupported DistMoE block-scaled format {self.format}")
         if self.fast_math and self.format is BlockScaledFormat.NVFP4:
             raise ValueError("fast_math is supported only by the MXFP8 fused path")
+        if self.use_four_over_six and self.format is not BlockScaledFormat.NVFP4:
+            raise ValueError("use_four_over_six is supported only by NVFP4")
         if self.pipeline not in ("staged", "mega"):
             raise ValueError("block-scaled pipeline must be 'staged' or 'mega'")
         if self.kernel_config is not None:

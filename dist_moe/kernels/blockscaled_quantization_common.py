@@ -40,6 +40,7 @@ from ..formats import (
     FP8_E4M3_MAX,
     FP8_E5M2_HALF_RANGE_ROUND_BOUNDARY,
     FP8_E5M2_MAX,
+    NVFP4_FOUR_OVER_SIX_MAX,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
@@ -95,6 +96,10 @@ _NVFP4_TOKEN_AMAX_FLOOR: cutlass.Constexpr[float] = NVFP4_TOKEN_AMAX_FLOOR
 # Numerator of the per-token global scale: ``numerator * recip(amax)`` — the
 # fleet gs convention (authority: `nvfp4_weight_global_scale`).
 _NVFP4_TOKEN_SCALE_NUMERATOR: cutlass.Constexpr[float] = NVFP4_MAX
+_NVFP4_FOUR_OVER_SIX_TOKEN_SCALE_NUMERATOR: cutlass.Constexpr[float] = (
+    NVFP4_FOUR_OVER_SIX_MAX
+)
+_NVFP4_FOUR_OVER_SIX_EXPANSION: cutlass.Constexpr[float] = 1.5
 
 
 @dsl_user_op
@@ -209,15 +214,11 @@ def _compute_nvfp4_scale_byte(
 
 
 @cute.jit
-def _compute_nvfp4_per_token_scale_and_multiplier(
-    block_amax: Float32,
+def _compute_nvfp4_scale_and_multiplier_from_raw(
+    raw_scale: Float32,
     row_scale: Float32,
     mNvfp4RecipLut: cute.Tensor,
 ):
-    target_max: cutlass.Constexpr[float] = FP4_E2M1_MAX
-    # Order is load-bearing: fleet convention is ``(amax * gs) * fl(1/6)`` —
-    # see the Triton `_nvfp4_scale_and_recip` for why (E4M3 RTNE ties).
-    raw_scale = (block_amax * row_scale) * Float32(1.0 / target_max)
     raw_scale = (
         Float32(_NVFP4_DYNAMIC_SCALE_FLOOR)
         if raw_scale < Float32(_NVFP4_DYNAMIC_SCALE_FLOOR)
@@ -246,6 +247,23 @@ def _compute_nvfp4_per_token_scale_and_multiplier(
         else Float32(_FP32_ZERO)
     )
     return scale_byte, multiplier
+
+
+@cute.jit
+def _compute_nvfp4_per_token_scale_and_multiplier(
+    block_amax: Float32,
+    row_scale: Float32,
+    mNvfp4RecipLut: cute.Tensor,
+):
+    target_max: cutlass.Constexpr[float] = FP4_E2M1_MAX
+    # Order is load-bearing: fleet convention is ``(amax * gs) * fl(1/6)`` —
+    # see the Triton `_nvfp4_scale_and_recip` for why (E4M3 RTNE ties).
+    raw_scale = (block_amax * row_scale) * Float32(1.0 / target_max)
+    return _compute_nvfp4_scale_and_multiplier_from_raw(
+        raw_scale,
+        row_scale,
+        mNvfp4RecipLut,
+    )
 
 
 @cute.jit
@@ -736,17 +754,95 @@ def _rcp_rn_f32_ge1(x: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @cute.jit
-def _compute_nvfp4_token_scales(row_amax: Float32):
+def _compute_nvfp4_token_scales(
+    row_amax: Float32,
+    use_four_over_six: cutlass.Constexpr[bool] = False,
+):
     # gs convention: numerator * recip(amax) — bitwise-matching the fake-quant
     # synthesis and the Triton transport kernels; the wire token_scale_inv is
     # the correctly-rounded inverse of the scale. Returns (row_scale,
     # token_scale_inv), the same order as the Triton
     # `nvfp4_token_scale_and_recip` — the two outputs have reciprocal
     # magnitudes, so a mismatched unpack would run silently.
-    row_scale = Float32(_NVFP4_TOKEN_SCALE_NUMERATOR) * _rcp_rn_f32(
+    numerator = (
+        _NVFP4_FOUR_OVER_SIX_TOKEN_SCALE_NUMERATOR
+        if cutlass.const_expr(use_four_over_six)
+        else _NVFP4_TOKEN_SCALE_NUMERATOR
+    )
+    row_scale = Float32(numerator) * _rcp_rn_f32(
         cute.arch.fmax(row_amax, Float32(_NVFP4_TOKEN_AMAX_FLOOR))
     )
     return row_scale, _rcp_rn_f32(row_scale)
+
+
+@dsl_user_op
+def _cvt_e4m3_pair_to_duplicated_f16x2(
+    scale4_byte: Uint8,
+    scale6_byte: Uint8,
+    *,
+    loc=None,
+    ip=None,
+) -> tuple[Uint32, Uint32]:
+    """Convert two E4M3 bytes to duplicated FP16x2 scale registers."""
+    packed_scales = Uint16(scale4_byte) | (Uint16(scale6_byte) << Uint16(8))
+    result = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32)>"),
+        [packed_scales.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 map4_h, map6_h;\n"
+        ".reg .b32 scale_h2;\n"
+        "cvt.rn.f16x2.e4m3x2 scale_h2, $2;\n"
+        "mov.b32 {map4_h, map6_h}, scale_h2;\n"
+        "mov.b32 $0, {map4_h, map4_h};\n"
+        "mov.b32 $1, {map6_h, map6_h}; }",
+        "=r,=r,h",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _cvt_scaled_e2m1x2_to_f32x2(
+    q_byte: Uint8,
+    scale_f16x2: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> tuple[Float32, Float32]:
+    """Decode E2M1x2, multiply by an FP16x2 scale, and widen to FP32."""
+    q_u32 = llvm.zext(
+        T.i32(),
+        q_byte.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    result = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(f32, f32)>"),
+        [q_u32, scale_f16x2.ir_value(loc=loc, ip=ip)],
+        "{ .reg .b8 q, unused0, unused1, unused2;\n"
+        ".reg .b16 lo, hi;\n"
+        ".reg .b32 q_h2, product_h2;\n"
+        "mov.b32 {q, unused0, unused1, unused2}, $2;\n"
+        "cvt.rn.f16x2.e2m1x2 q_h2, q;\n"
+        "mul.rn.f16x2 product_h2, q_h2, $3;\n"
+        "mov.b32 {lo, hi}, product_h2;\n"
+        "cvt.f32.f16 $0, lo;\n"
+        "cvt.f32.f16 $1, hi; }",
+        "=f,=f,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+    )
 
 
 @cute.jit
@@ -772,6 +868,99 @@ def _scale_nvfp4_per_token_block(
             rnd="rn",
         )
     return scale_byte
+
+
+@cute.jit
+def _quantize_nvfp4_per_token_block_four_over_six(
+    packed,
+    rep: cutlass.Constexpr[int],
+    block_amax: Float32,
+    row_scale: Float32,
+    mNvfp4RecipLut: cute.Tensor,
+    source_dtype: type[cutlass.Numeric],
+    q_words,
+) -> Uint8:
+    """Quantize one block with FP16 product-domain Four-over-Six scoring."""
+    raw_scale6 = (block_amax * row_scale) * Float32(1.0 / FP4_E2M1_MAX)
+    scale6_byte, multiplier6 = _compute_nvfp4_scale_and_multiplier_from_raw(
+        raw_scale6,
+        row_scale,
+        mNvfp4RecipLut,
+    )
+    scale4_byte, multiplier4 = _compute_nvfp4_scale_and_multiplier_from_raw(
+        raw_scale6 * Float32(_NVFP4_FOUR_OVER_SIX_EXPANSION),
+        row_scale,
+        mNvfp4RecipLut,
+    )
+
+    values4 = cute.make_rmem_tensor(16, Float32)
+    values6 = cute.make_rmem_tensor(16, Float32)
+    for pair in cutlass.range_constexpr(8):
+        value0, value1 = _unpack_b16x2(packed[rep, pair], source_dtype)
+        values4[2 * pair], values4[2 * pair + 1] = _mul_f32x2(
+            (Float32(value0), Float32(value1)),
+            (multiplier4, multiplier4),
+        )
+        values6[2 * pair], values6[2 * pair + 1] = _mul_f32x2(
+            (Float32(value0), Float32(value1)),
+            (multiplier6, multiplier6),
+        )
+
+    q4_words = cute.make_rmem_tensor(2, Uint32)
+    q6_words = cute.make_rmem_tensor(2, Uint32)
+    _pack_fp4_e2m1_xn_to_u32_rn(
+        values4,
+        q4_words,
+        base=0,
+        packed_base=0,
+        recip=Float32(1.0),
+        num_elems=16,
+        scale_values=False,
+    )
+    _pack_fp4_e2m1_xn_to_u32_rn(
+        values6,
+        q6_words,
+        base=0,
+        packed_base=0,
+        recip=Float32(1.0),
+        num_elems=16,
+        scale_values=False,
+    )
+
+    scale4_f16x2, scale6_f16x2 = _cvt_e4m3_pair_to_duplicated_f16x2(
+        scale4_byte,
+        scale6_byte,
+    )
+    error4 = Float32(0.0)
+    error6 = Float32(0.0)
+    for pair in cutlass.range_constexpr(8):
+        shift: cutlass.Constexpr[int] = (pair % 4) * 8
+        q4_byte = Uint8(q4_words[pair // 4] >> Uint32(shift))
+        q6_byte = Uint8(q6_words[pair // 4] >> Uint32(shift))
+        candidate4 = _cvt_scaled_e2m1x2_to_f32x2(q4_byte, scale4_f16x2)
+        candidate6 = _cvt_scaled_e2m1x2_to_f32x2(q6_byte, scale6_f16x2)
+        value0, value1 = _unpack_b16x2(packed[rep, pair], source_dtype)
+        target = _mul_f32x2(
+            (Float32(value0), Float32(value1)),
+            (row_scale, row_scale),
+        )
+        diff4 = _add_f32x2(candidate4, (-target[0], -target[1]))
+        diff6 = _add_f32x2(candidate6, (-target[0], -target[1]))
+        square4 = _mul_f32x2(diff4, diff4)
+        square6 = _mul_f32x2(diff6, diff6)
+        error4, error6 = _add_f32x2(
+            (error4, error6),
+            (square4[0], square6[0]),
+        )
+        error4, error6 = _add_f32x2(
+            (error4, error6),
+            (square4[1], square6[1]),
+        )
+
+    select4 = error4 < error6
+    q_words[0] = q4_words[0] if select4 else q6_words[0]
+    q_words[1] = q4_words[1] if select4 else q6_words[1]
+    return scale4_byte if select4 else scale6_byte
 
 
 @dsl_user_op

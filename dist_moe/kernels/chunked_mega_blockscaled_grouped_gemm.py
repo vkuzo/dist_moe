@@ -669,6 +669,7 @@ def _get_chunked_kernel(  # noqa: C901
     source_dtype: type[cutlass.Numeric],
     swiglu_k: int,
     nvfp4_high_throughput: bool,
+    use_four_over_six: bool,
     nvfp4_wide_row_quant: bool,
     nvfp4_row_quant_warps: int = 0,
     vector_dispatch_scale_copy: bool,
@@ -713,6 +714,7 @@ def _get_chunked_kernel(  # noqa: C901
         source_dtype,
         swiglu_k,
         nvfp4_high_throughput,
+        use_four_over_six,
         nvfp4_wide_row_quant,
         nvfp4_row_quant_warps,
         vector_dispatch_scale_copy,
@@ -754,6 +756,7 @@ def _get_chunked_kernel(  # noqa: C901
             num_n_clusters=1,
             world_size=world_size,
             dispatch_source_dtype=source_dtype,
+            use_four_over_six=use_four_over_six,
             combine_swiglu_k=swiglu_k,
             chunk_rows=chunk_rows,
             wide_gather=wide_gather,
@@ -1262,6 +1265,7 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
     chunk_rows: int | None = 512,
     return_x_wgrad_quant: bool = False,
     blockscaled_dispatch: bool = False,
+    use_four_over_six: bool = False,
     return_h2_wgrad_quant: bool = True,
     activation_buffer: torch.Tensor | None = None,
     operand_storage: torch.Tensor | None = None,
@@ -1279,6 +1283,9 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
     pre_shuffled_rows: bool = False,
 ):
     """Run fused dispatch, FC13, SwiGLU, FC2, and combine.
+
+    ``use_four_over_six`` applies adaptive NVFP4 block scaling to both
+    activation quantization points without changing their storage layouts.
 
     With `activation_buffer`, activation-backed return tensors are shape-only
     aliases at buffer offset zero; consume results through `activation_offsets`.
@@ -2543,6 +2550,7 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
         source_dtype=_dispatch_quant_source_dtype_from_torch(out_dtype),
         swiglu_k=intermediate_dim,
         nvfp4_high_throughput=nvfp4_high_throughput,
+        use_four_over_six=use_four_over_six,
         nvfp4_wide_row_quant=nvfp4_wide_row_quant,
         nvfp4_row_quant_warps=nvfp4_row_quant_warps,
         vector_dispatch_scale_copy=vector_dispatch_scale_copy,
@@ -2678,6 +2686,7 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
         swiglu_fast_math,
         swiglu_clamp,
         blockscaled_dispatch,
+        use_four_over_six,
         nvfp4_high_throughput,
         nvfp4_wide_row_quant,
         nvfp4_row_quant_warps,

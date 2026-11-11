@@ -31,6 +31,8 @@ Defaults are 128 tokens per rank, hidden width 3584, intermediate width 3072,
 eight global experts, and top-k two. Without `--activation`, BF16 measures all
 three supported activations while NVFP4 measures plain SwiGLU. Run NVFP4
 activations in separate processes so each context has an isolated lifecycle.
+Pass `--use-four-over-six` on an NVFP4 command to benchmark adaptive 4/6
+quantization against the default NVFP4 scale rule.
 Balanced cyclic routing uses unique expert IDs and uniform scores. Each layer
 has one activation slot, full-save capacity factor 1.0, device scratch factor
 1.0, no VMM, and BF16 WGRAD. NVFP4's native BF16 weights are quantized in
