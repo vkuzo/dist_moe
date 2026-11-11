@@ -61,8 +61,8 @@ each scale are loaded once: the Blackwell `e2m1x2` conversion produces a
 BF16 pair, one E4M3 scale is broadcast across its eight packed bytes, and the
 pair is written with one 32-bit store. The per-expert inverse global scale is
 loaded once per row and applied in FP32 before the final BF16 conversion.
-Natural scales, strided rows, and per-row outer scales retain the generic
-decoder.
+This entry point accepts only the contiguous grouped weight representation;
+activation reconstruction uses its separate planner-owned buffer decoder.
 
 The default W13 rows concatenate gate and up projections for both staged and
 Mega execution. Opt-in `fuse_swiglu=True` preparation is restricted to Mega

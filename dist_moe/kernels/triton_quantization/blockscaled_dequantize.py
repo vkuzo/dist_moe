@@ -18,7 +18,6 @@ from .formats import (
     CUBLAS_BLOCKED_ROW_LANES,
     CUBLAS_BLOCKED_ROWS_PER_ATOM,
     CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM,
-    ScaleFactorLayoutId,
 )
 
 _BLOCK_SIZE = 256
@@ -26,7 +25,6 @@ _ACTIVATION_DEQUANT_BLOCK_Q_SIZE = 2048
 _ACTIVATION_DEQUANT_NUM_WARPS = 8
 _WEIGHT_DEQUANT_BLOCK_Q_SIZE = 1024
 _WEIGHT_DEQUANT_NUM_WARPS = 4
-_TL_SCALE_FACTOR_LAYOUT_NATURAL = tl.constexpr(ScaleFactorLayoutId.NATURAL.value)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ATOM = tl.constexpr(CUBLAS_BLOCKED_ENTRIES_PER_ATOM)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE = tl.constexpr(
     CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE
@@ -109,84 +107,6 @@ def _cublas_blocked_scale_offset(row, col, n_col_blocks):
         + lane_base
         + row_band * _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
         + col_in_atom
-    )
-
-
-@triton.jit
-def _dequantize_nvfp4_kernel(
-    qdata_ptr,
-    scale_ptr,
-    global_scale_inv_ptr,
-    output_ptr,
-    activation_buffer_ptr,
-    activation_offset_ptr,
-    condition_ptr,
-    qdata_row_stride,
-    scale_row_stride,
-    global_scale_inv_stride,
-    rows_per_group,
-    group_scale_elements,
-    n_col_blocks,
-    n_cols,
-    SCALE_LAYOUT: tl.constexpr,
-    OUTER_SCALE_PER_ROW: tl.constexpr,
-    WRITE_ACTIVATION_BUFFER: tl.constexpr,
-    HAS_CONDITION: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    if HAS_CONDITION:
-        if tl.load(condition_ptr, eviction_policy="evict_last") == 0:
-            return
-
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    valid = cols < n_cols
-    row_i64 = row.to(tl.int64)
-    cols_i64 = cols.to(tl.int64)
-
-    packed = tl.load(
-        qdata_ptr + row_i64 * qdata_row_stride + cols_i64 // 2,
-        mask=valid,
-        other=0,
-    )
-    code = tl.where((cols & 1) == 0, packed & 0xF, packed >> 4)
-    values = _decode_fp4_e2m1(code)
-
-    scale_col = cols // 16
-    if SCALE_LAYOUT == _TL_SCALE_FACTOR_LAYOUT_NATURAL:
-        scale_offset = row_i64 * scale_row_stride + scale_col.to(tl.int64)
-    else:
-        group = row // rows_per_group
-        row_in_group = row - group * rows_per_group
-        scale_offset = group.to(
-            tl.int64
-        ) * group_scale_elements + _cublas_blocked_scale_offset(
-            row_in_group,
-            scale_col,
-            n_col_blocks,
-        ).to(tl.int64)
-    inner_scale = tl.load(scale_ptr + scale_offset, mask=valid, other=0.0).to(
-        tl.float32
-    )
-
-    outer_row = row if OUTER_SCALE_PER_ROW else row // rows_per_group
-    global_scale_inv = tl.load(
-        global_scale_inv_ptr + outer_row.to(tl.int64) * global_scale_inv_stride
-    ).to(tl.float32)
-    if WRITE_ACTIVATION_BUFFER:
-        byte_offset = tl.load(
-            activation_offset_ptr,
-            eviction_policy="evict_last",
-        ).to(tl.int64)
-        output_base = (activation_buffer_ptr + byte_offset).to(
-            tl.pointer_type(tl.bfloat16)
-        )
-    else:
-        output_base = output_ptr
-    tl.store(
-        output_base + row_i64 * n_cols + cols_i64,
-        values * inner_scale * global_scale_inv,
-        mask=valid,
     )
 
 
@@ -487,24 +407,20 @@ def _dequantize_nvfp4_activation_buffer_kernel(
         )
 
 
-def dequantize_nvfp4(
+def dequantize_nvfp4_weight(
     qdata: torch.Tensor,
     scale: torch.Tensor,
     global_scale_inv: torch.Tensor,
     *,
-    scale_layout: ScaleFactorLayoutId,
     rows_per_group: int,
-    outer_scale_per_row: bool,
 ) -> torch.Tensor:
-    """Dequantize packed NVFP4 rows into a contiguous BF16 tensor.
+    """Dequantize contiguous grouped NVFP4 weights into contiguous BF16.
 
     Args:
-        qdata: Rank-two packed E2M1 rows. Strided rows are supported.
-        scale: Natural or CUBLAS-blocked E4M3 scales.
-        global_scale_inv: FP32 inverse outer scales, per row or per group.
-        scale_layout: Physical layout of ``scale``.
-        rows_per_group: Logical rows belonging to one scale-layout group.
-        outer_scale_per_row: Whether each logical row owns an outer scale.
+        qdata: Contiguous rank-two packed E2M1 rows.
+        scale: Contiguous grouped CUBLAS-blocked E4M3 scales.
+        global_scale_inv: Per-group FP32 inverse outer scales.
+        rows_per_group: Logical weight rows belonging to one expert.
 
     Returns:
         Contiguous BF16 rows with twice the packed column count.
@@ -524,52 +440,18 @@ def dequantize_nvfp4(
     group_scale_elements = (
         padded_rows * n_col_blocks * CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
     )
-    if (
-        scale_layout == ScaleFactorLayoutId.CUBLAS_BLOCKED
-        and not outer_scale_per_row
-        and qdata.is_contiguous()
-        and scale.is_contiguous()
-    ):
-        _dequantize_nvfp4_weight_kernel[(rows,)](
-            qdata.view(torch.uint8),
-            scale,
-            global_scale_inv,
-            output,
-            global_scale_inv.stride(0),
-            N_COLS=n_cols,
-            ROWS_PER_GROUP=rows_per_group,
-            GROUP_SCALE_ELEMENTS=group_scale_elements,
-            N_COL_BLOCKS=n_col_blocks,
-            BLOCK_Q_SIZE=_WEIGHT_DEQUANT_BLOCK_Q_SIZE,
-            num_warps=_WEIGHT_DEQUANT_NUM_WARPS,
-        )
-        return output
-
-    scale_row_stride = (
-        scale.stride(0) if scale_layout == ScaleFactorLayoutId.NATURAL else 0
-    )
-    grid = (rows, triton.cdiv(n_cols, _BLOCK_SIZE))
-    _dequantize_nvfp4_kernel[grid](
+    _dequantize_nvfp4_weight_kernel[(rows,)](
         qdata.view(torch.uint8),
         scale,
         global_scale_inv,
         output,
-        output,
-        global_scale_inv,
-        global_scale_inv,
-        qdata.stride(0),
-        scale_row_stride,
         global_scale_inv.stride(0),
-        rows_per_group,
-        group_scale_elements,
-        n_col_blocks,
-        n_cols,
-        SCALE_LAYOUT=scale_layout.value,
-        OUTER_SCALE_PER_ROW=outer_scale_per_row,
-        WRITE_ACTIVATION_BUFFER=False,
-        HAS_CONDITION=False,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        num_warps=4,
+        N_COLS=n_cols,
+        ROWS_PER_GROUP=rows_per_group,
+        GROUP_SCALE_ELEMENTS=group_scale_elements,
+        N_COL_BLOCKS=n_col_blocks,
+        BLOCK_Q_SIZE=_WEIGHT_DEQUANT_BLOCK_Q_SIZE,
+        num_warps=_WEIGHT_DEQUANT_NUM_WARPS,
     )
     return output
 
