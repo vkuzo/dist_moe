@@ -39,7 +39,8 @@ class BlockScaledFormat(enum.StrEnum):
     Attributes:
         MXFP8_E4M3: FP8 E4M3 operands with E8M0 scale factors for training and
             inference.
-        NVFP4: FP4 E2M1 operands with E4M3 scale factors for inference only.
+        NVFP4: FP4 E2M1 operands with E4M3 scale factors for training and
+            inference.
     """
 
     MXFP8_E4M3 = _KernelBlockScaledFormat.MXFP8_E4M3.value
@@ -251,8 +252,8 @@ class PreparedWeight:
 
     Args:
         source: Logical high-precision weight identity. It receives WGRAD for
-            trainable prepared formats; inference-only prepared operands retain
-            it only for ownership and lifecycle coordination. Prepared
+            trainable prepared formats; inference-only layouts retain it only
+            for ownership and lifecycle coordination. Prepared
             execution does not require readable source storage; Python
             preprocessing callbacks that read the source still require it.
         format: Block-scaled format used by every quantized operand.
@@ -261,8 +262,8 @@ class PreparedWeight:
         fprop_scale: Contiguous CUDA scale storage in the blocked layout
             consumed directly by the FPROP kernel.
         dgrad_data: Contiguous transposed MXFP8 E4M3 DGRAD qdata. It is required
-            for MXFP8 training and absent for prepared NVFP4, which is
-            inference-only.
+            for MXFP8 training and absent for prepared NVFP4, whose backward
+            uses dequantized FPROP weights with the BF16 STE path.
         dgrad_scale: Contiguous blocked DGRAD scales with the orientation
             matching ``dgrad_data``; absent for NVFP4.
         global_scale: Optional per-expert FP32 global scale required by NVFP4.
@@ -307,8 +308,8 @@ class PreparedWeight:
 
         Args:
             source: Logical high-precision weight identity. Training formats
-                use it as the WGRAD owner; inference-only prepared operands
-                retain it for ownership and lifecycle coordination.
+                use it as the WGRAD owner; inference-only layouts retain it
+                for ownership and lifecycle coordination.
             format: Public block-scaled format shared by all operands.
             fprop_data: Quantized forward weight data.
             fprop_scale: Forward-oriented scale storage.
