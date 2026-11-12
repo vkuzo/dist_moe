@@ -22,9 +22,10 @@ scratch bounds; this guide explains the kernel views inside that allocation.
 ## Supported surface
 
 NVFP4 supports Staged and Mega forward for training and inference. Training
-uses native BF16 weights and delegates its gradient sequence to the BF16
-kernels after reconstructing exact dequantized forward operands. Prepared
-weights and interleaved W13 remain inference-only.
+delegates its gradient sequence to the BF16 kernels after reconstructing exact
+dequantized forward operands. Native BF16 weights are dynamically quantized;
+prepared weights cache the same operands across forward and backward.
+Interleaved W13 remains inference-only.
 
 The format stores:
 
@@ -45,16 +46,17 @@ separate MMA epilogue inputs, not replacements for the per-16-value scales.
 NVFP4 execution accepts native BF16 or explicitly prepared weights. Native
 weights are converted to packed FPROP qdata and CUBLAS-blocked scales during
 every invocation. Explicit preparation creates the same operands once.
-The inference-only prepared object does not allocate DGRAD qdata or scales.
-It retains both the per-expert global scale and its
-reciprocal. The runtime consumes the reciprocal directly, so prepared eager
-execution and CUDA graph replay do not launch quantization or a reciprocal
-kernel on every invocation.
+The prepared object does not allocate DGRAD qdata or scales because training
+uses the BF16 backward. It retains both the per-expert global scale and its
+reciprocal. The runtime consumes the reciprocal directly, so prepared
+training, eager inference, and CUDA graph replay do not launch weight
+quantization or a reciprocal on every invocation.
 
-Training accepts only native BF16 weights. Forward quantizes them for FPROP.
-Backward quantizes them again, decodes packed E2M1 data and CUBLAS-blocked
-E4M3 scales with the per-expert inverse global scale, and supplies BF16
-`DQ(Q(W13))` and `DQ(Q(W2))` to native DGRAD. Packed weights are not saved.
+Dynamic training quantizes native BF16 weights for FPROP and repeats that
+quantization in backward. Prepared training retains caller-owned packed
+weights and scales instead. Both paths decode packed E2M1 data and
+CUBLAS-blocked E4M3 scales with the per-expert inverse global scale, then
+supply BF16 `DQ(Q(W13))` and `DQ(Q(W2))` to native DGRAD.
 The contiguous weight decoder assigns one Triton program to each logical
 weight row and processes 1,024 packed bytes per tile. Each packed byte and
 each scale are loaded once: the Blackwell `e2m1x2` conversion produces a

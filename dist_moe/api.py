@@ -3955,9 +3955,9 @@ def routed_experts(  # noqa: C901
             ``[E_local, 2, F, D]``, ``[E_local, 2F, D]``, or
             ``[E_local * 2F, D]``, or a prepared MXFP8/NVFP4 operand whose
             source has one of those shapes. Native NVFP4 weights are
-            quantized during each invocation. Prepared NVFP4 operands avoid
-            that repeated work for inference; training requires native BF16
-            weights.
+            quantized during each invocation. Prepared NVFP4 operands cache
+            that conversion for training and inference; training dequantizes
+            the cached FPROP weight for BF16 STE backward.
         w2_weight: Local BF16 down weight with shape ``[E_local, D, F]`` or
             ``[E_local * D, F]``, or a matching prepared MXFP8/NVFP4 operand.
         context: Factory-created execution context for these static shapes.
@@ -4225,10 +4225,11 @@ def prepare_block_scaled_weight(
             inference SwiGLU. Quantization happens before any gate/up row
             interleaving; execution performs no additional weight conversion.
             Explicit block sizes require MXFP8 and ``inference=True``.
-        out: Optional MXFP8 training storage to refill for the same logical
-            weight, shape, format, and device. Refill preserves the identical
-            storage tensors and returns a prepared wrapper associated with
-            ``weight``. It is unavailable for inference and NVFP4.
+        out: Optional prepared storage to refill for the same logical weight,
+            shape, format, device, and fused-SwiGLU layout. Refill preserves
+            the identical storage tensors and returns a prepared wrapper
+            associated with ``weight``. MXFP8 refill is training-only; NVFP4
+            supports canonical training and inference operands.
 
     Returns:
         Prepared weight accepted by :func:`routed_experts`.

@@ -22,11 +22,11 @@ MMA design, see [`nvfp4_kernel_design.md`](nvfp4_kernel_design.md).
 <a id="public-contract"></a>
 ## Public contract
 
-NVFP4 supports training with native BF16 weights and inference with native
-BF16 or explicitly prepared NVFP4 weights. Expert ID `-1` marks an inactive
-route: it is absent from communication and expert kernels, and final reduction
-masks the unwritten combine slot so an all-padding token produces an exact
-zero output row. The following fragment assumes the imports,
+NVFP4 supports training and inference with native BF16 or explicitly prepared
+NVFP4 weights. Expert ID `-1` marks an inactive route: it is absent from
+communication and expert kernels, and final reduction masks the unwritten
+combine slot so an all-padding token produces an exact zero output row. The
+following fragment assumes the imports,
 tensor names, dimensions, device, and expert-parallel group from the README
 quickstart:
 
@@ -65,10 +65,11 @@ outer scales, GEMM operands, and dequantization contracts retain the same
 layouts and dtypes.
 
 `D` and `F` must satisfy the NVFP4 alignment and maximum-dimension checks.
-Training applies straight-through-estimator semantics to quantization:
-forward quantizes native BF16 weights, backward quantizes them again and
-dequantizes the result for BF16 DGRAD. Prepared NVFP4 weights are rejected in
-training.
+Training applies straight-through-estimator semantics to quantization. With
+native BF16 weights, forward quantizes them and backward repeats that
+quantization before dequantizing the result for BF16 DGRAD. Prepared weights
+retain the same FPROP qdata and scales across the autograd boundary; backward
+dequantizes those cached operands and runs the identical BF16 gradient path.
 
 For inference, use `inference=True` and `num_activation_slots=0`. Native BF16
 weights are quantized inside every invocation, including every CUDA-graph
@@ -119,19 +120,27 @@ The resulting `dist_moe.PreparedWeight` owns:
 
 | Field | Shape and dtype | Purpose |
 | --- | --- | --- |
-| `source` | grouped BF16 metadata | Logical weight identity; readable storage is not required and no WGRAD is produced. |
+| `source` | grouped BF16 metadata | Logical weight identity and WGRAD owner during training; readable storage is not required by prepared execution. |
 | `fprop_data` | packed FP4, two values per byte | Tensor-core FPROP operand. |
 | `fprop_scale` | CUBLAS-blocked E4M3 | Per-16-value FPROP scales in the kernel-native swizzle. |
 | `global_scale` | FP32 `[E_local]` | Per-expert quantization scale retained for inspection and ownership. |
 | `global_scale_inv` | FP32 `[E_local]` | Reciprocal consumed directly by FPROP kernels. |
-| `dgrad_data`, `dgrad_scale` | `None` | Prepared NVFP4 is inference-only. |
+| `dgrad_data`, `dgrad_scale` | `None` | NVFP4 training uses the native BF16 backward instead of block-scaled DGRAD operands. |
 
 Explicit preparation is outside `dist_moe.routed_experts()`. Reusing the
 prepared object therefore does not requantize weights during each invocation
 or CUDA-graph replay. Passing BF16 weights performs the identical preparation
-inside the registered forward operation instead. Training repeats that
-preparation in backward and exactly dequantizes the regenerated operands to
-BF16; it never saves packed weights across the autograd boundary.
+inside the registered forward operation instead. Dynamic training repeats
+that preparation in backward; prepared training retains the caller-owned
+packed weights and scales. Both modes exactly dequantize their operands to
+BF16 before the shared gradient sequence.
+
+Calling `prepare_block_scaled_weight(updated_weight, policy, out=prepared)`
+refills qdata, block scales, global scales, and inverse scales in place. The
+returned wrapper points at `updated_weight` as its logical source while every
+prepared storage tensor retains its address. The shape, format, device, and
+fused-SwiGLU layout must match the original allocation.
+
 Non-strict `make_fx` captures the same registered block-scaled forward without
 introducing autograd state.
 
@@ -316,8 +325,7 @@ row buffer or changing the captured kernel sequence.
 Construction or invocation fails before kernel execution when:
 
 - a dimension violates NVFP4 alignment or supported maxima;
-- a training weight is not native BF16;
-- an inference weight is neither native BF16 nor a prepared NVFP4 operand;
+- a weight is neither native BF16 nor a prepared NVFP4 operand;
 - a prepared weight's required global scales or reciprocal scales are absent
   or malformed;
 - input tokens exceed `max_num_local_input_tokens`; or

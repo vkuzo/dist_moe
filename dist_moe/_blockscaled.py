@@ -66,7 +66,6 @@ from ._execution import (
     _resolve_wgrad_destinations,
     _resolve_wgrad_output_dtype,
     _weak_parameter_ref,
-    _wgrad_accumulation_destinations,
     _WgradDestination,
     WgradPostprocessFn,
 )
@@ -1733,11 +1732,18 @@ def _prepare_weight_handle(
         w_q_dgrad = prequantized.w_q_dgrad
         w_scale_dgrad = prequantized.w_scale_dgrad
         if w_q_dgrad is None or w_scale_dgrad is None:
-            if not inference_mode:
+            prepared_nvfp4 = (
+                compute.blockscaled.format is BlockScaledFormat.NVFP4
+                and w_q_dgrad is None
+                and w_scale_dgrad is None
+            )
+            if not inference_mode and not prepared_nvfp4:
                 raise ValueError(
                     "pre-quantized training weight tuple must provide dgrad quant slots"
                 )
-            # Inference reads only the FPROP orientation.
+            # Inference and the NVFP4 BF16 backward do not consume the
+            # block-scaled DGRAD orientation. Internal handles retain a
+            # concrete tensor in every fixed state slot.
             w_q_dgrad = prequantized.w_q_fprop
             w_scale_dgrad = prequantized.w_scale_fprop
         w_global_scale_inv = _resolve_weight_global_scale_inv(
@@ -2239,7 +2245,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
         ctx.inference_mode = inference_mode
         ctx.execution_context = execution_context
         ctx.wgrad_postprocess_fn = wgrad_postprocess_fn
-        ctx.recompute_dynamic_weight_quants = (
+        prepared_weights = w13_q_fprop is not None or w2_q_fprop is not None
+        ctx.recompute_dynamic_weight_quants = not prepared_weights and (
             save_dequantized_activations
             or _recompute_dynamic_mega_weight_quants(
                 compute,
@@ -2916,8 +2923,16 @@ class _BlockScaledAutograd(torch.autograd.Function):
             from .api import _Bf16Autograd
 
             dense_ctx = _KernelAutogradContext()
-            dense_ctx.w13_input_shape = w13_compute_EFD.shape
-            dense_ctx.w2_input_shape = w2_compute_EDF.shape
+            dense_ctx.w13_input_shape = getattr(
+                ctx,
+                "logical_w13_shape",
+                w13_compute_EFD.shape,
+            )
+            dense_ctx.w2_input_shape = getattr(
+                ctx,
+                "logical_w2_shape",
+                w2_compute_EDF.shape,
+            )
             dense_ctx.set(
                 execution_context=execution_context,
                 num_local_input_tokens=num_tokens,
@@ -3912,15 +3927,16 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
             only. W2 and training retain their canonical row order.
         weight_block_size: Optional MXFP8 inference quantization grain. None
             preserves 1x32 inference and 32x32 training defaults.
-        out: Optional MXFP8 training storage to refill for the same shape and
-            format. Refill is unavailable for inference and NVFP4.
+        out: Optional prepared storage to refill for the same shape, format,
+            device, and layout. MXFP8 refill is training-only; NVFP4 refill
+            supports canonical training and inference operands.
 
     Returns:
         Prepared weight accepted by :func:`_run_blockscaled`.
 
     Raises:
         ValueError: If weight metadata, inference layout, or ``out`` violates
-            the selected format or MXFP8 training refill contract.
+            the selected format's refill contract.
     """
     from ._execution import PreparedWeight
 
@@ -3941,14 +3957,42 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
     if fuse_swiglu and weight.shape[1] % 16:
         raise ValueError("fused inference W13 requires F divisible by eight")
     if out is not None:
-        if inference or kernel_format != BlockScaledFormat.MXFP8_E4M3:
-            raise ValueError("caller-owned refill supports MXFP8 training weights")
         if out.format != config.format:
-            raise ValueError("out is not compatible MXFP8 prepared storage")
-        if out.dgrad_data is None or out.dgrad_scale is None:
-            raise ValueError("out must contain MXFP8 DGRAD operands")
+            raise ValueError("out format must match config")
         if out.source.shape != weight.shape or out.source.dtype != weight.dtype:
             raise ValueError("out source shape and dtype must match weight")
+        if out.fprop_data.device != weight.device:
+            raise ValueError("out storage device must match weight")
+        if out._interleaved_fc13 != fuse_swiglu:
+            raise ValueError("out fused SwiGLU layout must match fuse_swiglu")
+        if kernel_format == BlockScaledFormat.NVFP4:
+            if (
+                out.dgrad_data is not None
+                or out.dgrad_scale is not None
+                or out.global_scale is None
+                or out.global_scale_inv is None
+            ):
+                raise ValueError("out is not compatible NVFP4 prepared storage")
+            with torch.no_grad():
+                (
+                    qdata_ENQ,
+                    scale_RB,
+                    global_scale_E,
+                    global_scale_inv_E,
+                ) = _prepare_nvfp4_weight_operands(
+                    weight,
+                    fuse_swiglu=fuse_swiglu,
+                    use_four_over_six=config.use_four_over_six,
+                )
+                out.fprop_data.copy_(qdata_ENQ)
+                out.fprop_scale.copy_(scale_RB)
+                out.global_scale.copy_(global_scale_E)
+                out.global_scale_inv.copy_(global_scale_inv_E)
+            return out._with_source(weight)
+        if inference or kernel_format != BlockScaledFormat.MXFP8_E4M3:
+            raise ValueError("caller-owned MXFP8 refill requires training operands")
+        if out.dgrad_data is None or out.dgrad_scale is None:
+            raise ValueError("out must contain MXFP8 DGRAD operands")
         with torch.no_grad():
             qdata, fprop_scale, dgrad_scale = _prepare_mxfp8_weight_op(weight)
             out.fprop_data.copy_(qdata)
@@ -4614,6 +4658,91 @@ def _optional_state(tensor: torch.Tensor) -> torch.Tensor | None:
     return None if tensor.numel() == 0 else tensor
 
 
+def _logical_expert_weight_shapes(
+    context: Context,
+) -> tuple[torch.Size, torch.Size]:
+    """Return the grouped logical W13 and W2 shapes for a context.
+
+    Args:
+        context: Context defining model dimensions and EP ownership.
+
+    Returns:
+        Logical grouped W13 and W2 shapes.
+    """
+    num_local_experts = _num_local_experts(
+        context.config.num_experts,
+        context.group,
+    )
+    hidden_dim = context.config.hidden_dim
+    intermediate_dim = context.config.intermediate_dim
+    return (
+        torch.Size((num_local_experts, 2 * intermediate_dim, hidden_dim)),
+        torch.Size((num_local_experts, hidden_dim, intermediate_dim)),
+    )
+
+
+def _registered_wgrad_accumulation_destinations(
+    accumulator_grad_w13_EFD: torch.Tensor,
+    accumulator_grad_w2_EDF: torch.Tensor,
+    w13_EFD: torch.Tensor,
+    w2_EDF: torch.Tensor,
+    output_dtype: torch.dtype,
+    context_id: str,
+) -> tuple[_WgradDestination, _WgradDestination]:
+    """Validate registered WGRAD destinations against logical weight shapes.
+
+    Args:
+        accumulator_grad_w13_EFD: Existing logical W13 gradient to update.
+        accumulator_grad_w2_EDF: Existing logical W2 gradient to update.
+        w13_EFD: Registered W13 operand defining device placement.
+        w2_EDF: Registered W2 operand defining device placement.
+        output_dtype: Required WGRAD dtype.
+        context_id: Registered context defining logical weight shapes.
+
+    Returns:
+        Validated W13 and W2 accumulation destinations.
+
+    Raises:
+        RuntimeError: If either destination has incompatible metadata.
+    """
+    w13_shape, w2_shape = _logical_expert_weight_shapes(_get_context(context_id))
+
+    def resolve(
+        accumulator_EFD: torch.Tensor,
+        shape: torch.Size,
+        weight_EFD: torch.Tensor,
+    ) -> _WgradDestination:
+        """Validate one logical WGRAD destination.
+
+        Args:
+            accumulator_EFD: Existing gradient storage.
+            shape: Required logical grouped shape.
+            weight_EFD: Registered operand defining device placement.
+
+        Returns:
+            Validated accumulating destination.
+        """
+        if (
+            accumulator_EFD.shape != shape
+            or accumulator_EFD.dtype != output_dtype
+            or accumulator_EFD.device != weight_EFD.device
+            or not accumulator_EFD.is_contiguous()
+        ):
+            raise RuntimeError(
+                "WGRAD accumulator must be a contiguous tensor with the "
+                "requested shape, dtype, and device"
+            )
+        return _WgradDestination(None, accumulator_EFD, True, output_dtype)
+
+    destinations = (
+        resolve(accumulator_grad_w13_EFD, w13_shape, w13_EFD),
+        resolve(accumulator_grad_w2_EDF, w2_shape, w2_EDF),
+    )
+    if destinations[0].dtype != destinations[1].dtype:
+        raise RuntimeError("W13 and W2 accumulators have different WGRAD dtypes")
+    return destinations
+
+
 def _run_block_scaled_registered_backward(
     grad_output_TD: torch.Tensor,
     w13_EFD: torch.Tensor,
@@ -4668,6 +4797,7 @@ def _run_block_scaled_registered_backward(
     policy = context.config.block_scaled
     activation_buffer = context.activation_buffer
     assert policy is not None and activation_buffer is not None
+    logical_w13_shape, logical_w2_shape = _logical_expert_weight_shapes(context)
     kernel_format = _kernel_block_scaled_format(policy.format)
     blockscaled_cfg, config = _blockscaled_compute_config(context)
     if kernel_format in FP4_FORMATS:
@@ -4693,6 +4823,9 @@ def _run_block_scaled_registered_backward(
         topk_scores_TK=topk_scores_TK,
     )
     weights: list[torch.Tensor | None] = list(state[_BACKWARD_WEIGHT_STATE])
+    recompute_dynamic_weight_quants = (
+        kernel_format in FP4_FORMATS and weights[0].numel() == 0
+    )
     if kernel_format not in FP4_FORMATS:
         weights[2] = weights[0]
         weights[7] = weights[5]
@@ -4703,6 +4836,8 @@ def _run_block_scaled_registered_backward(
     # 2. Rebuild the lightweight context expected by the shared eager backward;
     # it carries no independent storage or lifetime.
     kernel_ctx = _KernelAutogradContext()
+    kernel_ctx.logical_w13_shape = logical_w13_shape
+    kernel_ctx.logical_w2_shape = logical_w2_shape
     kernel_ctx.set(
         config=config,
         blockscaled_cfg=blockscaled_cfg,
@@ -4711,7 +4846,7 @@ def _run_block_scaled_registered_backward(
         w13_orig_shape=None,
         w2_orig_shape=None,
         weights_preprocess_fn=None,
-        recompute_dynamic_weight_quants=kernel_format in FP4_FORMATS,
+        recompute_dynamic_weight_quants=recompute_dynamic_weight_quants,
         inplace_wgrad_accum=False,
         w13_param_ref=None,
         w2_param_ref=None,
@@ -4739,7 +4874,7 @@ def _run_block_scaled_registered_backward(
                 else activation_buffer.scratch_capacity_factor
             ),
             num_moe_layers=context.config.max_moe_layers_per_activation_slot,
-            num_local_experts=w13_EFD.shape[0],
+            num_local_experts=logical_w13_shape[0],
             routing_world_size=dist.get_world_size(context.group),
             routing_m_multiple=dist_bs_gemm.DEFAULT_M_MULTIPLE_OF,
             max_num_recv_tokens=None,
@@ -4853,12 +4988,13 @@ def _block_scaled_backward_accumulate_op(
     context_id: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run block-scaled backward and add WGRAD into explicit destinations."""
-    wgrad_destinations = _wgrad_accumulation_destinations(
+    wgrad_destinations = _registered_wgrad_accumulation_destinations(
         accumulator_grad_w13_EFD,
         accumulator_grad_w2_EDF,
         w13_EFD,
         w2_EDF,
         wgrad_output_dtype,
+        context_id,
     )
     gradients = _run_block_scaled_registered_backward(
         grad_output_TD,
@@ -4923,12 +5059,13 @@ def _block_scaled_backward_fake(
     del topk_expert_ids_TK, state, rmsnorm_enabled
     del rmsnorm_eps, rmsnorm_norm_output_dtype, rmsnorm_output_dtype
     del rmsnorm_require_bitwise, rmsnorm_use_kahan, rmsnorm_recompute_rstd
-    del context_id
+    context = _get_context(context_id)
+    w13_shape, w2_shape = _logical_expert_weight_shapes(context)
     return (
         torch.empty_like(grad_output_TD),
         torch.empty_like(topk_scores_TK),
-        w13_EFD.new_empty(w13_EFD.shape, dtype=wgrad_output_dtype),
-        w2_EDF.new_empty(w2_EDF.shape, dtype=wgrad_output_dtype),
+        w13_EFD.new_empty(w13_shape, dtype=wgrad_output_dtype),
+        w2_EDF.new_empty(w2_shape, dtype=wgrad_output_dtype),
     )
 
 
@@ -4956,13 +5093,13 @@ def _block_scaled_backward_accumulate_fake(
     del topk_expert_ids_TK, state, rmsnorm_enabled
     del rmsnorm_eps, rmsnorm_norm_output_dtype, rmsnorm_output_dtype
     del rmsnorm_require_bitwise, rmsnorm_use_kahan, rmsnorm_recompute_rstd
-    del context_id
-    _wgrad_accumulation_destinations(
+    _registered_wgrad_accumulation_destinations(
         accumulator_grad_w13_EFD,
         accumulator_grad_w2_EDF,
         w13_EFD,
         w2_EDF,
         wgrad_output_dtype,
+        context_id,
     )
     return torch.empty_like(grad_output_TD), torch.empty_like(topk_scores_TK)
 
@@ -5012,9 +5149,13 @@ def _block_scaled_setup_context(
     assert isinstance(w13_EFD, torch.Tensor) and isinstance(w2_EDF, torch.Tensor)
     assert isinstance(prepared, list)
     _result, state = output
+    context = _get_context(context_id)
+    policy = context.config.block_scaled
+    assert policy is not None
     resolved = _resolve_block_scaled_weight_state(
         prepared,
         state[_BACKWARD_WEIGHT_STATE],
+        _kernel_block_scaled_format(policy.format),
     )
     ctx.context_id = context_id
     ctx.rmsnorm_enabled = rmsnorm_enabled
@@ -5042,12 +5183,14 @@ def _block_scaled_setup_context(
 def _resolve_block_scaled_weight_state(
     prepared: list[torch.Tensor | None],
     produced: list[torch.Tensor],
+    block_format: BlockScaledFormat,
 ) -> list[torch.Tensor]:
     """Resolve supplied or dynamically produced weight operands.
 
     Args:
         prepared: Optional caller-supplied operands for both weights.
         produced: Private forward outputs for dynamically prepared operands.
+        block_format: Active block-scaled format.
 
     Returns:
         Ten concrete tensors consumed by the backward operation.
@@ -5078,6 +5221,10 @@ def _resolve_block_scaled_weight_state(
             resolved.extend(generated)
             continue
         assert q_fprop is not None and scale_fprop is not None
+        if block_format is BlockScaledFormat.NVFP4:
+            assert q_dgrad is None and scale_dgrad is None
+            q_dgrad = q_fprop
+            scale_dgrad = scale_fprop
         assert scale_dgrad is not None
         if global_scale_inv is None and global_scale is not None:
             global_scale_inv = torch.reciprocal(global_scale)
@@ -5373,12 +5520,6 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
 
     prepared_w13 = w13_weight if isinstance(w13_weight, PreparedWeight) else None
     prepared_w2 = w2_weight if isinstance(w2_weight, PreparedWeight) else None
-    if (
-        policy.format == BlockScaledFormat.NVFP4
-        and not context.config.inference
-        and (prepared_w13 is not None or prepared_w2 is not None)
-    ):
-        raise ValueError("NVFP4 training contexts require native BF16 weights")
     interleaved_fc13 = prepared_w13 is not None and prepared_w13._interleaved_fc13
     if prepared_w2 is not None and prepared_w2._interleaved_fc13:
         raise ValueError("interleaved prepared W13 cannot be used as W2")

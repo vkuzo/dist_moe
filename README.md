@@ -36,8 +36,8 @@ graph-stable PyTorch operations needed to execute routed experts.
 All supported modes work with non-strict `make_fx`, CUDA graphs, and optional
 VMM host-backed scratch. Training modes include forward and backward.
 
-The package also supports NVFP4 training with native BF16 weights, native
-BF16 or prepared NVFP4 inference weights, prepared MXFP8 weights,
+The package also supports NVFP4 training and inference with native BF16 or
+prepared NVFP4 weights, prepared MXFP8 weights,
 device-selected activation slots, plain and clamped
 SwiGLU, BF16 SiTU-GLU, fused post-expert RMSNorm, clip statistics, and optional
 in-place accumulation into standard `parameter.grad` buffers.
@@ -356,10 +356,11 @@ Block-scaled SiTU-GLU is not yet supported.
 
 ### NVFP4
 
-NVFP4 supports training with native BF16 weights and inference with native
-BF16 or explicitly prepared weights. Training quantizes weights for forward,
-requantizes and dequantizes them for the BF16 backward, and uses STE
-semantics across the quantization boundaries. The complete
+NVFP4 supports training and inference with native BF16 or explicitly prepared
+weights. Training with native weights quantizes them for forward, then
+requantizes and dequantizes them for the BF16 backward. Prepared weights cache
+that quantization and are dequantized directly for backward. Both modes use
+STE semantics across the quantization boundaries. The complete
 [NVFP4 execution guide](docs/nvfp4_execution.md) describes both modes.
 The inference example runs with:
 
@@ -390,8 +391,9 @@ Set `use_four_over_six=True` to evaluate adaptive scale-for-4 and scale-for-6
 candidates in each NVFP4 block. The packed qdata and scale layouts are
 unchanged.
 
-For training, set `inference=False`, reserve at least one activation slot, pass
-native BF16 weights, and call `backward()` as in the BF16 quickstart.
+For training, set `inference=False`, reserve at least one activation slot, and
+call `backward()` as in the BF16 quickstart. Pass native BF16 weights for
+dynamic conversion or prepare them before the call to reuse cached operands.
 
 <a id="plan-memory"></a>
 ## Plan memory
@@ -552,10 +554,10 @@ the exact saved-state contract.
 `dist_moe.prepare_block_scaled_weight()` creates caller-owned quantized data
 and scales. Prepared execution can use logical sources without readable
 storage; see [weight ownership and reuse](docs/mxfp8_execution.md#prepare-and-reuse-weights).
-NVFP4 inference also accepts native BF16 W13 and W2 weights and quantizes them
-during each invocation. Preparing NVFP4 weights explicitly avoids that
-repeated work and remains the reusable inference API. NVFP4 training requires
-native BF16 weights; it quantizes them in forward and again in backward.
+NVFP4 also accepts native BF16 W13 and W2 weights and quantizes them during
+each invocation. Preparing NVFP4 weights explicitly avoids that repeated work
+in training and inference. Training dequantizes the cached FPROP weights and
+retains the same BF16 STE backward as dynamic NVFP4.
 The complete
 [block-scaled inference example](examples/block_scaled_inference.py)
 prepares both expert weights before execution:

@@ -222,6 +222,52 @@ class _BackwardOpRecorder(TorchDispatchMode):
         return result
 
 
+class _StorageFreeWeight(torch.Tensor):
+    """Logical weight metadata that rejects every dispatched data operation."""
+
+    @staticmethod
+    def __new__(cls, source: torch.Tensor) -> torch.Tensor:
+        """Keep grouped shape, dtype, and device metadata without storage.
+
+        Args:
+            source: Tensor supplying logical metadata.
+
+        Returns:
+            Storage-free wrapper with matching metadata.
+        """
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            source.shape,
+            strides=source.stride(),
+            dtype=source.dtype,
+            layout=source.layout,
+            device=source.device,
+            requires_grad=source.requires_grad,
+        )
+
+    @classmethod
+    def __torch_dispatch__(
+        cls,
+        func: Any,
+        types: tuple[type, ...],
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Fail before a storage-free source can enter a data operation.
+
+        Args:
+            func: Dispatched tensor operation.
+            types: Participating tensor subclass types.
+            args: Positional operation arguments.
+            kwargs: Optional keyword operation arguments.
+
+        Raises:
+            RuntimeError: Always, because no data operation is valid.
+        """
+        del cls, types, args, kwargs
+        raise RuntimeError(f"storage-free logical weight entered {func}")
+
+
 def _nvfp4_outer_quant_scale(
     tensor: torch.Tensor,
     *,
@@ -2854,6 +2900,60 @@ class DistMoeKernelTest(unittest.TestCase):
                 torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
             )
 
+    def test_prepared_nvfp4_weight_refill_is_allocation_stable(self) -> None:
+        """Refill preserves NVFP4 storage addresses and exact operands."""
+        torch.manual_seed(0)
+        weight = torch.randn(
+            2,
+            128,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        config = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+        )
+        prepared = dist_moe.prepare_block_scaled_weight(weight, config)
+        assert prepared.global_scale is not None
+        assert prepared.global_scale_inv is not None
+        storage_tensors = (
+            prepared.fprop_data,
+            prepared.fprop_scale,
+            prepared.global_scale,
+            prepared.global_scale_inv,
+        )
+        addresses = tuple(tensor.data_ptr() for tensor in storage_tensors)
+
+        weight.add_(0.25)
+        refilled = dist_moe.prepare_block_scaled_weight(weight, config, out=prepared)
+        reference = dist_moe.prepare_block_scaled_weight(weight, config)
+        assert refilled.global_scale is not None
+        assert refilled.global_scale_inv is not None
+        assert reference.global_scale is not None
+        assert reference.global_scale_inv is not None
+
+        self.assertEqual(
+            addresses,
+            tuple(
+                tensor.data_ptr()
+                for tensor in (
+                    refilled.fprop_data,
+                    refilled.fprop_scale,
+                    refilled.global_scale,
+                    refilled.global_scale_inv,
+                )
+            ),
+        )
+        for actual, expected in (
+            (refilled.fprop_data, reference.fprop_data),
+            (refilled.fprop_scale, reference.fprop_scale),
+            (refilled.global_scale, reference.global_scale),
+            (refilled.global_scale_inv, reference.global_scale_inv),
+        ):
+            self.assertTrue(
+                torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+            )
+
     def test_mxfp8_inference_32x32_preserves_training_weights(self) -> None:
         """Keep canonical training quantization, including interleaved scale rows.
 
@@ -4559,8 +4659,110 @@ class DistMoeKernelTest(unittest.TestCase):
                                 bound,
                             )
 
-    def test_nvfp4_training_rejects_prepared_weights(self) -> None:
-        """Keep prepared NVFP4 operands inference-only after enabling training."""
+    def test_nvfp4_training_reuses_prepared_weights_with_bf16_backward(
+        self,
+    ) -> None:
+        """Match dynamic NVFP4 while avoiding weight quantization in both passes."""
+
+        def preserve_wgrad(
+            name: str,
+            gradient_EFD: torch.Tensor,
+        ) -> torch.Tensor:
+            """Force eager execution while preserving a produced WGRAD."""
+            del name
+            return gradient_EFD
+
+        for pipeline, execution_mode in itertools.product(
+            ("staged", "mega"),
+            ("functional", "inplace", "callback"),
+        ):
+            with self.subTest(
+                pipeline=pipeline,
+                execution_mode=execution_mode,
+            ):
+                policy = dist_moe.BlockScaledConfig(
+                    format=dist_moe.BlockScaledFormat.NVFP4,
+                    pipeline=pipeline,
+                )
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    inference=False,
+                    block_scaled=policy,
+                )
+                x_TD, ids_TK, scores_TK = case_a
+                actual = tuple(
+                    tensor.detach().clone().requires_grad_()
+                    for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+                )
+                reference = tuple(
+                    tensor.detach().clone().requires_grad_()
+                    for tensor in (x_TD, scores_TK, w13_EFD, w2_EDF)
+                )
+                prepared_w13 = dist_moe.prepare_block_scaled_weight(
+                    actual[2],
+                    policy,
+                )
+                prepared_w2 = dist_moe.prepare_block_scaled_weight(
+                    actual[3],
+                    policy,
+                )
+                options = dist_moe.ExecutionOptions(
+                    inplace_wgrad_accum=execution_mode == "inplace",
+                    wgrad_postprocess_fn=(
+                        preserve_wgrad if execution_mode == "callback" else None
+                    ),
+                )
+
+                with mock.patch.object(
+                    blockscaled_impl,
+                    "_prepare_nvfp4_weight_operands",
+                    wraps=blockscaled_impl._prepare_nvfp4_weight_operands,
+                ) as prepare_weight:
+                    actual_TD = dist_moe.routed_experts(
+                        actual[0],
+                        ids_TK,
+                        actual[1],
+                        prepared_w13,
+                        prepared_w2,
+                        context,
+                        options=options,
+                    )
+                    grad_TD = torch.randn_like(actual_TD)
+                    actual_TD.backward(grad_TD)
+                self.assertEqual(prepare_weight.call_count, 0)
+
+                reference_TD = dist_moe.routed_experts(
+                    reference[0],
+                    ids_TK,
+                    reference[1],
+                    reference[2],
+                    reference[3],
+                    context,
+                    options=options,
+                )
+                reference_TD.backward(grad_TD)
+
+                torch.testing.assert_close(
+                    actual_TD,
+                    reference_TD,
+                    rtol=0,
+                    atol=0,
+                )
+                for actual_input, reference_input in zip(
+                    actual,
+                    reference,
+                    strict=True,
+                ):
+                    self.assertIsNotNone(actual_input.grad)
+                    self.assertIsNotNone(reference_input.grad)
+                    torch.testing.assert_close(
+                        actual_input.grad,
+                        reference_input.grad,
+                        rtol=0,
+                        atol=0,
+                    )
+
+    def test_nvfp4_prepared_backward_does_not_read_logical_weights(self) -> None:
+        """Run cached BF16 backward with storage-free logical weight sources."""
         policy = dist_moe.BlockScaledConfig(
             format=dist_moe.BlockScaledFormat.NVFP4,
         )
@@ -4568,23 +4770,49 @@ class DistMoeKernelTest(unittest.TestCase):
             inference=False,
             block_scaled=policy,
         )
-        prepared_w13 = dist_moe.prepare_block_scaled_weight(
-            w13_EFD,
-            policy,
-            inference=True,
+        x_TD, ids_TK, scores_TK = case_a
+        prepared_w13 = dist_moe.prepare_block_scaled_weight(w13_EFD, policy)
+        prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy)
+        storage_free_w13 = prepared_w13._with_source(_StorageFreeWeight(w13_EFD))
+        storage_free_w2 = prepared_w2._with_source(_StorageFreeWeight(w2_EDF))
+        actual_x_TD = x_TD.detach().clone().requires_grad_()
+        actual_scores_TK = scores_TK.detach().clone().requires_grad_()
+        reference_x_TD = x_TD.detach().clone().requires_grad_()
+        reference_scores_TK = scores_TK.detach().clone().requires_grad_()
+
+        actual_TD = dist_moe.routed_experts(
+            actual_x_TD,
+            ids_TK,
+            actual_scores_TK,
+            storage_free_w13,
+            storage_free_w2,
+            context,
         )
-        prepared_w2 = dist_moe.prepare_block_scaled_weight(
-            w2_EDF,
-            policy,
-            inference=True,
+        grad_TD = torch.randn_like(actual_TD)
+        actual_TD.backward(grad_TD)
+        reference_TD = dist_moe.routed_experts(
+            reference_x_TD,
+            ids_TK,
+            reference_scores_TK,
+            prepared_w13,
+            prepared_w2,
+            context,
         )
-        with self.assertRaisesRegex(ValueError, "native BF16 weights"):
-            dist_moe.routed_experts(
-                *case_a,
-                prepared_w13,
-                prepared_w2,
-                context,
-            )
+        reference_TD.backward(grad_TD)
+
+        torch.testing.assert_close(actual_TD, reference_TD, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_x_TD.grad,
+            reference_x_TD.grad,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            actual_scores_TK.grad,
+            reference_scores_TK.grad,
+            rtol=0,
+            atol=0,
+        )
 
     def test_nvfp4_forward_saves_reference_backward_activations(self) -> None:
         """Save packed X and real BF16 GEMM boundaries for backward.
@@ -4973,33 +5201,6 @@ class DistMoeKernelTest(unittest.TestCase):
         packed NVFP4 must retain logical dimensions for inference planning.
         """
 
-        class StorageFreeWeight(torch.Tensor):
-            """Logical weight metadata that rejects every dispatched data op."""
-
-            @staticmethod
-            def __new__(cls, source: torch.Tensor) -> torch.Tensor:
-                """Keep grouped shape/dtype/device metadata without storage."""
-                return torch.Tensor._make_wrapper_subclass(
-                    cls,
-                    source.shape,
-                    strides=source.stride(),
-                    dtype=source.dtype,
-                    layout=source.layout,
-                    device=source.device,
-                    requires_grad=source.requires_grad,
-                )
-
-            @classmethod
-            def __torch_dispatch__(
-                cls,
-                func: Any,
-                types: tuple[type, ...],
-                args: tuple[Any, ...] = (),
-                kwargs: dict[str, Any] | None = None,
-            ) -> Any:
-                """Fail before a storage-free source can enter a data operation."""
-                raise RuntimeError(f"storage-free logical weight entered {func}")
-
         for block_format, inference, weight_block_size in (
             (dist_moe.BlockScaledFormat.MXFP8_E4M3, False, None),
             (dist_moe.BlockScaledFormat.MXFP8_E4M3, True, None),
@@ -5055,10 +5256,10 @@ class DistMoeKernelTest(unittest.TestCase):
                         run = partial(
                             dist_moe.routed_experts,
                             w13_weight=prepared_w13._with_source(
-                                StorageFreeWeight(w13_EFD)
+                                _StorageFreeWeight(w13_EFD)
                             ),
                             w2_weight=prepared_w2._with_source(
-                                StorageFreeWeight(w2_EDF)
+                                _StorageFreeWeight(w2_EDF)
                             ),
                             context=context,
                         )
@@ -7724,12 +7925,38 @@ class DistMoeTwoRankTest(unittest.TestCase):
         """Bound prepared NVFP4 inference against the routed reference.
 
         The test supplies real two-rank dispatch and combine evidence for the
-        inference-only format.
+        inference path.
         """
         self._run_two_rank_numerics(
             dist_moe.BlockScaledConfig(format=dist_moe.BlockScaledFormat.NVFP4),
             inference=True,
         )
+
+    @with_comms
+    def test_prepared_nvfp4_forward_and_backward_exercise_peer_paths(self) -> None:
+        """Bound prepared NVFP4 and BF16 STE gradients over real peer paths."""
+        for pipeline in ("staged", "mega"):
+            with self.subTest(pipeline=pipeline):
+                with mock.patch.object(
+                    blockscaled_impl,
+                    "_prepare_nvfp4_weight_operands",
+                    wraps=blockscaled_impl._prepare_nvfp4_weight_operands,
+                ) as prepare_weight:
+                    self._run_two_rank_numerics(
+                        dist_moe.BlockScaledConfig(
+                            format=dist_moe.BlockScaledFormat.NVFP4,
+                            pipeline=pipeline,
+                        ),
+                        prepared_weights=True,
+                        reference_moe=_reference_moe_nvfp4_real_quant,
+                        fwd_tolerance_override=(0.005, 3.1e-5, 2e-5, 0.999999),
+                        grad_tolerance_override=(0.01, 0.002, 5e-4, 0.999999),
+                    )
+                self.assertEqual(
+                    prepare_weight.call_count,
+                    2,
+                    "W13 and W2 must each quantize only during preparation",
+                )
 
     @with_comms
     def test_nvfp4_forward_and_backward_exercise_peer_paths(self) -> None:
