@@ -1331,21 +1331,30 @@ class _Nvfp4Bf16BackwardAdapter:
             derive_pipeline_depth=True,
         )
 
-        # The planner publishes the selected saved/recomputed packed-X offset
-        # before this graph-stable launch. Decode it before the combine
-        # producer can reuse recompute row scratch for H2.
-        dispatch_offsets = backward_plan.blockscaled.recompute_dispatch_offsets
-        _dequantize_nvfp4_activation_buffer_to_buffer(
-            activation_buffer.buffer,
-            dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
-            dispatch_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
-            num_recv_rows_1,
-            backward_plan.x_gathered_offset,
-            forward_plan.need_recompute,
-            capacity_rows,
-            hidden_dim,
-            execute_unconditionally=True,
+        full_save_bytes = self.model_config.num_moe_layers * (
+            self.model_config.saved_act_mem_size(
+                self.model_config.max_recv_tokens,
+                recompute=False,
+            )
         )
+        if activation_buffer.activation_slot_bytes < full_save_bytes:
+            # A recompute layer has no saved BF16 X, so decode its rebuilt
+            # packed rows before the combine producer can reuse row scratch for
+            # H2. A maximum-capacity slot makes recompute unreachable and omits
+            # this otherwise graph-stable no-op launch from the backward.
+            dispatch_offsets = backward_plan.blockscaled.recompute_dispatch_offsets
+            _dequantize_nvfp4_activation_buffer_to_buffer(
+                activation_buffer.buffer,
+                dispatch_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+                dispatch_offsets[
+                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
+                ],
+                num_recv_rows_1,
+                backward_plan.x_gathered_offset,
+                forward_plan.need_recompute,
+                capacity_rows,
+                hidden_dim,
+            )
 
         h1_placeholder = _activation_buffer_placeholder(
             activation_buffer.buffer,
@@ -2597,6 +2606,22 @@ class _BlockScaledAutograd(torch.autograd.Function):
                                 forward_plan.need_recompute
                             ),
                         )
+                        _dequantize_nvfp4_activation_buffer_to_buffer(
+                            activation_buffer.buffer,
+                            dispatch_offsets[
+                                ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                            ],
+                            dispatch_offsets[
+                                ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                + 1
+                            ],
+                            num_recv_tokens,
+                            forward_plan.x_gathered_offset,
+                            forward_plan.blockscaled.recompute_condition,
+                            capacity_rows,
+                            hidden_dim,
+                            execute_when_zero=True,
+                        )
                 else:
                     assert (
                         forward_plan is not None
@@ -2632,6 +2657,24 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         w_global_scale_inv=(w13_handle.blockscaled.w_global_scale_inv),
                         derive_pipeline_depth=auto_inference_tuning,
                     )
+                    if save_dequantized_activations:
+                        dispatch_offsets = forward_plan.blockscaled.dispatch_offsets
+                        _dequantize_nvfp4_activation_buffer_to_buffer(
+                            activation_buffer.buffer,
+                            dispatch_offsets[
+                                ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                            ],
+                            dispatch_offsets[
+                                ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                + 1
+                            ],
+                            num_recv_tokens,
+                            forward_plan.x_gathered_offset,
+                            forward_plan.blockscaled.recompute_condition,
+                            capacity_rows,
+                            hidden_dim,
+                            execute_when_zero=True,
+                        )
                     h1_placeholder = _activation_buffer_placeholder(
                         activation_buffer.buffer,
                         (capacity_rows, 2 * intermediate_dim),
