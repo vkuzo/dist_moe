@@ -2508,9 +2508,14 @@ class _Bf16Autograd(torch.autograd.Function):
         # 5. Compute W2 then W13 gradients in dependency order. Optional
         # destinations let the kernels write directly into framework storage.
         with record_function("dist_moe_backward"):
+            w2_dgrad_EDF = (
+                w2_EDF
+                if backward_adapter is None
+                else backward_adapter.materialize_w2_dgrad_weight()
+            )
             dist_grouped_gemm_dgrad_dispatch(
                 dy=grad_h3_MD,
-                w=w2_EDF,
+                w=w2_dgrad_EDF,
                 num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
                 gather_ptrs=combine_scatter_ptrs_M,
                 num_out_tokens=None,
@@ -2522,6 +2527,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 config=fprop_config,
                 has_padding_sentinels=backward_adapter is not None,
             )
+            del w2_dgrad_EDF
 
             if wgrad_destinations is None:
                 grad_w2_output_EDF = torch.empty(
@@ -2560,6 +2566,11 @@ class _Bf16Autograd(torch.autograd.Function):
             _initialize_fake_peer_scatter_output(buffers.dispatch)
             # W2 WGRAD has consumed H2 before its scratch may be reused for
             # grad_H1. Fusion writes grad_H1 into that same planned destination.
+            w13_dgrad_EFD = (
+                w13_EFD
+                if backward_adapter is None
+                else backward_adapter.materialize_w13_dgrad_weight()
+            )
             if (
                 config.activation in ("swiglu", "swiglu_clamped")
                 and w2_EDF.shape[2] % native_swiglu_bwd_col_multiple() == 0
@@ -2567,7 +2578,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 grad_x_TKD, _ = dist_grouped_gemm_dgrad_swiglu_bwd_combine(
                     grad_h2=backward_plan.grad_h2_offset,
                     h1=backward_plan.h1_offset,
-                    w=w13_EFD,
+                    w=w13_dgrad_EFD,
                     num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
                     scatter_ptrs=dispatch_bwd_gather_ptrs_M,
                     symm_mem_buffer=buffers.dispatch,
@@ -2599,7 +2610,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 )
                 grad_x_TKD = dist_grouped_gemm_dgrad_combine(
                     dy=backward_plan.grad_h1_offset,
-                    w=w13_EFD,
+                    w=w13_dgrad_EFD,
                     num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
                     scatter_ptrs=dispatch_bwd_gather_ptrs_M,
                     symm_mem_buffer=buffers.dispatch,
@@ -2608,6 +2619,7 @@ class _Bf16Autograd(torch.autograd.Function):
                     config=fprop_config,
                     has_padding_sentinels=backward_adapter is not None,
                 )
+            del w13_dgrad_EFD
             grad_x_TKD = grad_x_TKD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
             ].view(num_local_input_tokens, context.top_k, context.hidden_dim)

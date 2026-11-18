@@ -11,6 +11,7 @@ import datetime
 import itertools
 import tempfile
 import unittest
+import weakref
 from functools import partial, wraps
 from typing import Any, Callable, Literal
 from unittest import mock
@@ -4760,6 +4761,57 @@ class DistMoeKernelTest(unittest.TestCase):
                         rtol=0,
                         atol=0,
                     )
+
+    def test_nvfp4_backward_sequences_dequantized_weights(self) -> None:
+        """Release Q-DQ W2 before materializing Q-DQ W13 for dense DGRAD."""
+        policy = dist_moe.BlockScaledConfig(
+            format=dist_moe.BlockScaledFormat.NVFP4,
+        )
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            inference=False,
+            block_scaled=policy,
+        )
+        x_TD, ids_TK, scores_TK = case_a
+        prepared_w13 = dist_moe.prepare_block_scaled_weight(w13_EFD, policy)
+        prepared_w2 = dist_moe.prepare_block_scaled_weight(w2_EDF, policy)
+        dequantized_w2_ref: weakref.ReferenceType[torch.Tensor] | None = None
+        materialization_order = []
+        dequantize = blockscaled_impl._dequantize_nvfp4_weight
+
+        def observe_dequantization(
+            qdata: torch.Tensor,
+            scale: torch.Tensor,
+            global_scale_inv: torch.Tensor,
+        ) -> torch.Tensor:
+            """Record DGRAD weight order and the prior operand's lifetime."""
+            nonlocal dequantized_w2_ref
+            output = dequantize(qdata, scale, global_scale_inv)
+            name = "w13" if qdata.shape[1] == 2 * w2_EDF.shape[2] else "w2"
+            if name == "w2":
+                dequantized_w2_ref = weakref.ref(output)
+            else:
+                self.assertIsNotNone(dequantized_w2_ref)
+                assert dequantized_w2_ref is not None
+                self.assertIsNone(dequantized_w2_ref())
+            materialization_order.append(name)
+            return output
+
+        with mock.patch.object(
+            blockscaled_impl,
+            "_dequantize_nvfp4_weight",
+            side_effect=observe_dequantization,
+        ):
+            output_TD = dist_moe.routed_experts(
+                x_TD.detach().requires_grad_(),
+                ids_TK,
+                scores_TK.detach().requires_grad_(),
+                prepared_w13,
+                prepared_w2,
+                context,
+            )
+            output_TD.backward(torch.randn_like(output_TD))
+
+        self.assertEqual(materialization_order, ["w2", "w13"])
 
     def test_nvfp4_prepared_backward_does_not_read_logical_weights(self) -> None:
         """Run cached BF16 backward with storage-free logical weight sources."""
