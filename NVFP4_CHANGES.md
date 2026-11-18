@@ -1,5 +1,23 @@
 # NVFP4 Changes
 
+## Human note
+
+This fork adds the humans& nvfp4 bwd + bf16 bwd ([link](https://humansand.ai/blog/nvfp4-rl#putting-it-all-together-final-recipe)) to dist-moe.
+
+Changes from original repo, at a high level:
+1. add a nvfp4 reference with real quants and real nvfp4 gemms, with bitwise matching actual dist-moe kernels in the fwd and tight tolerance for the bwd (this enables safe hill climbing)
+2. add q-dq in the right spots to hook up the pre-existing nvfp4 forward with the pre-existing bf16 bwd, and fix all planner, cuda graphs, etc wiring
+3. API updates to enable nvfp4 in a training context, and pass either bf16 or nvfp4 weights to nvfp4 training pipeline
+4. four-over-six support (https://github.com/mit-han-lab/fouroversix)
+5. comprehesive testing + benchmarks
+6. torchtitan RL integration (not landed, and not in this repo) showed small RL runs working as expected
+
+At a high level the kernel changes here are:
+A. add fast dequant kernels (to implement the basic recipe), these are standalone
+B. add four-over-six support to all existing kernels that need it (no new kernels for this feature)
+
+## Agent note below
+
 This fork adds the following NVFP4 capabilities:
 
 - Replaced the approximate NVFP4 reference and its loose tolerances with a
@@ -46,6 +64,8 @@ The training comparison measures one forward and backward using reusable
 prepared weights. Refreshing both NVFP4 weight operands from BF16 is outside
 the iteration and measured 0.5840 ms separately. The NVFP4 backward continues
 to use BF16 GEMMs.
+
+(human note - training path has not been benchmarked or optimized yet)
 
 | Local `T` | BF16 forward + backward | NVFP4 staged forward + BF16 backward | NVFP4 delta |
 | ---: | ---: | ---: | ---: |
