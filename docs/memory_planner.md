@@ -60,6 +60,14 @@ padded to the grouped-GEMM 128-row multiple. Consequently,
 device and total padded bounds from `dist_moe.plan_memory()` rather than
 reimplementing this topology-aware calculation.
 
+NVFP4 training may use those padded rows only for forward compute while saving
+its Q-DQ BF16 X and BF16 H1 in exact, sentinel-free expert order. This compact
+layout is selected only for a non-VMM slot large enough that recompute is
+unreachable at the total routing-capacity bound; partial slots retain padded
+state so they can replay the original NVFP4 forward. The
+`compact_nvfp4_backward_activations` plan field reports the selection. Scratch
+capacity remains topology-aware and padded in either case.
+
 `dist_moe.MemoryPlan.explain()` reports the logical bytes. Supplying `device`
 also resolves CUDA VMM granularity, physical section padding, and the allocator
 size-class adjustment used by `dist_moe.create_context()`.
@@ -116,12 +124,13 @@ capacity factor -> minimum_slot_bytes
                    + factor * (balanced_full_save_slot_bytes - minimum_slot_bytes)
 ```
 
-`balanced_full_save_slot_bytes` uses the topology-aware padded receive count at
-routing factor `1.0`; it does not inherit either scratch factor. Factor `1.0`
-therefore covers all eligible state at balanced routing, while `1.5` covers
-aggregate optional-state bytes up to 1.5 times the balanced amount. This is a
-byte-capacity statement rather than a raw-row ratio because block-scaled
-routing pads each local expert independently.
+`balanced_full_save_slot_bytes` uses routing factor `1.0`; it does not inherit
+either scratch factor. MX formats and recompute-capable NVFP4 slots use the
+topology-aware padded count. A compact NVFP4 full-save slot instead uses the
+exact topology-clamped count. Factor `1.0` therefore covers all eligible state
+at balanced routing, while `1.5` covers aggregate optional-state bytes up to
+1.5 times the balanced amount. This is a byte-capacity statement rather than a
+raw-row ratio.
 
 <a id="understand-activation-buffer-layout"></a>
 ## Understand activation-buffer layout

@@ -71,6 +71,10 @@ class DistDispatchRoutingOutput:
     fwd_gather_ptrs: torch.Tensor
     # [T'] - Scatter pointers for writing output tokens back to peer GPUs
     scatter_ptrs: torch.Tensor
+    # Optional sentinel-free view of the same routes. NVFP4 training uses the
+    # primary padded view for forward kernels and this compact view for its
+    # delegated BF16 backward.
+    unpadded: "DistDispatchRoutingOutput | None" = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -730,6 +734,8 @@ def dist_dispatch_routing(
     generate_bwd_gather_ptrs: bool = True,
     use_low_latency: bool = False,
     pointer_capacity_multiple_of: int = 1,
+    generate_unpadded_output: bool = False,
+    max_unpadded_num_recv_tokens: int | None = None,
 ) -> DistDispatchRoutingOutput:
     """Compute routing indices for distributed grouped GEMM with expert parallelism.
 
@@ -799,6 +805,11 @@ def dist_dispatch_routing(
         pointer_capacity_multiple_of: Physical pointer-storage row alignment
               for a capacity-shaped consumer. The configured receive-row
               overflow guard is unchanged.
+        generate_unpadded_output: Also return exact counts and pointer tables
+              without per-expert sentinel padding. This is supported by the
+              general routing path when ``m_multiple_of`` is set.
+        max_unpadded_num_recv_tokens: Static capacity and overflow ceiling for
+              the optional unpadded pointer tables.
 
     Returns:
         DistDispatchRoutingOutput containing:
@@ -856,6 +867,10 @@ def dist_dispatch_routing(
     num_local_experts = num_experts // world_size
 
     m_multiple_of_constexpr = _normalize_m_multiple_of(m_multiple_of)
+    if generate_unpadded_output and m_multiple_of_constexpr == 0:
+        raise ValueError("generate_unpadded_output requires a positive m_multiple_of")
+    if max_unpadded_num_recv_tokens is not None and max_unpadded_num_recv_tokens <= 0:
+        raise ValueError("max_unpadded_num_recv_tokens must be positive")
 
     if _can_use_decode_routing(
         use_low_latency=use_low_latency,
@@ -995,6 +1010,46 @@ def dist_dispatch_routing(
     )
     fwd_gather_ptrs = torch.empty((ptrs_size,), dtype=torch.int64, device=device)
     scatter_ptrs = torch.empty((ptrs_size,), dtype=torch.int64, device=device)
+    unpadded_num_tokens_per_local_experts = (
+        torch.empty((num_local_experts,), dtype=torch.int32, device=device)
+        if generate_unpadded_output
+        else None
+    )
+    unpadded_num_tokens_per_rank = (
+        torch.empty((world_size,), dtype=torch.int32, device=device)
+        if generate_unpadded_output
+        else None
+    )
+    unpadded_ptrs_size = (
+        (
+            max_unpadded_num_recv_tokens
+            if max_unpadded_num_recv_tokens is not None
+            else _routing_ptrs_size(
+                world_size=world_size,
+                num_tokens=num_tokens,
+                topk=topk,
+                num_local_experts=num_local_experts,
+                m_multiple_of=0,
+            )
+        )
+        if generate_unpadded_output
+        else 0
+    )
+    unpadded_bwd_gather_ptrs = (
+        torch.empty((unpadded_ptrs_size,), dtype=torch.int64, device=device)
+        if generate_unpadded_output and generate_bwd_gather_ptrs
+        else None
+    )
+    unpadded_fwd_gather_ptrs = (
+        torch.empty((unpadded_ptrs_size,), dtype=torch.int64, device=device)
+        if generate_unpadded_output
+        else None
+    )
+    unpadded_scatter_ptrs = (
+        torch.empty((unpadded_ptrs_size,), dtype=torch.int64, device=device)
+        if generate_unpadded_output
+        else None
+    )
 
     # Launch Phase 2: Process gathered expert IDs with smaller tiles
     grid = (world_size, num_workers, 1)
@@ -1054,11 +1109,17 @@ def dist_dispatch_routing(
         dtype=torch.int64,
         device=device,
     )
+    unpadded_compact_offsets = (
+        torch.empty_like(compact_offsets) if generate_unpadded_output else None
+    )
     _triton_dispatch_routing_prefix[(1, 1, 1)](
         per_rank_token_cnts_ptr=per_rank_token_counts,
         token_cnts_ptr=num_tokens_per_local_experts,
         num_tokens_per_rank_ptr=num_tokens_per_rank,
         compact_offsets_ptr=compact_offsets,
+        unpadded_token_cnts_ptr=unpadded_num_tokens_per_local_experts,
+        unpadded_num_tokens_per_rank_ptr=unpadded_num_tokens_per_rank,
+        unpadded_compact_offsets_ptr=unpadded_compact_offsets,
         world_size=world_size,
         num_experts=num_experts,
         num_workers=num_workers,
@@ -1068,6 +1129,12 @@ def dist_dispatch_routing(
         m_multiple_of=m_multiple_of_constexpr,
         max_num_recv_tokens=(0 if max_num_recv_tokens is None else max_num_recv_tokens),
         has_max_num_recv_tokens=max_num_recv_tokens is not None,
+        max_unpadded_num_recv_tokens=(
+            0 if max_unpadded_num_recv_tokens is None else max_unpadded_num_recv_tokens
+        ),
+        has_max_unpadded_num_recv_tokens=(
+            generate_unpadded_output and max_unpadded_num_recv_tokens is not None
+        ),
     )
     _triton_dispatch_routing_combine[grid](
         per_rank_token_cnts_ptr=per_rank_token_counts,
@@ -1079,6 +1146,10 @@ def dist_dispatch_routing(
         bwd_gather_ptrs_ptr=bwd_gather_ptrs,
         fwd_gather_ptrs_ptr=fwd_gather_ptrs,
         scatter_ptrs_ptr=scatter_ptrs,
+        unpadded_compact_offsets_ptr=unpadded_compact_offsets,
+        unpadded_bwd_gather_ptrs_ptr=unpadded_bwd_gather_ptrs,
+        unpadded_fwd_gather_ptrs_ptr=unpadded_fwd_gather_ptrs,
+        unpadded_scatter_ptrs_ptr=unpadded_scatter_ptrs,
         world_size=world_size,
         num_experts=num_experts,
         block_size_t=block_size_t,
@@ -1089,6 +1160,23 @@ def dist_dispatch_routing(
         m_multiple_of=m_multiple_of_constexpr,
     )
 
+    unpadded = None
+    if generate_unpadded_output:
+        assert unpadded_num_tokens_per_local_experts is not None
+        assert unpadded_num_tokens_per_rank is not None
+        assert unpadded_fwd_gather_ptrs is not None
+        assert unpadded_scatter_ptrs is not None
+        unpadded = DistDispatchRoutingOutput(
+            num_tokens_per_local_experts=unpadded_num_tokens_per_local_experts,
+            num_tokens_per_rank=unpadded_num_tokens_per_rank,
+            bwd_gather_ptrs=(
+                unpadded_bwd_gather_ptrs
+                if unpadded_bwd_gather_ptrs is not None
+                else torch.empty((0,), dtype=torch.int64, device=device)
+            ),
+            fwd_gather_ptrs=unpadded_fwd_gather_ptrs,
+            scatter_ptrs=unpadded_scatter_ptrs,
+        )
     return DistDispatchRoutingOutput(
         num_tokens_per_local_experts=num_tokens_per_local_experts,
         num_tokens_per_rank=num_tokens_per_rank[:world_size],
@@ -1099,4 +1187,5 @@ def dist_dispatch_routing(
         ),
         fwd_gather_ptrs=fwd_gather_ptrs,
         scatter_ptrs=scatter_ptrs,
+        unpadded=unpadded,
     )

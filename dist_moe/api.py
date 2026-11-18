@@ -587,6 +587,8 @@ class MemoryPlan:
         inference_operand_bytes: Device-resolved physical Mega inference
             operand requirement. ``None`` for VMM, non-Mega execution, or a
             plan without a resolved device/SM count.
+        compact_nvfp4_backward_activations: Whether NVFP4 training saves and
+            consumes sentinel-free dense backward activations.
     """
 
     balanced_recv_rows: int
@@ -613,6 +615,7 @@ class MemoryPlan:
     vmm_device_scratch_section_bytes: int | None
     vmm_padding_bytes: int
     inference_operand_bytes: int | None = None
+    compact_nvfp4_backward_activations: bool = False
 
     @property
     def uses_host_scratch(self) -> bool:
@@ -703,6 +706,8 @@ class MemoryPlan:
                 "  physical Mega inference operands: "
                 f"{_size(self.inference_operand_bytes)} (within device scratch)"
             )
+        if self.compact_nvfp4_backward_activations:
+            lines.append("  NVFP4 backward activations: sentinel-free BF16 saved state")
         if self.vmm_granularity_bytes is not None:
             assert self.vmm_device_prefix_bytes is not None
             assert self.vmm_host_section_bytes is not None
@@ -1040,6 +1045,35 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
             )
         else:
             selected_slot_bytes = minimum_slot_bytes
+        compact_nvfp4_backward_activations = False
+        if config.vmm is None and model_config.save_dequantized_activations:
+            compact_model_config = dataclasses.replace(
+                model_config,
+                compact_dequantized_activations=True,
+            )
+            compact_balanced_slot_bytes = _align_memory(
+                config.max_moe_layers_per_activation_slot
+                * compact_model_config.full_saved_act_mem_size(1.0)
+            )
+            compact_maximum_slot_bytes = _align_memory(
+                config.max_moe_layers_per_activation_slot
+                * compact_model_config.full_saved_act_mem_size(total_factor)
+            )
+            if selected_slot_bytes >= compact_maximum_slot_bytes:
+                compact_nvfp4_backward_activations = True
+                balanced_full_save_slot_bytes = compact_balanced_slot_bytes
+                maximum_useful_slot_bytes = compact_maximum_slot_bytes
+                if config.activation_slot_capacity_factor is not None:
+                    optional_balanced_bytes = (
+                        balanced_full_save_slot_bytes - minimum_slot_bytes
+                    )
+                    selected_slot_bytes = _align_memory(
+                        minimum_slot_bytes
+                        + math.ceil(
+                            config.activation_slot_capacity_factor
+                            * optional_balanced_bytes
+                        )
+                    )
         if selected_slot_bytes > maximum_useful_slot_bytes:
             logger.warning(
                 "activation_slot_bytes=%d exceeds the maximum useful %d bytes "
@@ -1049,7 +1083,7 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
             )
         if (
             config.vmm is None
-            and model_config.save_dequantized_activations
+            and compact_nvfp4_backward_activations
             and selected_slot_bytes >= maximum_useful_slot_bytes
         ):
             # This slot can retain every layer at the device routing capacity,
@@ -1087,6 +1121,9 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
         vmm_device_scratch_section_bytes=None,
         vmm_padding_bytes=0,
         inference_operand_bytes=inference_operand_bytes,
+        compact_nvfp4_backward_activations=(
+            False if config.inference else compact_nvfp4_backward_activations
+        ),
     )
     if config.vmm is not None and host_scratch > 0 and device is not None:
         return _resolve_vmm_physical_plan(plan, _resolve_cuda_device(device))
@@ -1726,7 +1763,10 @@ def create_context(  # noqa: C901
             inference_mode=config.inference,
         )
     activation_buffer.scratch_capacity_factor = plan.total_scratch_capacity_factor
-    activation_buffer.model_config = _model_config(config, ep_size=world_size)
+    activation_buffer.model_config = dataclasses.replace(
+        _model_config(config, ep_size=world_size),
+        compact_dequantized_activations=(plan.compact_nvfp4_backward_activations),
+    )
     if plan.inference_operand_bytes is not None:
         # Static inference views reserve scratch without invoking the offset
         # planner. Reset must retain that reservation in its peak accounting.
@@ -2353,6 +2393,8 @@ class _Bf16Autograd(torch.autograd.Function):
             native_swiglu_bwd_col_multiple,
         )
 
+        backward_adapter = getattr(ctx, "bf16_backward_adapter", None)
+
         # 2. Rebuild typed plan views from saved scalar offsets, then let the
         # device planner choose saved versus recomputed intermediates without
         # changing the captured launch topology.
@@ -2372,6 +2414,22 @@ class _Bf16Autograd(torch.autograd.Function):
             forward_plan=forward_plan,
             buffer_status=activation_buffer,
             model_config=ctx.model_config,
+            padded_num_recv_tokens=(
+                backward_adapter.padded_num_recv_rows_1
+                if (
+                    backward_adapter is not None
+                    and backward_adapter.uses_unpadded_backward
+                )
+                else None
+            ),
+            padded_num_recv_tokens_per_rank=(
+                backward_adapter.padded_num_recv_rows_per_rank_R
+                if (
+                    backward_adapter is not None
+                    and backward_adapter.uses_unpadded_backward
+                )
+                else None
+            ),
         )
         estimated_num_recv_rows = max(1, num_local_input_tokens * context.top_k)
         fprop_config = _bf16_compute_config(
@@ -2390,8 +2448,6 @@ class _Bf16Autograd(torch.autograd.Function):
             num_groups=w13_EFD.shape[0],
         )
         assert fprop_config is not None and wgrad_config is not None
-        backward_adapter = getattr(ctx, "bf16_backward_adapter", None)
-
         # 3. Recompute H1/H3 only when needed. H2 is always transient scratch,
         # so its activation kernel runs even when H1 was saved. Block-scaled
         # forward formats may provide a narrow adapter that recreates these
@@ -2535,7 +2591,10 @@ class _Bf16Autograd(torch.autograd.Function):
                 dx=backward_plan.grad_h2_offset,
                 dy_gathered=backward_plan.grad_h3_gathered_offset,
                 config=fprop_config,
-                has_padding_sentinels=backward_adapter is not None,
+                has_padding_sentinels=(
+                    backward_adapter is not None
+                    and not backward_adapter.uses_unpadded_backward
+                ),
             )
             del w2_dgrad_EDF
 
@@ -2600,7 +2659,10 @@ class _Bf16Autograd(torch.autograd.Function):
                     swiglu_clamped=config.activation == "swiglu_clamped",
                     swiglu_alpha=config.swiglu_alpha,
                     swiglu_limit=config.swiglu_limit,
-                    has_padding_sentinels=backward_adapter is not None,
+                    has_padding_sentinels=(
+                        backward_adapter is not None
+                        and not backward_adapter.uses_unpadded_backward
+                    ),
                 )
             else:
                 swiglu_bwd(
@@ -2627,7 +2689,10 @@ class _Bf16Autograd(torch.autograd.Function):
                     num_sms=config.num_sms,
                     activation_buffer=activation_buffer.buffer,
                     config=fprop_config,
-                    has_padding_sentinels=backward_adapter is not None,
+                    has_padding_sentinels=(
+                        backward_adapter is not None
+                        and not backward_adapter.uses_unpadded_backward
+                    ),
                 )
             del w13_dgrad_EFD
             grad_x_TKD = grad_x_TKD.view(-1, context.hidden_dim)[

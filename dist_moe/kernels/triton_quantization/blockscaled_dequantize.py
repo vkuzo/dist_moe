@@ -25,6 +25,8 @@ _ACTIVATION_DEQUANT_BLOCK_Q_SIZE = 2048
 _ACTIVATION_DEQUANT_NUM_WARPS = 8
 _WEIGHT_DEQUANT_BLOCK_Q_SIZE = 1024
 _WEIGHT_DEQUANT_NUM_WARPS = 4
+_BF16_ROW_COPY_BLOCK_WORDS = 1024
+_BF16_ROW_COPY_PROGRAMS_PER_EXPERT = 64
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ATOM = tl.constexpr(CUBLAS_BLOCKED_ENTRIES_PER_ATOM)
 _TL_CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE = tl.constexpr(
     CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE
@@ -407,6 +409,273 @@ def _dequantize_nvfp4_activation_buffer_kernel(
         )
 
 
+@triton.jit
+def _routed_row_mapping(
+    row,
+    padded_counts_ptr,
+    unpadded_counts_ptr,
+    NUM_LOCAL_EXPERTS: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    EXPAND: tl.constexpr,
+):
+    """Map one row between padded and sentinel-free expert segments."""
+    experts = tl.arange(0, BLOCK_EXPERTS)
+    expert_mask = experts < NUM_LOCAL_EXPERTS
+    padded_counts = tl.load(
+        padded_counts_ptr + experts,
+        mask=expert_mask,
+        other=0,
+    ).to(tl.int64)
+    unpadded_counts = tl.load(
+        unpadded_counts_ptr + experts,
+        mask=expert_mask,
+        other=0,
+    ).to(tl.int64)
+    lookup_counts = padded_counts if EXPAND else unpadded_counts
+    lookup_ends = tl.cumsum(lookup_counts, axis=0)
+    expert = tl.sum(
+        tl.where(expert_mask, row >= lookup_ends, False).to(tl.int32),
+        axis=0,
+    )
+    expert_before = experts < expert
+    lookup_start = tl.sum(
+        tl.where(expert_before, lookup_counts, 0),
+        axis=0,
+    )
+    padded_start = tl.sum(
+        tl.where(expert_before, padded_counts, 0),
+        axis=0,
+    )
+    unpadded_start = tl.sum(
+        tl.where(expert_before, unpadded_counts, 0),
+        axis=0,
+    )
+    within_expert = row - lookup_start
+    actual_count = tl.sum(
+        tl.where(experts == expert, unpadded_counts, 0),
+        axis=0,
+    )
+    if EXPAND:
+        source_row = unpadded_start + within_expert
+        destination_row = row
+        valid_value = within_expert < actual_count
+    else:
+        source_row = padded_start + within_expert
+        destination_row = row
+        valid_value = True
+    return source_row, destination_row, valid_value
+
+
+@triton.jit
+def _copy_routed_bf16_rows_kernel(
+    activation_buffer_ptr,
+    source_offset_ptr,
+    destination_offset_ptr,
+    padded_counts_ptr,
+    unpadded_counts_ptr,
+    num_source_rows_ptr,
+    num_destination_rows_ptr,
+    condition_ptr,
+    N_COLS: tl.constexpr,
+    NUM_LOCAL_EXPERTS: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_WORDS: tl.constexpr,
+    EXPAND: tl.constexpr,
+    EXECUTE_WHEN_ZERO: tl.constexpr,
+):
+    """Copy BF16 rows between padded and sentinel-free expert layouts."""
+    condition = tl.load(condition_ptr, eviction_policy="evict_last")
+    should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
+    if not should_execute:
+        return
+
+    num_source_rows = tl.load(
+        num_source_rows_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    num_destination_rows = tl.load(
+        num_destination_rows_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    if num_source_rows == num_destination_rows:
+        return
+    experts = tl.arange(0, BLOCK_EXPERTS)
+    expert_mask = experts < NUM_LOCAL_EXPERTS
+    padded_counts = tl.load(
+        padded_counts_ptr + experts,
+        mask=expert_mask,
+        other=0,
+    ).to(tl.int64)
+    unpadded_counts = tl.load(
+        unpadded_counts_ptr + experts,
+        mask=expert_mask,
+        other=0,
+    )
+    expert = tl.program_id(0)
+    expert_before = experts < expert
+    padded_start = tl.sum(
+        tl.where(expert_before, padded_counts, 0),
+        axis=0,
+    )
+    unpadded_start = tl.sum(
+        tl.where(expert_before, unpadded_counts, 0),
+        axis=0,
+    )
+    actual_count = tl.sum(
+        tl.where(experts == expert, unpadded_counts, 0),
+        axis=0,
+    )
+    padded_count = tl.sum(
+        tl.where(experts == expert, padded_counts, 0),
+        axis=0,
+    )
+    rows_to_copy = padded_count if EXPAND else actual_count
+    source_start = unpadded_start if EXPAND else padded_start
+    destination_start = padded_start if EXPAND else unpadded_start
+
+    source_offset = tl.load(
+        source_offset_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    destination_offset = tl.load(
+        destination_offset_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    source = (activation_buffer_ptr + source_offset).to(tl.pointer_type(tl.uint32))
+    destination = (activation_buffer_ptr + destination_offset).to(
+        tl.pointer_type(tl.uint32)
+    )
+    words_per_row: tl.constexpr = N_COLS // 2
+    word_lanes = tl.arange(0, BLOCK_WORDS)
+    row_in_expert = tl.program_id(1).to(tl.int64)
+    while row_in_expert < rows_to_copy:
+        source_row = source_start + row_in_expert
+        destination_row = destination_start + row_in_expert
+        valid_value = (not EXPAND) or row_in_expert < actual_count
+        valid_value &= source_row < num_source_rows
+        valid_destination = destination_row < num_destination_rows
+        for block_start in tl.static_range(0, words_per_row, BLOCK_WORDS):
+            words = block_start + word_lanes
+            word_mask = words < words_per_row
+            values = tl.load(
+                source + source_row * words_per_row + words,
+                mask=word_mask & valid_value,
+                other=0,
+            )
+            tl.store(
+                destination + destination_row * words_per_row + words,
+                values,
+                mask=word_mask & valid_destination,
+            )
+        row_in_expert += tl.num_programs(1)
+
+
+@triton.jit
+def _dequantize_compact_nvfp4_activation_buffer_kernel(
+    activation_buffer_ptr,
+    qdata_offset_ptr,
+    scale_offset_ptr,
+    padded_counts_ptr,
+    unpadded_counts_ptr,
+    padded_num_rows_ptr,
+    unpadded_num_rows_ptr,
+    output_offset_ptr,
+    condition_ptr,
+    N_COLS: tl.constexpr,
+    NUM_LOCAL_EXPERTS: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    EXECUTE_WHEN_ZERO: tl.constexpr,
+    EXECUTE_UNCONDITIONALLY: tl.constexpr,
+    ROW_SCALE_STORAGE_MULTIPLE: tl.constexpr,
+    BLOCK_Q_SIZE: tl.constexpr,
+):
+    """Decode padded NVFP4 rows into sentinel-free BF16 expert segments."""
+    if not EXECUTE_UNCONDITIONALLY:
+        condition = tl.load(condition_ptr, eviction_policy="evict_last")
+        should_execute = condition == 0 if EXECUTE_WHEN_ZERO else condition != 0
+        if not should_execute:
+            return
+
+    output_row = tl.program_id(0).to(tl.int64)
+    unpadded_num_rows = tl.load(
+        unpadded_num_rows_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    if output_row >= unpadded_num_rows:
+        return
+    padded_num_rows = tl.load(
+        padded_num_rows_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    source_row, _, _ = _routed_row_mapping(
+        output_row,
+        padded_counts_ptr,
+        unpadded_counts_ptr,
+        NUM_LOCAL_EXPERTS=NUM_LOCAL_EXPERTS,
+        BLOCK_EXPERTS=BLOCK_EXPERTS,
+        EXPAND=False,
+    )
+
+    qdata_offset = tl.load(qdata_offset_ptr, eviction_policy="evict_last").to(tl.int64)
+    scale_offset = tl.load(scale_offset_ptr, eviction_policy="evict_last").to(tl.int64)
+    qdata = (activation_buffer_ptr + qdata_offset).to(tl.pointer_type(tl.uint8))
+    scales = (activation_buffer_ptr + scale_offset).to(tl.pointer_type(tl.uint8))
+    scale_cols: tl.constexpr = N_COLS // 16
+    n_col_blocks = (scale_cols + _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM - 1) // (
+        _TL_CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
+    )
+    global_scale_offset = (
+        scale_offset + padded_num_rows * ROW_SCALE_STORAGE_MULTIPLE * scale_cols
+    )
+    global_scale_inv = tl.load(
+        (activation_buffer_ptr + global_scale_offset).to(tl.pointer_type(tl.float32))
+        + source_row,
+    ).to(tl.float32)
+
+    output_offset = tl.load(
+        output_offset_ptr,
+        eviction_policy="evict_last",
+    ).to(tl.int64)
+    output = (activation_buffer_ptr + output_offset).to(tl.pointer_type(tl.uint32))
+    q_cols: tl.constexpr = N_COLS // 2
+    num_q_blocks: tl.constexpr = triton.cdiv(q_cols, BLOCK_Q_SIZE)
+    q_lanes = tl.arange(0, BLOCK_Q_SIZE)
+    scale_lanes = tl.arange(0, BLOCK_Q_SIZE // 8)
+    for block_idx in tl.static_range(0, num_q_blocks):
+        q_cols_in_block = block_idx * BLOCK_Q_SIZE + q_lanes
+        valid_q = q_cols_in_block < q_cols
+        packed = tl.load(
+            qdata + source_row * q_cols + q_cols_in_block.to(tl.int64),
+            mask=valid_q,
+            other=0,
+        )
+        scale_cols_in_block = block_idx * (BLOCK_Q_SIZE // 8) + scale_lanes
+        inner_scale = tl.load(
+            scales
+            + _cublas_blocked_scale_offset(
+                source_row,
+                scale_cols_in_block,
+                n_col_blocks,
+            ).to(tl.int64),
+            mask=scale_cols_in_block < scale_cols,
+            other=0,
+        )
+        scale_per_q = tl.broadcast_to(
+            inner_scale[:, None],
+            (BLOCK_Q_SIZE // 8, 8),
+        ).reshape((BLOCK_Q_SIZE,))
+        decoded = _decode_scaled_nvfp4x2_to_bf16x2(
+            packed,
+            scale_per_q,
+            global_scale_inv,
+        )
+        tl.store(
+            output + output_row * q_cols + q_cols_in_block.to(tl.int64),
+            decoded,
+            mask=valid_q,
+        )
+
+
 def dequantize_nvfp4_weight(
     qdata: torch.Tensor,
     scale: torch.Tensor,
@@ -578,6 +847,124 @@ def dequantize_nvfp4_activation_buffer_to_activation_buffer(
         output_offset,
         condition,
         N_COLS=n_cols,
+        EXECUTE_WHEN_ZERO=execute_when_zero,
+        EXECUTE_UNCONDITIONALLY=execute_unconditionally,
+        ROW_SCALE_STORAGE_MULTIPLE=row_scale_storage_multiple,
+        BLOCK_Q_SIZE=_ACTIVATION_DEQUANT_BLOCK_Q_SIZE,
+        num_warps=_ACTIVATION_DEQUANT_NUM_WARPS,
+    )
+
+
+def copy_routed_bf16_activation_buffer_rows(
+    activation_buffer: torch.Tensor,
+    source_offset: torch.Tensor,
+    destination_offset: torch.Tensor,
+    padded_counts: torch.Tensor,
+    unpadded_counts: torch.Tensor,
+    num_source_rows: torch.Tensor,
+    num_destination_rows: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    destination_capacity_rows: int,
+    n_cols: int,
+    expand: bool,
+    execute_when_zero: bool,
+) -> None:
+    """Copy BF16 expert rows between padded and sentinel-free layouts.
+
+    Args:
+        activation_buffer: Planner-owned byte-addressed allocation.
+        source_offset: Source byte-offset device scalar.
+        destination_offset: Destination byte-offset device scalar.
+        padded_counts: Per-expert counts including sentinels.
+        unpadded_counts: Per-expert real-row counts.
+        num_source_rows: Source-row count device scalar.
+        num_destination_rows: Destination-row count device scalar.
+        condition: Device predicate for the copy.
+        destination_capacity_rows: Static graph-stable launch capacity.
+        n_cols: BF16 values per row.
+        expand: Whether compact rows are expanded and padding is zeroed.
+        execute_when_zero: Whether a zero predicate executes the copy.
+    """
+    if destination_capacity_rows == 0 or n_cols == 0:
+        return
+    _copy_routed_bf16_rows_kernel[
+        (
+            padded_counts.numel(),
+            min(
+                destination_capacity_rows,
+                _BF16_ROW_COPY_PROGRAMS_PER_EXPERT,
+            ),
+        )
+    ](
+        activation_buffer,
+        source_offset,
+        destination_offset,
+        padded_counts,
+        unpadded_counts,
+        num_source_rows,
+        num_destination_rows,
+        condition,
+        N_COLS=n_cols,
+        NUM_LOCAL_EXPERTS=padded_counts.numel(),
+        BLOCK_EXPERTS=triton.next_power_of_2(padded_counts.numel()),
+        BLOCK_WORDS=_BF16_ROW_COPY_BLOCK_WORDS,
+        EXPAND=expand,
+        EXECUTE_WHEN_ZERO=execute_when_zero,
+        num_warps=4,
+    )
+
+
+def dequantize_compact_nvfp4_activation_buffer_to_activation_buffer(
+    activation_buffer: torch.Tensor,
+    qdata_offset: torch.Tensor,
+    scale_offset: torch.Tensor,
+    padded_counts: torch.Tensor,
+    unpadded_counts: torch.Tensor,
+    padded_num_rows: torch.Tensor,
+    unpadded_num_rows: torch.Tensor,
+    output_offset: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    unpadded_capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool,
+    execute_unconditionally: bool,
+    row_scale_storage_multiple: int,
+) -> None:
+    """Decode padded NVFP4 rows into sentinel-free BF16 storage.
+
+    Args:
+        activation_buffer: Planner-owned byte-addressed allocation.
+        qdata_offset: Packed E2M1 source byte-offset device scalar.
+        scale_offset: Block-scale source byte-offset device scalar.
+        padded_counts: Per-expert counts including sentinels.
+        unpadded_counts: Per-expert real-row counts.
+        padded_num_rows: Total padded-row device scalar.
+        unpadded_num_rows: Total real-row device scalar.
+        output_offset: Compact BF16 destination byte-offset device scalar.
+        condition: Device predicate for the decode.
+        unpadded_capacity_rows: Static graph-stable destination capacity.
+        n_cols: Logical values per row.
+        execute_when_zero: Whether a zero predicate executes the decode.
+        execute_unconditionally: Whether the predicate is ignored.
+        row_scale_storage_multiple: Physical blocked-scale row multiplier.
+    """
+    if unpadded_capacity_rows == 0 or n_cols == 0:
+        return
+    _dequantize_compact_nvfp4_activation_buffer_kernel[(unpadded_capacity_rows,)](
+        activation_buffer,
+        qdata_offset,
+        scale_offset,
+        padded_counts,
+        unpadded_counts,
+        padded_num_rows,
+        unpadded_num_rows,
+        output_offset,
+        condition,
+        N_COLS=n_cols,
+        NUM_LOCAL_EXPERTS=padded_counts.numel(),
+        BLOCK_EXPERTS=triton.next_power_of_2(padded_counts.numel()),
         EXECUTE_WHEN_ZERO=execute_when_zero,
         EXECUTE_UNCONDITIONALLY=execute_unconditionally,
         ROW_SCALE_STORAGE_MULTIPLE=row_scale_storage_multiple,

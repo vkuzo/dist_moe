@@ -1234,6 +1234,10 @@ class ModelConfig:
     # Unlike native_backward, H2's quantized activation bundle does not survive
     # forward.
     save_dequantized_activations: bool = False
+    # Save the dense NVFP4 backward operands without the forward-only
+    # per-expert sentinel rows. This is enabled only when the selected slot
+    # guarantees that recompute is unreachable.
+    compact_dequantized_activations: bool = False
     # Interleaved FC13 consumes its epilogue output directly and therefore does
     # not materialize dense h1. This inference-only layout requires Mega.
     interleaved_fc13: bool = False
@@ -1264,6 +1268,13 @@ class ModelConfig:
             )
         if self.save_dequantized_activations and self.interleaved_fc13:
             raise ValueError("BF16 backward activation saving requires materialized H1")
+        if self.compact_dequantized_activations and not (
+            self.save_dequantized_activations and storage is not None
+        ):
+            raise ValueError(
+                "compact_dequantized_activations requires dense block-scaled "
+                "backward activation saving"
+            )
         if storage is None:
             return
         self._validate_blockscaled_storage(storage)
@@ -1484,6 +1495,26 @@ class ModelConfig:
                 self.num_tokens * self.topk * self.hidden_dim * self.element_size
             )
             return x_gathered_size + h1_size + h3_size
+
+    def full_saved_act_mem_size(self, imbalance_factor: float) -> int:
+        """Return one layer's full saved state at an imbalance factor.
+
+        NVFP4 forward kernels retain their independently padded row capacity,
+        but the BF16 backward state drops those sentinel rows. Other execution
+        modes use the same row count for compute and saved state.
+
+        Args:
+            imbalance_factor: Receive capacity relative to balanced routing.
+
+        Returns:
+            Full-save bytes for one layer.
+        """
+        rows = (
+            self._max_unpadded_recv_tokens(imbalance_factor)
+            if self.compact_dequantized_activations
+            else self._max_recv_tokens(imbalance_factor)
+        )
+        return self.saved_act_mem_size(rows, recompute=False)
 
     def _blockscaled_row_scratch_size(
         self, num_recv_tokens: int, recompute: bool
@@ -1876,6 +1907,30 @@ class ModelConfig:
             max_num_recv_tokens=self.max_num_recv_tokens,
         )
 
+    @functools.cached_property
+    def max_unpadded_recv_tokens(self) -> int:
+        """Return the sentinel-free receive capacity at configured imbalance."""
+        return self._max_unpadded_recv_tokens(self.max_imbalance_factor)
+
+    def _max_unpadded_recv_tokens(self, imbalance_factor: float) -> int:
+        """Return a topology-clamped receive capacity without expert padding.
+
+        Args:
+            imbalance_factor: Capacity relative to balanced routed rows.
+
+        Returns:
+            Maximum number of real received rows.
+        """
+        return _plan_max_recv_tokens(
+            num_tokens=self.num_tokens,
+            topk=self.topk,
+            imbalance_factor=imbalance_factor,
+            num_local_experts=self.num_local_experts,
+            routing_world_size=self.routing_world_size,
+            routing_m_multiple_of=None,
+            max_num_recv_tokens=self.max_num_recv_tokens,
+        )
+
     def host_scratch_mem_size(self, effective_imbalance: float) -> int:
         """Calculate host scratch memory size for VMM layout.
 
@@ -1961,8 +2016,7 @@ class ModelConfig:
         """
         if num_activation_slots == 0:
             return self.inference_scratch_mem_size
-        recv_tokens = self.max_recv_tokens
-        saved_full_per_layer = self.saved_act_mem_size(recv_tokens, recompute=False)
+        saved_full_per_layer = self.full_saved_act_mem_size(self.max_imbalance_factor)
         return (
             num_activation_slots * self.num_moe_layers * saved_full_per_layer
             + self.scratch_mem_size
@@ -1993,6 +2047,13 @@ def validate_buffer_capacity(
         ValueError: If buffer_size < min_buffer_size.
     """
     min_size = model_config.min_buffer_size(num_activation_slots=num_activation_slots)
+    if model_config.compact_dequantized_activations and num_activation_slots > 0:
+        min_size = (
+            num_activation_slots
+            * model_config.num_moe_layers
+            * model_config.saved_act_mem_size(0, recompute=True)
+            + model_config.saved_bf16_x_scratch_mem_size
+        )
     if buffer_size < min_size:
         if num_activation_slots == 0:
             raise ValueError(
@@ -2012,7 +2073,11 @@ def validate_buffer_capacity(
         )
     if num_activation_slots == 0:
         return
-    scratch_mem_size = model_config.scratch_mem_size
+    scratch_mem_size = (
+        model_config.saved_bf16_x_scratch_mem_size
+        if model_config.compact_dequantized_activations
+        else model_config.scratch_mem_size
+    )
     activation_slot_bytes = (
         (buffer_size - scratch_mem_size)
         // num_activation_slots
@@ -2244,6 +2309,8 @@ class BackwardPlan:
 def _get_blockscaled_forward_plan(
     num_recv_tokens: torch.Tensor,
     num_recv_tokens_per_rank: torch.Tensor,
+    unpadded_num_recv_tokens: torch.Tensor | None,
+    unpadded_num_recv_tokens_per_rank: torch.Tensor | None,
     num_recv_tokens_per_rank_snapshot: torch.Tensor | None,
     buffer_status: ActivationBuffer,
     model_config: ModelConfig,
@@ -2261,6 +2328,8 @@ def _get_blockscaled_forward_plan(
     Args:
         num_recv_tokens: Device scalar containing capacity-padded received rows.
         num_recv_tokens_per_rank: Received rows from each expert-parallel rank.
+        unpadded_num_recv_tokens: Optional sentinel-free received-row count.
+        unpadded_num_recv_tokens_per_rank: Optional sentinel-free per-rank counts.
         num_recv_tokens_per_rank_snapshot: Optional independent saved row counts.
         buffer_status: Mutable activation-buffer state.
         model_config: Static planner model geometry.
@@ -2289,9 +2358,14 @@ def _get_blockscaled_forward_plan(
         device=device,
     )
     N = buffer_status.num_activation_slots
+    if model_config.compact_dequantized_activations:
+        assert unpadded_num_recv_tokens is not None
+        assert unpadded_num_recv_tokens_per_rank is not None
     _triton_get_blockscaled_forward_plan[(1,)](
         num_recv_tokens_ptr=num_recv_tokens,
         num_recv_tokens_per_rank_ptr=num_recv_tokens_per_rank,
+        unpadded_num_recv_tokens_ptr=unpadded_num_recv_tokens,
+        unpadded_num_recv_tokens_per_rank_ptr=unpadded_num_recv_tokens_per_rank,
         num_recv_tokens_per_rank_snapshot_ptr=num_recv_tokens_per_rank_snapshot,
         saved_activation_bytes_per_rank_ptr=buffer_status.saved_activation_bytes_per_rank,
         buffer_offsets_ptr=buffer_status.buffer_offsets,
@@ -2313,6 +2387,7 @@ def _get_blockscaled_forward_plan(
         hidden_dim=model_config.hidden_dim,
         intermediate_dim=model_config.intermediate_dim,
         capacity_rows=model_config.max_recv_tokens,
+        unpadded_capacity_rows=model_config.max_unpadded_recv_tokens,
         microbatch_id_ptr=activation_slot_id_1,
         activation_slot_bytes=buffer_status.activation_slot_bytes,
         num_activation_slots=N,
@@ -2323,6 +2398,7 @@ def _get_blockscaled_forward_plan(
         scratch_only=scratch_only,
         native_backward=model_config.native_backward,
         save_dequantized_activations=model_config.save_dequantized_activations,
+        compact_dequantized_activations=(model_config.compact_dequantized_activations),
         interleaved_fc13=model_config.interleaved_fc13,
     )
     # Unpack in the same order the kernel stores into fwd_offsets_ptr.
@@ -2360,6 +2436,8 @@ def _get_blockscaled_forward_plan(
 def _get_blockscaled_backward_plan(
     num_recv_tokens: torch.Tensor,
     num_recv_tokens_per_rank: torch.Tensor,
+    padded_num_recv_tokens: torch.Tensor | None,
+    padded_num_recv_tokens_per_rank: torch.Tensor | None,
     forward_plan: ForwardPlan,
     buffer_status: ActivationBuffer,
     model_config: ModelConfig,
@@ -2374,6 +2452,8 @@ def _get_blockscaled_backward_plan(
     Args:
         num_recv_tokens: Device scalar containing capacity-padded received rows.
         num_recv_tokens_per_rank: Received rows from each expert-parallel rank.
+        padded_num_recv_tokens: Optional padded count for NVFP4 recomputation.
+        padded_num_recv_tokens_per_rank: Optional padded per-rank counts.
         forward_plan: Matching forward plan and saved offsets.
         buffer_status: Mutable activation-buffer state.
         model_config: Static planner model geometry.
@@ -2395,9 +2475,14 @@ def _get_blockscaled_backward_plan(
         device=buffer_status.buffer_offsets.device,
     )
     N = buffer_status.num_activation_slots
+    if model_config.compact_dequantized_activations:
+        assert padded_num_recv_tokens is not None
+        assert padded_num_recv_tokens_per_rank is not None
     _triton_get_blockscaled_backward_plan[(1,)](
         num_recv_tokens_ptr=num_recv_tokens,
         num_recv_tokens_per_rank_ptr=num_recv_tokens_per_rank,
+        padded_num_recv_tokens_ptr=padded_num_recv_tokens,
+        padded_num_recv_tokens_per_rank_ptr=padded_num_recv_tokens_per_rank,
         buffer_offsets_ptr=buffer_status.buffer_offsets,
         peak_min_free_space_ptr=buffer_status.peak_min_free_space,
         need_recompute_ptr=forward_plan.need_recompute,
@@ -2424,6 +2509,7 @@ def _get_blockscaled_backward_plan(
         hidden_dim=model_config.hidden_dim,
         intermediate_dim=model_config.intermediate_dim,
         capacity_rows=model_config.max_recv_tokens,
+        unpadded_capacity_rows=model_config.max_unpadded_recv_tokens,
         microbatch_id_ptr=forward_plan.activation_slot_id_1,
         activation_slot_bytes=buffer_status.activation_slot_bytes,
         num_activation_slots=N,
@@ -2431,6 +2517,7 @@ def _get_blockscaled_backward_plan(
         mega=model_config.mega,
         native_backward=model_config.native_backward,
         save_dequantized_activations=model_config.save_dequantized_activations,
+        compact_dequantized_activations=(model_config.compact_dequantized_activations),
     )
     # Chunks are ordered as the kernel stores them into bwd_offsets_ptr. The
     # BF16-backward adapter populates every dense slot for the shared gradient
@@ -2464,6 +2551,8 @@ def get_forward_plan(
     inference_mode: bool = False,
     num_recv_tokens_per_rank_snapshot: torch.Tensor | None = None,
     scratch_only: bool = False,
+    unpadded_num_recv_tokens: torch.Tensor | None = None,
+    unpadded_num_recv_tokens_per_rank: torch.Tensor | None = None,
 ) -> ForwardPlan:
     """Create a forward execution plan for distributed MoE layer.
 
@@ -2473,7 +2562,7 @@ def get_forward_plan(
     - Saved activations allocated front to back:
       - Recompute mode: x
       - No-recompute mode: x_gathered, h1, h3_saved. The NVFP4 BF16-backward
-        adapter stores x_gathered as packed qdata and scales.
+        adapter stores Q-DQ BF16 x_gathered.
     - Temporary activations (h2, or all if recomputing) allocated back to front
 
     Args:
@@ -2497,6 +2586,10 @@ def get_forward_plan(
             per-rank counts consumed by the corresponding backward pass.
         scratch_only: If True, use shared scratch without changing saved-state
             pointers because no backward can consume this forward.
+        unpadded_num_recv_tokens: Optional exact received-row count for compact
+            NVFP4 backward state.
+        unpadded_num_recv_tokens_per_rank: Optional matching exact per-rank
+            received-row counts.
 
     Returns:
         ForwardPlan with the recompute decision and memory offsets. BF16 packs
@@ -2541,6 +2634,8 @@ def get_forward_plan(
         return _get_blockscaled_forward_plan(
             num_recv_tokens,
             num_recv_tokens_per_rank,
+            unpadded_num_recv_tokens,
+            unpadded_num_recv_tokens_per_rank,
             num_recv_tokens_per_rank_snapshot,
             buffer_status,
             model_config,
@@ -2623,6 +2718,8 @@ def get_backward_plan(
     forward_plan: ForwardPlan,
     buffer_status: ActivationBuffer,
     model_config: ModelConfig,
+    padded_num_recv_tokens: torch.Tensor | None = None,
+    padded_num_recv_tokens_per_rank: torch.Tensor | None = None,
 ) -> BackwardPlan:
     """Create a backward execution plan for distributed MoE layer.
 
@@ -2646,7 +2743,8 @@ def get_backward_plan(
 
     Args:
         num_recv_tokens: Tensor [1] containing rows received in this backward pass.
-            With block-scaled routing this includes per-expert padding.
+            Compact NVFP4 backward supplies exact rows; other block-scaled
+            paths include per-expert padding.
         num_recv_tokens_per_rank: Tensor [EP] containing the number of tokens
             routed to each rank in this backward pass.
         forward_plan: ForwardPlan from the corresponding forward pass,
@@ -2655,6 +2753,11 @@ def get_backward_plan(
             and number of tokens saved from each rank. Modified in place.
         model_config: ModelConfig containing element_size, hidden_dim,
             intermediate_dim, and other parameters needed for memory calculations.
+        padded_num_recv_tokens: Optional original padded received-row count
+            needed to rematerialize NVFP4 H2 for compact BF16 backward.
+        padded_num_recv_tokens_per_rank: Optional matching padded per-rank
+            received-row counts.
+
     Returns:
         BackwardPlan with memory offsets for all backward pass tensors.
         buffer_status is updated in place with new buffer_offsets and
@@ -2667,6 +2770,8 @@ def get_backward_plan(
         return _get_blockscaled_backward_plan(
             num_recv_tokens,
             num_recv_tokens_per_rank,
+            padded_num_recv_tokens,
+            padded_num_recv_tokens_per_rank,
             forward_plan,
             buffer_status,
             model_config,

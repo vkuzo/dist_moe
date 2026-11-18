@@ -695,6 +695,9 @@ def _triton_dispatch_routing_prefix(
     token_cnts_ptr,
     num_tokens_per_rank_ptr,
     compact_offsets_ptr,
+    unpadded_token_cnts_ptr,
+    unpadded_num_tokens_per_rank_ptr,
+    unpadded_compact_offsets_ptr,
     world_size: tl.constexpr,
     num_experts: tl.constexpr,
     num_workers: tl.constexpr,
@@ -704,6 +707,8 @@ def _triton_dispatch_routing_prefix(
     m_multiple_of: tl.constexpr = 0,
     max_num_recv_tokens=0,
     has_max_num_recv_tokens: tl.constexpr = False,
+    max_unpadded_num_recv_tokens=0,
+    has_max_unpadded_num_recv_tokens: tl.constexpr = False,
 ):
     """Compute compacted output offsets and token counts in one CTA.
 
@@ -753,7 +758,20 @@ def _triton_dispatch_routing_prefix(
             total_stored_tokens,
             max_num_recv_tokens,
         )
+    if has_max_unpadded_num_recv_tokens:
+        total_tokens = tl.sum(tl.where(el_mask, expert_counts, 0).to(tl.int64))
+        _device_trap_if(
+            total_tokens > max_unpadded_num_recv_tokens,
+            total_tokens,
+            max_unpadded_num_recv_tokens,
+        )
     tl.store(token_cnts_ptr + block_local_experts, stored_counts, mask=el_mask)
+    if unpadded_token_cnts_ptr is not None:
+        tl.store(
+            unpadded_token_cnts_ptr + block_local_experts,
+            expert_counts,
+            mask=el_mask,
+        )
 
     rank_expert_counts = tl.load(
         num_tokens_per_rank_ptr
@@ -762,12 +780,18 @@ def _triton_dispatch_routing_prefix(
         mask=el_mask[None, :],
         other=0,
     )
+    exact_rank_expert_counts = rank_expert_counts
     if m_multiple_of > 0:
         rank_expert_counts = tl.cdiv(rank_expert_counts, m_multiple_of) * m_multiple_of
     tl.store(
         num_tokens_per_rank_ptr + block_ranks,
         tl.sum(rank_expert_counts, axis=1),
     )
+    if unpadded_num_tokens_per_rank_ptr is not None:
+        tl.store(
+            unpadded_num_tokens_per_rank_ptr + block_ranks,
+            tl.sum(exact_rank_expert_counts, axis=1),
+        )
 
     expert_prefix = tl.cumsum(stored_counts, axis=0) - stored_counts
     rank_prefix = tl.cumsum(pair_counts, axis=0) - pair_counts
@@ -784,6 +808,19 @@ def _triton_dispatch_routing_prefix(
         compact_offsets,
         mask=el_mask[None, :, None],
     )
+    if unpadded_compact_offsets_ptr is not None:
+        exact_expert_prefix = tl.cumsum(expert_counts, axis=0) - expert_counts
+        exact_compact_offsets = (
+            exact_expert_prefix[None, :, None] + rank_prefix[:, :, None] + chunk_prefix
+        ).to(tl.int64)
+        tl.store(
+            unpadded_compact_offsets_ptr
+            + block_ranks[:, None, None] * num_local_experts * compact_ctas_per_pair
+            + block_local_experts[None, :, None] * compact_ctas_per_pair
+            + block_compact_ctas[None, None, :],
+            exact_compact_offsets,
+            mask=el_mask[None, :, None],
+        )
 
 
 @triton.jit(do_not_specialize=["num_tokens_per_worker"])
@@ -797,6 +834,10 @@ def _triton_dispatch_routing_combine(  # noqa: C901
     bwd_gather_ptrs_ptr,
     fwd_gather_ptrs_ptr,
     scatter_ptrs_ptr,
+    unpadded_compact_offsets_ptr,
+    unpadded_bwd_gather_ptrs_ptr,
+    unpadded_fwd_gather_ptrs_ptr,
+    unpadded_scatter_ptrs_ptr,
     world_size: tl.constexpr,
     num_experts: tl.constexpr,
     block_size_t: tl.constexpr,
@@ -875,6 +916,10 @@ def _triton_dispatch_routing_combine(  # noqa: C901
         + compact_cta_id
     )
     copy_dst_start_t = tl.load(compact_offsets_ptr + compact_offset)
+    if unpadded_compact_offsets_ptr is not None:
+        unpadded_copy_dst_start_t = tl.load(
+            unpadded_compact_offsets_ptr + compact_offset
+        )
 
     block_t = tl.arange(0, block_size_t)
     block_w = tl.arange(0, workers_per_compact_cta)
@@ -914,6 +959,18 @@ def _triton_dispatch_routing_combine(  # noqa: C901
                 eviction_policy="evict_first",
             )
             tl.store(bwd_gather_ptrs_ptr + dst_offsets, bwd_gather_vals, mask=mask_t)
+            if unpadded_bwd_gather_ptrs_ptr is not None:
+                unpadded_dst_offsets = (
+                    unpadded_copy_dst_start_t
+                    + worker_dst[:, None]
+                    - copy_dst_start_t
+                    + token_offsets
+                )
+                tl.store(
+                    unpadded_bwd_gather_ptrs_ptr + unpadded_dst_offsets,
+                    bwd_gather_vals,
+                    mask=mask_t,
+                )
 
         fwd_gather_vals = tl.load(
             per_rank_fwd_gather_ptrs_ptr + src_offsets,
@@ -922,6 +979,18 @@ def _triton_dispatch_routing_combine(  # noqa: C901
             eviction_policy="evict_first",
         )
         tl.store(fwd_gather_ptrs_ptr + dst_offsets, fwd_gather_vals, mask=mask_t)
+        if unpadded_fwd_gather_ptrs_ptr is not None:
+            unpadded_dst_offsets = (
+                unpadded_copy_dst_start_t
+                + worker_dst[:, None]
+                - copy_dst_start_t
+                + token_offsets
+            )
+            tl.store(
+                unpadded_fwd_gather_ptrs_ptr + unpadded_dst_offsets,
+                fwd_gather_vals,
+                mask=mask_t,
+            )
 
         scatter_ptrs = tl.load(
             per_rank_scatter_ptrs_ptr + src_offsets,
@@ -930,6 +999,18 @@ def _triton_dispatch_routing_combine(  # noqa: C901
             eviction_policy="evict_first",
         )
         tl.store(scatter_ptrs_ptr + dst_offsets, scatter_ptrs, mask=mask_t)
+        if unpadded_scatter_ptrs_ptr is not None:
+            unpadded_dst_offsets = (
+                unpadded_copy_dst_start_t
+                + worker_dst[:, None]
+                - copy_dst_start_t
+                + token_offsets
+            )
+            tl.store(
+                unpadded_scatter_ptrs_ptr + unpadded_dst_offsets,
+                scatter_ptrs,
+                mask=mask_t,
+            )
 
     copy_dst_start_t += tl.sum(copy_token_counts, axis=0).to(tl.int64)
 

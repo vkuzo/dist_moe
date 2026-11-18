@@ -205,20 +205,28 @@ selector or per-operand VMM mapping policy. None of these inference views
 creates saved activation state, and concat remains the default weight layout.
 
 Training always uses GPU-planned offsets. Its hybrid layout combines dense
-BF16 saved operands with packed NVFP4 row bundles. Full-save retains packed
-gathered X, H1, and H3; recompute retains local BF16 X and rebuilds packed
-gathered X in backward. Staged W13 copies canonical expert-padded X as part of
-its launch; Mega full-save follows its fused launch with a conditional packed
-gather copy into the same planner layout and an EP barrier protecting the peer
-dispatch lifetime. The row-bundle decoder converts Q(X) and Q(H2) into BF16
-backward scratch before their source storage is reused. Each packed source and
-expanding BF16 destination remain disjoint for the full kernel lifetime
-because independently scheduled decoder programs have no grid-wide ordering.
-The backward planner first publishes the selected saved or recomputed bundle,
-then one graph-stable launch decodes it. Each CTA owns one row and walks
-2,048-byte packed tiles. It loads each E2M1 byte once, loads each blocked E4M3
-scale once per 16 values, uses packed BF16x2 conversion and block-scale
-multiplication, applies the row scale in FP32, and writes one 32-bit BF16 pair.
+BF16 backward operands with transient packed NVFP4 row bundles. Full-save
+retains Q-DQ BF16 gathered X, BF16 H1, and BF16 H3; recompute retains local
+BF16 X and rebuilds gathered X and H1 in backward. Staged W13 produces
+canonical expert-padded X as part of its launch; Mega follows its fused launch
+with a conditional packed gather copy and an EP barrier protecting peer
+dispatch lifetime.
+
+When the selected non-VMM activation slot makes recompute unreachable, routing
+also emits sentinel-free counts and pointer tables. The forward decodes Q(X)
+directly from the padded row bundle into compact BF16 storage and saves H1 in
+the same compact expert order. If a call has no actual sentinel rows, the W13
+output aliases the saved H1 and both layout-copy kernels return immediately.
+Otherwise forward compacts H1 after W2 consumes the padded view, and backward
+expands it only for the NVFP4 W2 rematerialization. Q(H2) decodes directly into
+compact BF16 storage. The shared BF16 DGRAD and WGRAD kernels then consume the
+sentinel-free counts and pointers. Slots that may recompute retain the prior
+padded saved-state and backward contract.
+
+Each NVFP4 row-bundle decoder owns one output row and walks 2,048-byte packed
+tiles. It loads each E2M1 byte once, loads each blocked E4M3 scale once per 16
+values, uses packed BF16x2 conversion and block-scale multiplication, applies
+the row scale in FP32, and writes one 32-bit BF16 pair.
 
 G8 with GPU offsets requires the source high-throughput producer topology.
 Its padded allocation row bound is at least `16 * num_sms`, and the

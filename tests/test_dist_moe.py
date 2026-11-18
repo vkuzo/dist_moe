@@ -821,6 +821,7 @@ def _install_nvfp4_forward_activation_buffer(
     blockscaled_cfg = dataclasses.replace(
         blockscaled_cfg,
         save_dequantized_activations=True,
+        compact_dequantized_activations=not force_recompute,
         static_inference_storage=False,
     )
     world_size = dist.get_world_size(context.group)
@@ -903,8 +904,8 @@ def _read_saved_bf16_x(
     Returns:
         BF16 gathered rows with shape ``[num_recv_tokens, hidden_dim]``.
     """
-    num_recv_tokens = int(state[15].item())
-    output_offset = int(state[17][1].item())
+    num_recv_tokens = int(state[21].item())
+    output_offset = int(state[23][1].item())
     output_bytes = num_recv_tokens * hidden_dim * torch.bfloat16.itemsize
     return (
         activation_buffer.buffer[output_offset : output_offset + output_bytes]
@@ -1877,7 +1878,21 @@ class DistMoeConfigTest(unittest.TestCase):
             dataclasses.replace(config, activation_slot_capacity_factor=0.5),
             ep_size=2,
         )
+        compact_model_config = dataclasses.replace(
+            model_config,
+            compact_dequantized_activations=True,
+        )
 
+        self.assertTrue(full_save.compact_nvfp4_backward_activations)
+        self.assertFalse(partial_save.compact_nvfp4_backward_activations)
+        self.assertEqual(
+            full_save.activation_slot_bytes,
+            api_impl._align_memory(compact_model_config.full_saved_act_mem_size(1.0)),
+        )
+        self.assertLess(
+            full_save.activation_slot_bytes,
+            api_impl._align_memory(model_config.full_saved_act_mem_size(1.0)),
+        )
         self.assertEqual(
             full_save.device_scratch_bytes,
             api_impl._align_memory(model_config.saved_bf16_x_scratch_mem_size),
@@ -4952,20 +4967,23 @@ class DistMoeKernelTest(unittest.TestCase):
                     len(state), blockscaled_impl._BACKWARD_STATE_TENSOR_COUNT
                 )
                 self.assertTrue(all(tensor.numel() == 0 for tensor in state[:10]))
-                self.assertFalse(state[16].item())
-                offsets = state[17].tolist()
+                self.assertFalse(state[22].item())
+                offsets = state[23].tolist()
                 self.assertEqual(offsets[1], 0)
                 self.assertEqual(offsets[3], 0)
-                self.assertEqual(state[20].numel(), 0)
-                num_recv_tokens = int(state[15].item())
-                split_sizes = state[10].tolist()
+                self.assertEqual(state[26].numel(), 0)
+                padded_num_recv_tokens = int(state[15].item())
+                num_recv_tokens = int(state[21].item())
+                split_sizes = state[16].tolist()
+                self.assertEqual(sum(split_sizes), num_recv_tokens)
+                self.assertLess(num_recv_tokens, padded_num_recv_tokens)
                 storage = activation_buffer.model_config.blockscaled_storage
                 assert storage is not None
                 x_q_size, x_scale_size = storage.row_quant_sizes(
-                    num_recv_tokens,
+                    padded_num_recv_tokens,
                     x_TD.shape[1],
                 )
-                activation_offsets = state[18]
+                activation_offsets = state[24]
                 self.assertEqual(
                     int(
                         activation_offsets[
@@ -5052,18 +5070,7 @@ class DistMoeKernelTest(unittest.TestCase):
                         _cosine_similarity(actual_h1, expected_h1),
                         0.999999,
                     )
-                    self.assertEqual(
-                        torch.count_nonzero(
-                            x_q_dq_MD[cursor + active_rows : cursor + split_size]
-                        ).item(),
-                        0,
-                    )
-                    self.assertEqual(
-                        torch.count_nonzero(
-                            h1_M2F[cursor + active_rows : cursor + split_size]
-                        ).item(),
-                        0,
-                    )
+                    self.assertEqual(active_rows, split_size)
                     cursor += split_size
                 self.assertEqual(cursor, num_recv_tokens)
                 torch.testing.assert_close(
@@ -5133,9 +5140,9 @@ class DistMoeKernelTest(unittest.TestCase):
         torch.cuda.synchronize()
 
         torch.testing.assert_close(actual_TD, inference_output_TD, rtol=0, atol=0)
-        self.assertTrue(state[16].item())
+        self.assertTrue(state[22].item())
         self.assertTrue(all(tensor.numel() == 0 for tensor in state[:10]))
-        offsets = state[17].tolist()
+        offsets = state[23].tolist()
         self.assertEqual(offsets[1], 0)
         self.assertEqual(offsets[3], 0)
         self.assertEqual(offsets[4], 0)
@@ -5162,9 +5169,10 @@ class DistMoeKernelTest(unittest.TestCase):
         self.assertGreater(state[13].numel(), 0)
         self.assertEqual(state[14].shape, (1,))
         self.assertEqual(state[15].shape, (1,))
-        self.assertEqual(state[18].ndim, 1)
-        self.assertEqual(state[19].item(), 1)
-        self.assertEqual(state[20].numel(), 0)
+        self.assertTrue(all(tensor.numel() == 0 for tensor in state[16:22]))
+        self.assertEqual(state[24].ndim, 1)
+        self.assertEqual(state[25].item(), 1)
+        self.assertEqual(state[26].numel(), 0)
 
     def test_nvfp4_forward_saved_state_is_graph_visible(self) -> None:
         """Preserve Mega saved state in FakeTensor, make_fx, and capture."""
@@ -5207,7 +5215,7 @@ class DistMoeKernelTest(unittest.TestCase):
             blockscaled_impl._BACKWARD_STATE_TENSOR_COUNT,
         )
         self.assertTrue(all(tensor.numel() == 0 for tensor in fake_state[:10]))
-        self.assertEqual(fake_state[17].shape, (10,))
+        self.assertEqual(fake_state[23].shape, (10,))
 
         def run(
             x_TD: torch.Tensor,
@@ -5232,12 +5240,12 @@ class DistMoeKernelTest(unittest.TestCase):
         context.reset()
         eager_output, eager_state = run(*case_a)
         eager_output = eager_output.clone()
-        eager_need_recompute = eager_state[16].clone()
+        eager_need_recompute = eager_state[22].clone()
         context.reset()
         traced_output, traced_state = traced(*case_a)
         torch.testing.assert_close(traced_output, eager_output, rtol=0, atol=0)
         torch.testing.assert_close(
-            traced_state[16],
+            traced_state[22],
             eager_need_recompute,
             rtol=0,
             atol=0,
@@ -5254,7 +5262,7 @@ class DistMoeKernelTest(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(captured_output, eager_output, rtol=0, atol=0)
         torch.testing.assert_close(
-            captured_state[16],
+            captured_state[22],
             eager_need_recompute,
             rtol=0,
             atol=0,
@@ -8253,12 +8261,12 @@ class DistMoeTwoRankTest(unittest.TestCase):
 
     @with_comms
     def test_nvfp4_saved_bf16_x_exercises_peer_gather_paths(self) -> None:
-        """Match saved BF16 rows gathered through real two-rank peer pointers.
+        """Match compact BF16 rows gathered through real two-rank peer pointers.
 
         Every local expert receives tokens from both ranks. Comparing the
         expert-grouped activation slot with Dist-MoE's independent per-token
-        Q-DQ primitive proves that saved BF16 X follows routed row
-        order and masks padding.
+        Q-DQ primitive proves that saved BF16 X follows exact routed row order
+        without per-expert sentinels.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -8341,7 +8349,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 w2_EDF,
             )
             torch.cuda.synchronize()
-            self.assertFalse(state[16].item())
+            self.assertFalse(state[22].item())
 
             global_x = _all_gather_cat(x_TD)
             global_ids = _all_gather_cat(ids_TK)
@@ -8352,15 +8360,15 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 -1,
             )
 
-            offsets = state[17].tolist()
+            offsets = state[23].tolist()
             self.assertEqual(offsets[1], 0)
-            num_recv_tokens = int(state[15].item())
+            num_recv_tokens = int(state[21].item())
             x_q_dq_MD = _read_saved_bf16_x(
                 activation_buffer,
                 state,
                 hidden_dim,
             )
-            split_sizes = state[10].tolist()
+            split_sizes = state[16].tolist()
             cursor = 0
             for local_expert, split_size in enumerate(split_sizes):
                 global_expert = expert_start + local_expert

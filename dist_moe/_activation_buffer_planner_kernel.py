@@ -307,6 +307,8 @@ def _tl_store_activation_offsets(
 def _triton_get_blockscaled_forward_plan(
     num_recv_tokens_ptr,
     num_recv_tokens_per_rank_ptr,
+    unpadded_num_recv_tokens_ptr,
+    unpadded_num_recv_tokens_per_rank_ptr,
     num_recv_tokens_per_rank_snapshot_ptr,
     saved_activation_bytes_per_rank_ptr,
     buffer_offsets_ptr,
@@ -328,6 +330,7 @@ def _triton_get_blockscaled_forward_plan(
     hidden_dim: tl.constexpr,
     intermediate_dim: tl.constexpr,
     capacity_rows: tl.constexpr,
+    unpadded_capacity_rows: tl.constexpr,
     microbatch_id_ptr,
     activation_slot_bytes: tl.constexpr,
     num_activation_slots: tl.constexpr,
@@ -338,6 +341,7 @@ def _triton_get_blockscaled_forward_plan(
     scratch_only: tl.constexpr,
     native_backward: tl.constexpr,
     save_dequantized_activations: tl.constexpr,
+    compact_dequantized_activations: tl.constexpr,
     interleaved_fc13: tl.constexpr,
 ):
     """Compute the block-scaled forward plan: offsets + recompute decision.
@@ -390,13 +394,29 @@ def _triton_get_blockscaled_forward_plan(
     """
     rank_offsets = tl.arange(0, EP)
     rank_counts = tl.load(num_recv_tokens_per_rank_ptr + rank_offsets).to(tl.int64)
+    saved_rank_counts = rank_counts
+    if compact_dequantized_activations:
+        saved_rank_counts = tl.load(
+            unpadded_num_recv_tokens_per_rank_ptr + rank_offsets
+        ).to(tl.int64)
     if num_recv_tokens_per_rank_snapshot_ptr is not None:
-        tl.store(num_recv_tokens_per_rank_snapshot_ptr + rank_offsets, rank_counts)
+        tl.store(
+            num_recv_tokens_per_rank_snapshot_ptr + rank_offsets,
+            saved_rank_counts,
+        )
 
     padded_rows = tl.load(num_recv_tokens_ptr).to(tl.int64)
     tl.device_assert(padded_rows <= capacity_rows, "padded receive capacity exceeded")
     rows = padded_rows
-    h1_size = _tl_align(rows * 2 * intermediate_dim * element_size)  # h1 dense
+    saved_rows = rows
+    if compact_dequantized_activations:
+        saved_rows = tl.load(unpadded_num_recv_tokens_ptr).to(tl.int64)
+        tl.device_assert(
+            saved_rows <= unpadded_capacity_rows,
+            "unpadded receive capacity exceeded",
+        )
+    h1_size = _tl_align(rows * 2 * intermediate_dim * element_size)  # h1 compute
+    saved_h1_size = _tl_align(saved_rows * 2 * intermediate_dim * element_size)
     x_row_q_size, x_row_scale_size = _tl_row_quant_sizes(
         rows,
         hidden_dim,
@@ -505,7 +525,7 @@ def _triton_get_blockscaled_forward_plan(
         if save_dequantized_activations:
             no_recompute_alloc_per_rank = (
                 _tl_dense_x_dense_backward_no_recompute_alloc_per_rank(
-                    rank_counts,
+                    saved_rank_counts,
                     h3_mem_size,
                     hidden_dim,
                     intermediate_dim,
@@ -578,13 +598,20 @@ def _triton_get_blockscaled_forward_plan(
             scratch_bottom = scratch_end
         elif save_dequantized_activations:
             # Decode gathered X into its persistent BF16 backward operand.
-            # Packed Q(X) and Q(H2) remain in shared row scratch.
+            # Dense H1 compute remains padded in scratch until W2 consumes it;
+            # its persistent BF16 copy and decoded X omit sentinel rows.
             x_gathered_offset = free_start
-            h1_offset = x_gathered_offset + _tl_align(rows * hidden_dim * element_size)
-            h3_offset = h1_offset + h1_size
+            h1_offset = x_gathered_offset + _tl_align(
+                saved_rows * hidden_dim * element_size
+            )
+            h3_offset = h1_offset + saved_h1_size
             new_free_start = h3_offset + h3_mem_size
             x_offset = zero
-            scratch_bottom = row_slot_offset
+            scratch_bottom = tl.where(
+                compact_dequantized_activations and saved_rows != rows,
+                row_slot_offset - h1_size,
+                row_slot_offset,
+            )
         else:
             # Save the operands backward needs, ascending from free_start in the
             # order: x_col (x_gathered, FC13 WGRAD), h1 (dense), h2_col (h2, FC2
@@ -656,9 +683,20 @@ def _triton_get_blockscaled_forward_plan(
         dispatch_col_scale = x_col_offset + x_col_q_size
         combine_col_q = h2_col_offset
         combine_col_scale = h2_col_offset + h2_col_q_size
-    dispatch_c = h1_offset
-    combine_source_x = h1_offset
-    combine_source_y = h1_offset + intermediate_dim * element_size
+    h1_compute_offset = h1_offset
+    if compact_dequantized_activations and not inference_mode and not scratch_only:
+        h1_compute_offset = tl.where(
+            need_recompute,
+            h1_offset,
+            tl.where(
+                saved_rows == rows,
+                h1_offset,
+                row_slot_offset - h1_size,
+            ),
+        )
+    dispatch_c = h1_compute_offset
+    combine_source_x = h1_compute_offset
+    combine_source_y = h1_compute_offset + intermediate_dim * element_size
     if interleaved_fc13:
         # Dense h1 does not exist: FC13's C stays a host-side dummy
         # descriptor, and the SwiGLU sources are the NVFP4 dense-h2 staging
@@ -702,6 +740,8 @@ def _triton_get_blockscaled_forward_plan(
 def _triton_get_blockscaled_backward_plan(
     num_recv_tokens_ptr,
     num_recv_tokens_per_rank_ptr,
+    padded_num_recv_tokens_ptr,
+    padded_num_recv_tokens_per_rank_ptr,
     buffer_offsets_ptr,
     peak_min_free_space_ptr,
     need_recompute_ptr,
@@ -728,6 +768,7 @@ def _triton_get_blockscaled_backward_plan(
     hidden_dim: tl.constexpr,
     intermediate_dim: tl.constexpr,
     capacity_rows: tl.constexpr,
+    unpadded_capacity_rows: tl.constexpr,
     microbatch_id_ptr,
     activation_slot_bytes: tl.constexpr,
     num_activation_slots: tl.constexpr,
@@ -735,6 +776,7 @@ def _triton_get_blockscaled_backward_plan(
     mega: tl.constexpr,
     native_backward: tl.constexpr,
     save_dequantized_activations: tl.constexpr,
+    compact_dequantized_activations: tl.constexpr,
 ):
     """Compute the block-scaled backward plan (offsets only).
 
@@ -771,13 +813,24 @@ def _triton_get_blockscaled_backward_plan(
       recompute     scratch [row slot | h2/grad_h1 | grad_h2 |
                              grad_h3_gathered | h1 | x_gathered]
 
+    Compact full-save uses exact rows for this dense workspace and retains the
+    original padded row count only for NVFP4 H2 rematerialization. H1 aliases
+    its saved compact storage when the two row counts match; otherwise a
+    padded temporary precedes that rematerialization.
+
     Finally buffer_offsets, saved bytes, and moe_layer_id are rewound to undo the
-    matching forward layer's allocation. num_recv_tokens_ptr carries routing's
-    per-rank row count after per-expert padding, matching the forward planner.
+    matching forward layer's allocation.
     """
-    padded_rows = tl.load(num_recv_tokens_ptr).to(tl.int64)
+    rows = tl.load(num_recv_tokens_ptr).to(tl.int64)
+    padded_rows = rows
+    if compact_dequantized_activations:
+        padded_rows = tl.load(padded_num_recv_tokens_ptr).to(tl.int64)
+        tl.device_assert(
+            rows <= unpadded_capacity_rows,
+            "unpadded receive capacity exceeded",
+        )
     tl.device_assert(padded_rows <= capacity_rows, "padded receive capacity exceeded")
-    rows = padded_rows
+    quant_rows = padded_rows
     need_recompute = tl.load(need_recompute_ptr)
     microbatch_id = (tl.load(microbatch_id_ptr) % num_activation_slots).to(tl.int64)
     scratch_end = tl.load(buffer_offsets_ptr + num_activation_slots)
@@ -785,7 +838,7 @@ def _triton_get_blockscaled_backward_plan(
     slot_end = tl.cast((microbatch_id + 1) * activation_slot_bytes, tl.int64)
 
     x_row_q_size, x_row_scale_size = _tl_row_quant_sizes(
-        rows,
+        quant_rows,
         hidden_dim,
         operand_element_size,
         operand_values_per_storage_element,
@@ -795,7 +848,7 @@ def _triton_get_blockscaled_backward_plan(
         sf_vec_size,
     )
     h2_row_q_size, h2_row_scale_size = _tl_row_quant_sizes(
-        rows,
+        quant_rows,
         intermediate_dim,
         operand_element_size,
         operand_values_per_storage_element,
@@ -805,7 +858,7 @@ def _triton_get_blockscaled_backward_plan(
         sf_vec_size,
     )
     dxy_row_q_size, dxy_row_scale_size = _tl_row_quant_sizes(
-        rows,
+        quant_rows,
         2 * intermediate_dim,
         operand_element_size,
         operand_values_per_storage_element,
@@ -878,6 +931,7 @@ def _triton_get_blockscaled_backward_plan(
         sf_vec_size,
     )
     h1_size = _tl_align(rows * 2 * intermediate_dim * element_size)
+    padded_h1_size = _tl_align(padded_rows * 2 * intermediate_dim * element_size)
     grad_h2_size = _tl_align(rows * intermediate_dim * element_size)
 
     # Column-quantized WGRAD operands stack in scratch below the row slot, with
@@ -900,9 +954,15 @@ def _triton_get_blockscaled_backward_plan(
     cursor = row_slot_offset
     if save_dequantized_activations:
         # Match the BF16 backward's liveness reuse. Recompute reserves a dense
-        # X destination below H1; a full-save layer reads dense X directly from
-        # its persistent forward slot and uses row scratch only for H2.
-        dense_scratch_end = row_slot_offset
+        # X destination below H1; a full-save layer reads compact BF16 state.
+        # The NVFP4 H2 regeneration still consumes a padded temporary H1,
+        # populated by W13 recompute or expanded from the saved compact rows.
+        padded_h1_offset = row_slot_offset - padded_h1_size
+        dense_scratch_end = tl.where(
+            compact_dequantized_activations and padded_rows != rows,
+            padded_h1_offset,
+            row_slot_offset,
+        )
         grad_h1_offset = dense_scratch_end - h1_size
         grad_h2_offset = grad_h1_offset - grad_h2_size
         h2_offset = dense_scratch_end - grad_h2_size
@@ -1008,10 +1068,10 @@ def _triton_get_blockscaled_backward_plan(
     x_scale_cols: tl.constexpr = (hidden_dim + sf_vec_size - 1) // sf_vec_size
     h2_scale_cols: tl.constexpr = (intermediate_dim + sf_vec_size - 1) // sf_vec_size
     x_row_scale_storage_size = (
-        rows * row_scale_storage_multiple * x_scale_cols * scale_element_size
+        quant_rows * row_scale_storage_multiple * x_scale_cols * scale_element_size
     )
     h2_row_scale_storage_size = (
-        rows * row_scale_storage_multiple * h2_scale_cols * scale_element_size
+        quant_rows * row_scale_storage_multiple * h2_scale_cols * scale_element_size
     )
     tl.store(
         bwd_offsets_ptr + 14,
@@ -1033,12 +1093,19 @@ def _triton_get_blockscaled_backward_plan(
         h2_col_scale_offset = h2_col_offset + h2_col_q_size
         grad_h3_col_scale_offset = grad_h3_col_offset + x_col_q_size
         dxy_col_scale_offset = dxy_col_offset + dxy_col_q_size
+    recompute_h1_offset = h1_offset
+    if compact_dequantized_activations:
+        recompute_h1_offset = tl.where(
+            padded_rows == rows,
+            h1_offset,
+            padded_h1_offset,
+        )
     _tl_store_activation_offsets(
         offsets_ptr=bwd_activation_offsets_ptr,
         base=BACKWARD_RECOMPUTE_DISPATCH_OFFSET_BASE_TL_CONSTEXPR,
         a_q=x_row_offset,
         b_q=missing,
-        c=h1_offset,
+        c=recompute_h1_offset,
         a_scale=x_row_offset + x_row_q_size,
         b_scale=missing,
         source_x=missing,
@@ -1054,8 +1121,8 @@ def _triton_get_blockscaled_backward_plan(
         c=missing,
         a_scale=h2_row_offset + h2_row_q_size,
         b_scale=missing,
-        source_x=h1_offset,
-        source_y=h1_offset + intermediate_dim * element_size,
+        source_x=recompute_h1_offset,
+        source_y=recompute_h1_offset + intermediate_dim * element_size,
         col_q=h2_col_offset,
         col_scale=h2_col_scale_offset,
     )

@@ -36,6 +36,8 @@ from ._activation_buffer import (
 from ._activation_buffer_offsets import (
     ACTIVATION_A_Q_OFFSET,
     ACTIVATION_A_SCALE_OFFSET,
+    ACTIVATION_C_OFFSET,
+    ACTIVATION_SOURCE_X_OFFSET,
     activation_buffer_placeholder as _activation_buffer_placeholder,
     validate_activation_buffer_storage,
     validate_conditional_execution,
@@ -129,17 +131,19 @@ _SAVED_WEIGHT_STATE_COUNT = 5
 _SAVED_WEIGHT_PAIR_COUNT = 2 * _SAVED_WEIGHT_STATE_COUNT
 _W13_SAVED_WEIGHT_START = 2
 _W2_SAVED_WEIGHT_START = _W13_SAVED_WEIGHT_START + _SAVED_WEIGHT_STATE_COUNT
-_ASYNC_FORWARD_SAVED_TENSOR_COUNT = 34
+_ASYNC_FORWARD_SAVED_TENSOR_COUNT = 40
 _FORWARD_ROUTING_STATE = slice(14, 20)
+_FORWARD_UNPADDED_ROUTING_STATE = slice(34, 40)
 _FORWARD_NEED_RECOMPUTE = 20
 _FORWARD_OFFSET_INDICES = (*range(21, 30), 33)
 _FORWARD_ACTIVATION_OFFSETS = 30
 _FORWARD_RECOMPUTE_CONDITION = 31
 _FORWARD_POSTPROCESS_CONTEXT = 32
-_BACKWARD_STATE_TENSOR_COUNT = 21
+_BACKWARD_STATE_TENSOR_COUNT = 27
 _BACKWARD_WEIGHT_STATE = slice(0, _SAVED_WEIGHT_PAIR_COUNT)
-_BACKWARD_ROUTING_STATE = slice(10, 16)
-_BACKWARD_PLAN_STATE = slice(16, 21)
+_BACKWARD_PADDED_ROUTING_STATE = slice(10, 16)
+_BACKWARD_ROUTING_STATE = slice(16, 22)
+_BACKWARD_PLAN_STATE = slice(22, 27)
 _BACKWARD_NON_WEIGHT_STATE = slice(10, None)
 
 
@@ -685,6 +689,323 @@ def _dequantize_nvfp4_activation_buffer_to_buffer_fake(
     )
 
 
+def _validate_compact_routing_metadata(
+    padded_counts_E: torch.Tensor,
+    unpadded_counts_E: torch.Tensor,
+    padded_num_rows_1: torch.Tensor,
+    unpadded_num_rows_1: torch.Tensor,
+    *,
+    device: torch.device,
+) -> None:
+    """Validate paired padded and sentinel-free routing counts.
+
+    Args:
+        padded_counts_E: Per-expert counts including sentinel rows.
+        unpadded_counts_E: Matching per-expert real-row counts.
+        padded_num_rows_1: Total padded-row device scalar.
+        unpadded_num_rows_1: Total real-row device scalar.
+        device: Required device for every tensor.
+    """
+    if (
+        padded_counts_E.dtype != torch.int32
+        or unpadded_counts_E.dtype != torch.int32
+        or padded_counts_E.ndim != 1
+        or padded_counts_E.shape != unpadded_counts_E.shape
+        or not padded_counts_E.is_contiguous()
+        or not unpadded_counts_E.is_contiguous()
+        or padded_counts_E.device != device
+        or unpadded_counts_E.device != device
+    ):
+        raise ValueError(
+            "padded and unpadded expert counts must be matching contiguous "
+            "int32 vectors on the activation-buffer device"
+        )
+    for name, value in (
+        ("padded_num_rows_1", padded_num_rows_1),
+        ("unpadded_num_rows_1", unpadded_num_rows_1),
+    ):
+        if (
+            value.dtype not in (torch.int32, torch.int64)
+            or value.shape != (1,)
+            or not value.is_contiguous()
+            or value.device != device
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous int32 or int64 device scalar"
+            )
+
+
+@torch.library.custom_op(
+    "dist_moe::copy_routed_bf16_activation_rows_",
+    mutates_args=("activation_buffer",),
+)
+def _copy_routed_bf16_activation_rows(
+    activation_buffer: torch.Tensor,
+    source_offset_1: torch.Tensor,
+    destination_offset_1: torch.Tensor,
+    padded_counts_E: torch.Tensor,
+    unpadded_counts_E: torch.Tensor,
+    padded_num_rows_1: torch.Tensor,
+    unpadded_num_rows_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    padded_capacity_rows: int,
+    unpadded_capacity_rows: int,
+    n_cols: int,
+    expand: bool,
+    execute_when_zero: bool,
+) -> None:
+    """Copy BF16 expert rows between padded and sentinel-free layouts.
+
+    Args:
+        activation_buffer: Mutable planner-owned byte allocation.
+        source_offset_1: Source byte-offset device scalar.
+        destination_offset_1: Destination byte-offset device scalar.
+        padded_counts_E: Per-expert counts including sentinels.
+        unpadded_counts_E: Per-expert real-row counts.
+        padded_num_rows_1: Total padded-row device scalar.
+        unpadded_num_rows_1: Total real-row device scalar.
+        conditional_execution_1: Device predicate for the copy.
+        padded_capacity_rows: Static padded launch capacity.
+        unpadded_capacity_rows: Static compact launch capacity.
+        n_cols: BF16 values per row.
+        expand: Whether compact rows are expanded into padded storage.
+        execute_when_zero: Whether a zero predicate executes the copy.
+    """
+    validate_activation_buffer_storage(activation_buffer)
+    validate_conditional_execution(
+        conditional_execution_1,
+        device=activation_buffer.device,
+    )
+    _validate_compact_routing_metadata(
+        padded_counts_E,
+        unpadded_counts_E,
+        padded_num_rows_1,
+        unpadded_num_rows_1,
+        device=activation_buffer.device,
+    )
+    for offset in (source_offset_1, destination_offset_1):
+        _validate_nvfp4_activation_buffer_metadata(
+            activation_buffer,
+            offset,
+            conditional_execution_1,
+            device=activation_buffer.device,
+            required_bytes=max(padded_capacity_rows, unpadded_capacity_rows)
+            * n_cols
+            * torch.bfloat16.itemsize,
+        )
+    from .kernels.triton_quantization.blockscaled_dequantize import (
+        copy_routed_bf16_activation_buffer_rows,
+    )
+
+    copy_routed_bf16_activation_buffer_rows(
+        activation_buffer,
+        source_offset_1,
+        destination_offset_1,
+        padded_counts_E,
+        unpadded_counts_E,
+        (unpadded_num_rows_1 if expand else padded_num_rows_1),
+        (padded_num_rows_1 if expand else unpadded_num_rows_1),
+        conditional_execution_1,
+        destination_capacity_rows=(
+            padded_capacity_rows if expand else unpadded_capacity_rows
+        ),
+        n_cols=n_cols,
+        expand=expand,
+        execute_when_zero=execute_when_zero,
+    )
+
+
+@_copy_routed_bf16_activation_rows.register_fake
+def _copy_routed_bf16_activation_rows_fake(
+    activation_buffer: torch.Tensor,
+    source_offset_1: torch.Tensor,
+    destination_offset_1: torch.Tensor,
+    padded_counts_E: torch.Tensor,
+    unpadded_counts_E: torch.Tensor,
+    padded_num_rows_1: torch.Tensor,
+    unpadded_num_rows_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    padded_capacity_rows: int,
+    unpadded_capacity_rows: int,
+    n_cols: int,
+    expand: bool,
+    execute_when_zero: bool,
+) -> None:
+    """Validate fake metadata for a routed BF16 row copy.
+
+    Args:
+        activation_buffer: Mutable planner-owned byte allocation.
+        source_offset_1: Source byte-offset device scalar.
+        destination_offset_1: Destination byte-offset device scalar.
+        padded_counts_E: Per-expert counts including sentinels.
+        unpadded_counts_E: Per-expert real-row counts.
+        padded_num_rows_1: Total padded-row device scalar.
+        unpadded_num_rows_1: Total real-row device scalar.
+        conditional_execution_1: Device predicate for the copy.
+        padded_capacity_rows: Static padded launch capacity.
+        unpadded_capacity_rows: Static compact launch capacity.
+        n_cols: BF16 values per row.
+        expand: Whether compact rows are expanded into padded storage.
+        execute_when_zero: Whether a zero predicate executes the copy.
+    """
+    del expand, execute_when_zero
+    validate_activation_buffer_storage(activation_buffer)
+    validate_conditional_execution(
+        conditional_execution_1,
+        device=activation_buffer.device,
+    )
+    _validate_compact_routing_metadata(
+        padded_counts_E,
+        unpadded_counts_E,
+        padded_num_rows_1,
+        unpadded_num_rows_1,
+        device=activation_buffer.device,
+    )
+    for offset in (source_offset_1, destination_offset_1):
+        _validate_nvfp4_activation_buffer_metadata(
+            activation_buffer,
+            offset,
+            conditional_execution_1,
+            device=activation_buffer.device,
+            required_bytes=max(padded_capacity_rows, unpadded_capacity_rows)
+            * n_cols
+            * torch.bfloat16.itemsize,
+        )
+
+
+@torch.library.custom_op(
+    "dist_moe::dequantize_compact_nvfp4_activation_buffer_to_buffer_",
+    mutates_args=("activation_buffer",),
+)
+def _dequantize_compact_nvfp4_activation_buffer_to_buffer(
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    padded_counts_E: torch.Tensor,
+    unpadded_counts_E: torch.Tensor,
+    padded_num_rows_1: torch.Tensor,
+    unpadded_num_rows_1: torch.Tensor,
+    output_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    padded_capacity_rows: int,
+    unpadded_capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool,
+    execute_unconditionally: bool,
+) -> None:
+    """Decode padded NVFP4 rows into sentinel-free BF16 storage.
+
+    Args:
+        activation_buffer: Mutable planner-owned byte allocation.
+        qdata_offset_1: Packed E2M1 source byte-offset device scalar.
+        scale_offset_1: Block-scale source byte-offset device scalar.
+        padded_counts_E: Per-expert counts including sentinels.
+        unpadded_counts_E: Per-expert real-row counts.
+        padded_num_rows_1: Total padded-row device scalar.
+        unpadded_num_rows_1: Total real-row device scalar.
+        output_offset_1: Compact BF16 destination byte-offset device scalar.
+        conditional_execution_1: Device predicate for the decode.
+        padded_capacity_rows: Static padded source capacity.
+        unpadded_capacity_rows: Static compact destination capacity.
+        n_cols: Logical values per row.
+        execute_when_zero: Whether a zero predicate executes the decode.
+        execute_unconditionally: Whether the predicate is ignored.
+    """
+    _validate_compact_routing_metadata(
+        padded_counts_E,
+        unpadded_counts_E,
+        padded_num_rows_1,
+        unpadded_num_rows_1,
+        device=activation_buffer.device,
+    )
+    _validate_nvfp4_activation_buffer_dequantization(
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        unpadded_num_rows_1,
+        output_offset_1,
+        conditional_execution_1,
+        unpadded_capacity_rows,
+        n_cols,
+    )
+    from .kernels.activation_buffer import ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+    from .kernels.triton_quantization.blockscaled_dequantize import (
+        dequantize_compact_nvfp4_activation_buffer_to_activation_buffer,
+    )
+
+    dequantize_compact_nvfp4_activation_buffer_to_activation_buffer(
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        padded_counts_E,
+        unpadded_counts_E,
+        padded_num_rows_1,
+        unpadded_num_rows_1,
+        output_offset_1,
+        conditional_execution_1,
+        unpadded_capacity_rows=unpadded_capacity_rows,
+        n_cols=n_cols,
+        execute_when_zero=execute_when_zero,
+        execute_unconditionally=execute_unconditionally,
+        row_scale_storage_multiple=ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
+    )
+
+
+@_dequantize_compact_nvfp4_activation_buffer_to_buffer.register_fake
+def _dequantize_compact_nvfp4_activation_buffer_to_buffer_fake(
+    activation_buffer: torch.Tensor,
+    qdata_offset_1: torch.Tensor,
+    scale_offset_1: torch.Tensor,
+    padded_counts_E: torch.Tensor,
+    unpadded_counts_E: torch.Tensor,
+    padded_num_rows_1: torch.Tensor,
+    unpadded_num_rows_1: torch.Tensor,
+    output_offset_1: torch.Tensor,
+    conditional_execution_1: torch.Tensor,
+    padded_capacity_rows: int,
+    unpadded_capacity_rows: int,
+    n_cols: int,
+    execute_when_zero: bool,
+    execute_unconditionally: bool,
+) -> None:
+    """Validate fake metadata for compact NVFP4 activation decode.
+
+    Args:
+        activation_buffer: Mutable planner-owned byte allocation.
+        qdata_offset_1: Packed E2M1 source byte-offset device scalar.
+        scale_offset_1: Block-scale source byte-offset device scalar.
+        padded_counts_E: Per-expert counts including sentinels.
+        unpadded_counts_E: Per-expert real-row counts.
+        padded_num_rows_1: Total padded-row device scalar.
+        unpadded_num_rows_1: Total real-row device scalar.
+        output_offset_1: Compact BF16 destination byte-offset device scalar.
+        conditional_execution_1: Device predicate for the decode.
+        padded_capacity_rows: Static padded source capacity.
+        unpadded_capacity_rows: Static compact destination capacity.
+        n_cols: Logical values per row.
+        execute_when_zero: Whether a zero predicate executes the decode.
+        execute_unconditionally: Whether the predicate is ignored.
+    """
+    del padded_capacity_rows, execute_when_zero, execute_unconditionally
+    _validate_compact_routing_metadata(
+        padded_counts_E,
+        unpadded_counts_E,
+        padded_num_rows_1,
+        unpadded_num_rows_1,
+        device=activation_buffer.device,
+    )
+    _validate_nvfp4_activation_buffer_dequantization(
+        activation_buffer,
+        qdata_offset_1,
+        scale_offset_1,
+        unpadded_num_rows_1,
+        output_offset_1,
+        conditional_execution_1,
+        unpadded_capacity_rows,
+        n_cols,
+    )
+
+
 def _validate_nvfp4_weight_dequantization(
     qdata_ENQ: torch.Tensor,
     scale_RB: torch.Tensor,
@@ -1128,6 +1449,7 @@ class _BlockscaledConfig:
     routing_capacity: int | None = None
     static_inference_storage: bool = False
     save_dequantized_activations: bool = False
+    compact_dequantized_activations: bool = False
 
     @property
     def policy(self) -> _FusedBlockscaledFormatPolicy:
@@ -1233,6 +1555,16 @@ class _Nvfp4Bf16BackwardAdapter:
     w13: _BlockscaledWeight
     w2: _BlockscaledWeight
     num_sms: int | None
+    padded_num_recv_rows_per_local_expert_E: torch.Tensor
+    padded_dispatch_fwd_gather_ptrs_M: torch.Tensor
+    padded_combine_scatter_ptrs_M: torch.Tensor
+    padded_num_recv_rows_per_rank_R: torch.Tensor
+    padded_num_recv_rows_1: torch.Tensor
+
+    @property
+    def uses_unpadded_backward(self) -> bool:
+        """Return whether dense backward tensors omit routing sentinels."""
+        return self.model_config.compact_dequantized_activations
 
     def materialize_w2_dgrad_weight(self) -> torch.Tensor:
         """Decode packed W2 into its transient BF16 DGRAD operand."""
@@ -1275,6 +1607,15 @@ class _Nvfp4Bf16BackwardAdapter:
         capacity_rows = dispatch_fwd_gather_ptrs_M.numel()
         m_multiple_of = self.model_config.routing_m_multiple_of
         assert m_multiple_of is not None
+        unpadded_num_recv_rows_per_local_expert_E = num_recv_rows_per_local_expert_E
+        unpadded_num_recv_rows_1 = num_recv_rows_1
+        if self.uses_unpadded_backward:
+            num_recv_rows_per_local_expert_E = (
+                self.padded_num_recv_rows_per_local_expert_E
+            )
+            dispatch_fwd_gather_ptrs_M = self.padded_dispatch_fwd_gather_ptrs_M
+            combine_scatter_ptrs_M = self.padded_combine_scatter_ptrs_M
+            capacity_rows = dispatch_fwd_gather_ptrs_M.numel()
 
         local_x_TD = torch.empty(
             (num_local_input_tokens, hidden_dim),
@@ -1332,9 +1673,8 @@ class _Nvfp4Bf16BackwardAdapter:
         )
 
         full_save_bytes = self.model_config.num_moe_layers * (
-            self.model_config.saved_act_mem_size(
-                self.model_config.max_recv_tokens,
-                recompute=False,
+            self.model_config.full_saved_act_mem_size(
+                self.model_config.max_imbalance_factor
             )
         )
         if activation_buffer.activation_slot_bytes < full_save_bytes:
@@ -1354,6 +1694,26 @@ class _Nvfp4Bf16BackwardAdapter:
                 forward_plan.need_recompute,
                 capacity_rows,
                 hidden_dim,
+            )
+
+        combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
+        if self.uses_unpadded_backward:
+            _copy_routed_bf16_activation_rows(
+                activation_buffer.buffer,
+                backward_plan.h1_offset,
+                combine_offsets[
+                    ACTIVATION_SOURCE_X_OFFSET : ACTIVATION_SOURCE_X_OFFSET + 1
+                ],
+                self.padded_num_recv_rows_per_local_expert_E,
+                unpadded_num_recv_rows_per_local_expert_E,
+                self.padded_num_recv_rows_1,
+                unpadded_num_recv_rows_1,
+                forward_plan.need_recompute,
+                self.model_config.max_recv_tokens,
+                self.model_config.max_unpadded_recv_tokens,
+                2 * intermediate_dim,
+                True,
+                True,
             )
 
         h1_placeholder = _activation_buffer_placeholder(
@@ -1391,18 +1751,39 @@ class _Nvfp4Bf16BackwardAdapter:
 
         # The planner likewise publishes the selected H2 row-bundle offset
         # before one graph-stable unconditional decode.
-        combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
-        _dequantize_nvfp4_activation_buffer_to_buffer(
-            activation_buffer.buffer,
-            combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
-            combine_offsets[ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1],
-            num_recv_rows_1,
-            backward_plan.h2_offset,
-            forward_plan.need_recompute,
-            capacity_rows,
-            intermediate_dim,
-            execute_unconditionally=True,
-        )
+        if self.uses_unpadded_backward:
+            _dequantize_compact_nvfp4_activation_buffer_to_buffer(
+                activation_buffer.buffer,
+                combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+                combine_offsets[
+                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
+                ],
+                self.padded_num_recv_rows_per_local_expert_E,
+                unpadded_num_recv_rows_per_local_expert_E,
+                self.padded_num_recv_rows_1,
+                unpadded_num_recv_rows_1,
+                backward_plan.h2_offset,
+                forward_plan.need_recompute,
+                self.model_config.max_recv_tokens,
+                self.model_config.max_unpadded_recv_tokens,
+                intermediate_dim,
+                False,
+                True,
+            )
+        else:
+            _dequantize_nvfp4_activation_buffer_to_buffer(
+                activation_buffer.buffer,
+                combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
+                combine_offsets[
+                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET + 1
+                ],
+                num_recv_rows_1,
+                backward_plan.h2_offset,
+                forward_plan.need_recompute,
+                capacity_rows,
+                intermediate_dim,
+                execute_unconditionally=True,
+            )
         return h3_MD
 
 
@@ -2049,6 +2430,9 @@ def _async_model_config(
         max_num_recv_tokens=max_num_recv_tokens,
         mega=blockscaled_cfg.mega,
         save_dequantized_activations=(blockscaled_cfg.save_dequantized_activations),
+        compact_dequantized_activations=(
+            blockscaled_cfg.compact_dequantized_activations
+        ),
     )
 
 
@@ -2444,23 +2828,46 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 pointer_capacity_multiple_of=(
                     128 if fprop_inference_mode and blockscaled_cfg.mega else 1
                 ),
+                generate_unpadded_output=(
+                    save_for_backward
+                    and blockscaled_cfg.compact_dequantized_activations
+                ),
+                max_unpadded_num_recv_tokens=(
+                    model_config.max_unpadded_recv_tokens
+                    if (
+                        save_for_backward
+                        and blockscaled_cfg.compact_dequantized_activations
+                    )
+                    else None
+                ),
             )
 
             num_tokens_per_local_expert_E = routing.num_tokens_per_local_experts
             dispatch_bwd_gather_ptrs = routing.bwd_gather_ptrs
             dispatch_fwd_gather_ptrs = routing.fwd_gather_ptrs
             combine_scatter_ptrs = routing.scatter_ptrs
+            backward_routing = (
+                routing.unpadded
+                if blockscaled_cfg.compact_dequantized_activations
+                else routing
+            )
+            assert backward_routing is not None
 
         # 4. Static inference binds scratch directly. Training and VMM retain
         # device-side offsets and the existing recomputation/placement policy.
         forward_plan = None
         num_recv_tokens = None
+        padded_num_recv_tokens = None
         num_recv_tokens_per_rank_snapshot = None
+        padded_num_recv_tokens_per_rank_snapshot = None
         if not static_inference_storage:
             with record_function("moe_forward_plan"):
                 # Backward must retain this call's count even when later
                 # routing reuses its metadata storage.
-                num_recv_tokens = routing.num_tokens_per_rank[
+                padded_num_recv_tokens = routing.num_tokens_per_rank[
+                    local_rank : local_rank + 1
+                ].clone()
+                num_recv_tokens = backward_routing.num_tokens_per_rank[
                     local_rank : local_rank + 1
                 ].clone()
                 buffer_capacity = activation_buffer.buffer.numel()
@@ -2473,12 +2880,15 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     num_activation_slots=capacity_num_activation_slots,
                 )
                 num_recv_tokens_per_rank_snapshot = (
-                    torch.empty_like(routing.num_tokens_per_rank)
+                    torch.empty_like(backward_routing.num_tokens_per_rank)
                     if save_for_backward
                     else None
                 )
+                padded_num_recv_tokens_per_rank_snapshot = (
+                    routing.num_tokens_per_rank.clone() if save_for_backward else None
+                )
                 forward_plan = get_forward_plan(
-                    num_recv_tokens=num_recv_tokens,
+                    num_recv_tokens=padded_num_recv_tokens,
                     num_recv_tokens_per_rank=routing.num_tokens_per_rank,
                     buffer_status=activation_buffer,
                     model_config=model_config,
@@ -2487,6 +2897,16 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     inference_mode=inference_mode,
                     num_recv_tokens_per_rank_snapshot=num_recv_tokens_per_rank_snapshot,
                     scratch_only=not save_for_backward,
+                    unpadded_num_recv_tokens=(
+                        num_recv_tokens
+                        if blockscaled_cfg.compact_dequantized_activations
+                        else None
+                    ),
+                    unpadded_num_recv_tokens_per_rank=(
+                        backward_routing.num_tokens_per_rank
+                        if blockscaled_cfg.compact_dequantized_activations
+                        else None
+                    ),
                 )
 
         if save_for_backward:
@@ -2584,7 +3004,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         dispatch_offsets = forward_plan.blockscaled.dispatch_offsets
                         _copy_gathered_nvfp4_activation_to_buffer(
                             dispatch_fwd_gather_ptrs,
-                            num_recv_tokens,
+                            padded_num_recv_tokens,
                             activation_buffer.buffer,
                             dispatch_offsets[
                                 ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
@@ -2606,22 +3026,45 @@ class _BlockScaledAutograd(torch.autograd.Function):
                                 forward_plan.need_recompute
                             ),
                         )
-                        _dequantize_nvfp4_activation_buffer_to_buffer(
-                            activation_buffer.buffer,
-                            dispatch_offsets[
-                                ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
-                            ],
-                            dispatch_offsets[
-                                ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
-                                + 1
-                            ],
-                            num_recv_tokens,
-                            forward_plan.x_gathered_offset,
-                            forward_plan.blockscaled.recompute_condition,
-                            capacity_rows,
-                            hidden_dim,
-                            execute_when_zero=True,
-                        )
+                        if blockscaled_cfg.compact_dequantized_activations:
+                            _dequantize_compact_nvfp4_activation_buffer_to_buffer(
+                                activation_buffer.buffer,
+                                dispatch_offsets[
+                                    ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                                ],
+                                dispatch_offsets[
+                                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                    + 1
+                                ],
+                                num_tokens_per_local_expert_E,
+                                backward_routing.num_tokens_per_local_experts,
+                                padded_num_recv_tokens,
+                                num_recv_tokens,
+                                forward_plan.x_gathered_offset,
+                                forward_plan.blockscaled.recompute_condition,
+                                capacity_rows,
+                                model_config.max_unpadded_recv_tokens,
+                                hidden_dim,
+                                True,
+                                False,
+                            )
+                        else:
+                            _dequantize_nvfp4_activation_buffer_to_buffer(
+                                activation_buffer.buffer,
+                                dispatch_offsets[
+                                    ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                                ],
+                                dispatch_offsets[
+                                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                    + 1
+                                ],
+                                padded_num_recv_tokens,
+                                forward_plan.x_gathered_offset,
+                                forward_plan.blockscaled.recompute_condition,
+                                capacity_rows,
+                                hidden_dim,
+                                execute_when_zero=True,
+                            )
                 else:
                     assert (
                         forward_plan is not None
@@ -2659,22 +3102,45 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     )
                     if save_dequantized_activations:
                         dispatch_offsets = forward_plan.blockscaled.dispatch_offsets
-                        _dequantize_nvfp4_activation_buffer_to_buffer(
-                            activation_buffer.buffer,
-                            dispatch_offsets[
-                                ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
-                            ],
-                            dispatch_offsets[
-                                ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
-                                + 1
-                            ],
-                            num_recv_tokens,
-                            forward_plan.x_gathered_offset,
-                            forward_plan.blockscaled.recompute_condition,
-                            capacity_rows,
-                            hidden_dim,
-                            execute_when_zero=True,
-                        )
+                        if blockscaled_cfg.compact_dequantized_activations:
+                            _dequantize_compact_nvfp4_activation_buffer_to_buffer(
+                                activation_buffer.buffer,
+                                dispatch_offsets[
+                                    ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                                ],
+                                dispatch_offsets[
+                                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                    + 1
+                                ],
+                                num_tokens_per_local_expert_E,
+                                backward_routing.num_tokens_per_local_experts,
+                                padded_num_recv_tokens,
+                                num_recv_tokens,
+                                forward_plan.x_gathered_offset,
+                                forward_plan.blockscaled.recompute_condition,
+                                capacity_rows,
+                                model_config.max_unpadded_recv_tokens,
+                                hidden_dim,
+                                True,
+                                False,
+                            )
+                        else:
+                            _dequantize_nvfp4_activation_buffer_to_buffer(
+                                activation_buffer.buffer,
+                                dispatch_offsets[
+                                    ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                                ],
+                                dispatch_offsets[
+                                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                    + 1
+                                ],
+                                padded_num_recv_tokens,
+                                forward_plan.x_gathered_offset,
+                                forward_plan.blockscaled.recompute_condition,
+                                capacity_rows,
+                                hidden_dim,
+                                execute_when_zero=True,
+                            )
                     h1_placeholder = _activation_buffer_placeholder(
                         activation_buffer.buffer,
                         (capacity_rows, 2 * intermediate_dim),
@@ -2714,6 +3180,29 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     # Training also emits the column-quantized WGRAD operand;
                     # inference returns only the combined output tensor.
                     h3_MD = combine_result[0] if save_col_quant else combine_result
+                if blockscaled_cfg.compact_dequantized_activations:
+                    assert (
+                        forward_plan is not None
+                        and forward_plan.blockscaled is not None
+                        and padded_num_recv_tokens is not None
+                        and num_recv_tokens is not None
+                    )
+                    dispatch_offsets = forward_plan.blockscaled.dispatch_offsets
+                    _copy_routed_bf16_activation_rows(
+                        activation_buffer.buffer,
+                        dispatch_offsets[ACTIVATION_C_OFFSET : ACTIVATION_C_OFFSET + 1],
+                        forward_plan.h1_offset,
+                        num_tokens_per_local_expert_E,
+                        backward_routing.num_tokens_per_local_experts,
+                        padded_num_recv_tokens,
+                        num_recv_tokens,
+                        forward_plan.blockscaled.recompute_condition,
+                        capacity_rows,
+                        model_config.max_unpadded_recv_tokens,
+                        2 * intermediate_dim,
+                        False,
+                        True,
+                    )
 
         w13_handle_tensors = None
         w2_handle_tensors = None
@@ -2773,6 +3262,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
 
             assert num_recv_tokens_per_rank_snapshot is not None
             assert num_recv_tokens is not None
+            assert padded_num_recv_tokens_per_rank_snapshot is not None
+            assert padded_num_recv_tokens is not None
             assert w13_handle_tensors is not None and w2_handle_tensors is not None
             assert forward_plan is not None
             assert forward_plan.blockscaled is not None
@@ -2788,8 +3279,8 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 dispatch_bwd_gather_ptrs,
                 dispatch_fwd_gather_ptrs,
                 combine_scatter_ptrs,
-                num_recv_tokens_per_rank_snapshot,
-                num_recv_tokens,
+                padded_num_recv_tokens_per_rank_snapshot,
+                padded_num_recv_tokens,
                 # ForwardPlan tensors
                 forward_plan.need_recompute,
                 forward_plan.x_offset,
@@ -2805,6 +3296,12 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 forward_plan.blockscaled.recompute_condition,
                 postprocess_context,
                 forward_plan.activation_slot_id_1,
+                backward_routing.num_tokens_per_local_experts,
+                backward_routing.bwd_gather_ptrs,
+                backward_routing.fwd_gather_ptrs,
+                backward_routing.scatter_ptrs,
+                num_recv_tokens_per_rank_snapshot,
+                num_recv_tokens,
             )
 
         return output_TD
@@ -2905,6 +3402,12 @@ class _BlockScaledAutograd(torch.autograd.Function):
             recompute_condition,
             postprocess_context,
             activation_slot_id_1,
+            unpadded_num_tokens_per_local_expert_E,
+            unpadded_dispatch_bwd_gather_ptrs,
+            unpadded_dispatch_fwd_gather_ptrs,
+            unpadded_combine_scatter_ptrs,
+            unpadded_num_recv_tokens_per_rank,
+            unpadded_num_recv_tokens,
         ) = ctx.saved_tensors
 
         # 2. Recreate callback-owned compute views before restoring or rebuilding
@@ -3012,8 +3515,22 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     w13=w13_handle.blockscaled,
                     w2=w2_handle.blockscaled,
                     num_sms=num_sms,
+                    padded_num_recv_rows_per_local_expert_E=(
+                        num_tokens_per_local_expert_E
+                    ),
+                    padded_dispatch_fwd_gather_ptrs_M=(dispatch_fwd_gather_ptrs),
+                    padded_combine_scatter_ptrs_M=combine_scatter_ptrs,
+                    padded_num_recv_rows_per_rank_R=num_recv_tokens_per_rank,
+                    padded_num_recv_rows_1=num_recv_tokens,
                 ),
             )
+            if not blockscaled_cfg.compact_dequantized_activations:
+                unpadded_num_tokens_per_local_expert_E = num_tokens_per_local_expert_E
+                unpadded_dispatch_bwd_gather_ptrs = dispatch_bwd_gather_ptrs
+                unpadded_dispatch_fwd_gather_ptrs = dispatch_fwd_gather_ptrs
+                unpadded_combine_scatter_ptrs = combine_scatter_ptrs
+                unpadded_num_recv_tokens_per_rank = num_recv_tokens_per_rank
+                unpadded_num_recv_tokens = num_recv_tokens
             # The shared BF16 path needs weight shape/dtype/device metadata
             # before DGRAD, but the adapter supplies the actual Q-DQ operands
             # just in time. Zero-stride views carry that metadata without
@@ -3031,12 +3548,12 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 w2_metadata_EDF,
                 topk_expert_ids_TK,
                 topk_scores_TK,
-                num_tokens_per_local_expert_E,
-                dispatch_bwd_gather_ptrs,
-                dispatch_fwd_gather_ptrs,
-                combine_scatter_ptrs,
-                num_recv_tokens_per_rank,
-                num_recv_tokens,
+                unpadded_num_tokens_per_local_expert_E,
+                unpadded_dispatch_bwd_gather_ptrs,
+                unpadded_dispatch_fwd_gather_ptrs,
+                unpadded_combine_scatter_ptrs,
+                unpadded_num_recv_tokens_per_rank,
+                unpadded_num_recv_tokens,
                 need_recompute,
                 x_offset,
                 x_gathered_offset,
@@ -4250,7 +4767,7 @@ def _pack_block_scaled_backward_state(
         format: Active block-scaled format.
 
     Returns:
-        Twenty-one graph-visible tensors consumed by the backward operation.
+        Fixed graph-visible tensors consumed by the backward operation.
     """
     weights = (
         *_forward_weight_state(
@@ -4280,8 +4797,20 @@ def _pack_block_scaled_backward_state(
     if postprocess_context is None:
         postprocess_context = _empty_private_state(reference)
     state = list(weights)
+    padded_routing = saved[_FORWARD_ROUTING_STATE]
+    saved_unpadded_routing = saved[_FORWARD_UNPADDED_ROUTING_STATE]
+    if saved_unpadded_routing[0] is padded_routing[0]:
+        unpadded_routing = [
+            _empty_private_state(reference) for _ in saved_unpadded_routing
+        ]
+    else:
+        unpadded_routing = []
+        for unpadded in saved_unpadded_routing:
+            assert unpadded is not None
+            unpadded_routing.append(unpadded)
     for tensor in (
-        *saved[_FORWARD_ROUTING_STATE],
+        *padded_routing,
+        *unpadded_routing,
         saved[_FORWARD_NEED_RECOMPUTE],
         packed_offsets,
         saved[_FORWARD_ACTIVATION_OFFSETS],
@@ -4324,7 +4853,12 @@ def _block_scaled_forward_metadata(
     if not save_for_backward:
         return [_empty_private_state(x_TD) for _ in range(_BACKWARD_STATE_TENSOR_COUNT)]
     policy = context.config.block_scaled
-    assert policy is not None
+    activation_buffer = context.activation_buffer
+    assert (
+        policy is not None
+        and activation_buffer is not None
+        and activation_buffer.model_config is not None
+    )
     kernel_format = _kernel_block_scaled_format(policy.format)
     world_size = dist.get_world_size(context.group)
     local_experts = w13_EFD.shape[0]
@@ -4360,6 +4894,43 @@ def _block_scaled_forward_metadata(
         integer((world_size,), dtype=torch.int32),
         integer((1,), dtype=torch.int32),
     )
+    model_config = _async_model_config(
+        dtype=x_TD.dtype,
+        hidden_dim=context.config.hidden_dim,
+        intermediate_dim=context.config.intermediate_dim,
+        num_tokens=x_TD.shape[0],
+        topk=context.top_k,
+        max_imbalance_factor=context.config.device_scratch_capacity_factor,
+        num_moe_layers=context.config.max_moe_layers_per_activation_slot,
+        num_local_experts=local_experts,
+        routing_world_size=world_size,
+        routing_m_multiple=dist_bs_gemm.DEFAULT_M_MULTIPLE_OF,
+        max_num_recv_tokens=None,
+        blockscaled_cfg=replace(
+            _blockscaled_compute_config(context)[0],
+            save_dequantized_activations=(kernel_format is BlockScaledFormat.NVFP4),
+            compact_dequantized_activations=(
+                activation_buffer.model_config.compact_dequantized_activations
+            ),
+        ),
+    )
+    unpadded_pointer_count = (
+        model_config.max_unpadded_recv_tokens
+        if model_config.compact_dequantized_activations
+        else pointer_count
+    )
+    unpadded_routing = (
+        (
+            integer((local_experts,), dtype=torch.int32),
+            integer((unpadded_pointer_count,), dtype=torch.int64),
+            integer((unpadded_pointer_count,), dtype=torch.int64),
+            integer((unpadded_pointer_count,), dtype=torch.int64),
+            integer((world_size,), dtype=torch.int32),
+            integer((1,), dtype=torch.int32),
+        )
+        if model_config.compact_dequantized_activations
+        else tuple(_empty_private_state(x_TD) for _ in range(6))
+    )
     planner = (
         integer((1,), dtype=torch.bool),
         integer((10,), dtype=torch.int64),
@@ -4375,7 +4946,7 @@ def _block_scaled_forward_metadata(
             else x_TD.new_empty(0)
         ),
     )
-    return [*weights, *routing, *planner]
+    return [*weights, *routing, *unpadded_routing, *planner]
 
 
 def _run_async_forward(
@@ -4429,6 +5000,11 @@ def _run_async_forward(
         blockscaled_cfg,
         interleaved_fc13=interleaved_fc13,
         save_dequantized_activations=save_dequantized_activations,
+        compact_dequantized_activations=(
+            save_dequantized_activations
+            and activation_buffer.model_config is not None
+            and activation_buffer.model_config.compact_dequantized_activations
+        ),
         static_inference_storage=(
             blockscaled_cfg.static_inference_storage
             and not save_dequantized_activations
@@ -4835,7 +5411,7 @@ def _run_block_scaled_registered_backward(
         w2_EDF: Logical or quantized down-projection expert weight.
         topk_expert_ids_TK: Routed expert IDs with shape ``[T, K]``.
         topk_scores_TK: Routing weights with shape ``[T, K]``.
-        state: Twenty-one tensors returned by the forward operation.
+        state: Twenty-seven tensors returned by the forward operation.
         rmsnorm_enabled: Whether fused post-expert RMSNorm is selected.
         rmsnorm_eps: RMSNorm epsilon.
         rmsnorm_norm_output_dtype: Normalized route-output dtype.
@@ -4869,6 +5445,10 @@ def _run_block_scaled_registered_backward(
         blockscaled_cfg = replace(
             blockscaled_cfg,
             save_dequantized_activations=True,
+            compact_dequantized_activations=(
+                activation_buffer.model_config is not None
+                and activation_buffer.model_config.compact_dequantized_activations
+            ),
         )
     postprocess_config = _rmsnorm_from_registered_args(
         None,
@@ -4952,7 +5532,12 @@ def _run_block_scaled_registered_backward(
         swiglu_alpha=context.config.swiglu_alpha,
         swiglu_limit=context.config.swiglu_limit,
     )
-    routing = state[_BACKWARD_ROUTING_STATE]
+    padded_routing = state[_BACKWARD_PADDED_ROUTING_STATE]
+    routing = (
+        state[_BACKWARD_ROUTING_STATE]
+        if blockscaled_cfg.compact_dequantized_activations
+        else padded_routing
+    )
     (
         need_recompute,
         packed_offsets,
@@ -4967,13 +5552,14 @@ def _run_block_scaled_registered_backward(
         *weights,
         topk_expert_ids_TK,
         topk_scores_TK,
-        *routing,
+        *padded_routing,
         need_recompute,
         *offsets[:9],
         activation_offsets,
         recompute_condition,
         _optional_state(postprocess_context),
         offsets[9],
+        *routing,
     )
     # 3. Delegate to the single backward implementation and expose only the
     # four public autograd gradients from its full positional result.
@@ -5701,6 +6287,11 @@ def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public executio
         blockscaled_cfg,
         interleaved_fc13=interleaved_fc13,
         save_dequantized_activations=save_dequantized_activations,
+        compact_dequantized_activations=(
+            save_dequantized_activations
+            and activation_buffer.model_config is not None
+            and activation_buffer.model_config.compact_dequantized_activations
+        ),
         static_inference_storage=(
             blockscaled_cfg.static_inference_storage
             and not save_dequantized_activations

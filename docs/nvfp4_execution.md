@@ -189,11 +189,13 @@ configuration selects this planner-backed execution; operands are not
 individually reclassified or separately mapped. The packed row format and
 arithmetic are unchanged by that choice.
 
-Training uses the hybrid activation plan. A full-save decision retains
-packed gathered X (qdata, block scales, and inverse row scales), the BF16 H1
-emitted by the real NVFP4 W13 GEMM, and BF16 H3. A recompute decision retains
-only the original local BF16 X. Both decisions keep fixed routing, planner,
-and postprocessing state. H2 and dynamic weight quants are transient scratch.
+Training uses the hybrid activation plan. A full-save decision retains Q-DQ
+BF16 gathered X, the BF16 H1 emitted by the real NVFP4 W13 GEMM, and BF16 H3.
+A recompute decision retains only the original local BF16 X. If the selected
+non-VMM slot guarantees full-save for every executable route count, X and H1
+omit the per-expert 128-row sentinels and backward retains a second,
+sentinel-free routing view. H2, gathered packed X, and dynamic weight quants
+are transient scratch.
 
 <a id="follow-the-forward-pass"></a>
 ## Follow the forward pass
@@ -218,12 +220,13 @@ local token results `A/B`; rank 1 performs the symmetric work for `C/D`.
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | `_stage_blockscaled_dispatch` | local BF16 `x_TD` | packed qdata, E4M3 scales, and FP32 inverse row scale | local rank's symmetric dispatch HBM | packed rows are transient | none inside quantization |
 | 2 | `_ep_barrier` | dispatch and routing publication state | symmetric-memory signal state | device | routing state is retained for training | EP device barrier before peer reads |
-| 3 | `dist_dispatch_routing` | global top-k IDs and published row addresses | per-expert counts, gather pointers, scatter pointers | local HBM metadata referring to local or peer HBM | retained for training | no CPU synchronization |
-| 4 | planner binding | received-row counts and static model geometry | activation-slot and scratch offsets; static views only for device-only inference Mega | context-owned memory | training dynamically selects full-save or recompute | planner-backed paths run `get_forward_plan`; device-only inference Mega skips that launch and the unused count clone |
-| 5a | staged distributed W13 GEMM | peer packed rows and dynamic/prepared W13 operands | gathered packed X and BF16 H1 | activation slot or scratch | full-save retains packed X and H1 | kernel-internal producer/consumer ordering |
+| 3 | `dist_dispatch_routing` | global top-k IDs and published row addresses | padded per-expert counts and pointers; optional sentinel-free copies for compact full-save | local HBM metadata referring to local or peer HBM | retained for training | no CPU synchronization |
+| 4 | planner binding | padded and optional exact received-row counts plus static model geometry | activation-slot and scratch offsets; static views only for device-only inference Mega | context-owned memory | training dynamically selects full-save or recompute | planner-backed paths run `get_forward_plan`; device-only inference Mega skips that launch and the unused count clone |
+| 5a | staged distributed W13 GEMM | peer packed rows and dynamic/prepared W13 operands | transient gathered packed X and padded BF16 H1 | scratch or activation slot | full-save retains decoded BF16 X and BF16 H1 | kernel-internal producer/consumer ordering |
 | 5b | staged fused SwiGLU/W2/combine | H1, dynamic/prepared W2 operands, scatter pointers | packed H2 scratch and BF16 H3 | activation slot, scratch, and peer combine HBM | full-save retains H3; H2 is never retained | device barrier before peer combine consumption |
-| 5c | Mega fused forward | packed rows, both dynamic/prepared weights, routing metadata, and planner/static views | BF16 H1/H3 and internal packed compute operands | activation slot, scratch, and peer combine HBM | full-save retains H1/H3 | fixed chunk-pipeline ordering and peer barrier |
-| 5d | Mega packed-X save copy | peer packed rows and gather pointers | canonical expert-padded gathered packed X | activation slot | runs only for full-save; staged performs this copy inside W13 | EP barrier keeps peer dispatch rows live through the copy |
+| 5c | Mega fused forward | packed rows, both dynamic/prepared weights, routing metadata, and planner/static views | padded BF16 H1, BF16 H3, and internal packed compute operands | activation slot, scratch, and peer combine HBM | full-save retains BF16 H1/H3 | fixed chunk-pipeline ordering and peer barrier |
+| 5d | Mega packed-X staging copy | peer packed rows and gather pointers | canonical expert-padded gathered packed X | scratch | runs only for full-save; staged performs this copy inside W13 | EP barrier keeps peer dispatch rows live through the copy |
+| 5e | full-save conversion | gathered packed X, padded H1, padded and exact counts | Q-DQ BF16 X and BF16 H1 in exact expert order | activation slot | retained through backward | H1 copy is a no-op when the two layouts coincide |
 | 6 | `_async_forward_postprocess` | combined rows and top-k scores | BF16 `y_TD` | local HBM | returned output only | no host synchronization |
 
 Only one of the staged pair or the Mega launch executes. Both consume the same
@@ -241,13 +244,14 @@ sequence to the BF16 implementation.
 If the device planner selected recompute, backward republishes the saved local
 X as packed NVFP4 and repeats staged W13 forward compute, rebuilding gathered
 packed X and H1. This staged reconstruction is used for both original forward
-pipelines. If it selected full-save, packed X and H1 already occupy the
-activation slot. In both cases, backward decodes the selected packed X into
-BF16 `X_bw` scratch before the existing BF16 W13 WGRAD.
+pipelines. If it selected full-save, Q-DQ BF16 X and H1 already occupy the
+activation slot, so W13 WGRAD reads the saved BF16 X directly.
 
 For both decisions, backward reruns SwiGLU and the NVFP4 W2 forward kernel,
 then dequantizes the quantized SwiGLU result as
-`H2_bw = DQ(Q(SwiGLU(H1)))`. The existing BF16 sequence then performs:
+`H2_bw = DQ(Q(SwiGLU(H1)))`. Compact full-save expands H1 only for this NVFP4
+rematerialization and writes `H2_bw` directly in sentinel-free expert order.
+The existing BF16 sequence then performs:
 
 ```text
 grad_Y, scores, H3
@@ -261,9 +265,8 @@ grad_Y, scores, H3
 ```
 
 The planner rewind, WGRAD ownership/callback policy, postprocessing backward,
-and output-gradient ownership are the BF16 contracts. Packed gathered X
-crosses the forward/backward lifetime inside the planner-owned activation
-slot; Q(H2) and Q(W) do not.
+and output-gradient ownership are the BF16 contracts. Q(H2), gathered packed
+X, and Q(W) do not cross the forward/backward lifetime.
 
 <a id="understand-the-packed-dispatch-row"></a>
 ## Understand the packed dispatch row
