@@ -15,7 +15,7 @@ q(a_bf16) -> a_nvfp4: packed qdata and every required scale
 a_q_dq_bf16 = dq(a_nvfp4)
 ```
 
-## Forward
+## Staged forward
 
 ```text
 BF16 FORWARD                                                             | IMPLEMENTED NVFP4 TRAINING FORWARD
@@ -106,7 +106,7 @@ h2_bf16 is never persistent.                                             | x_gat
                                                                          | retain the M_pad routed-row layout on current main.
 ```
 
-## Backward
+## Staged backward
 
 ```text
 BF16 BACKWARD                                                            | IMPLEMENTED NVFP4 TRAINING BACKWARD
@@ -240,4 +240,100 @@ NVFP4:  x_q_dq_for_bwd_bf16,
 
 w2_q_dq_bf16 and w13_q_dq_bf16 are materialized just in time for their
 respective DGRAD kernels and never coexist.
+```
+
+## Mega forward
+
+```text
+BF16 FORWARD                                                             | IMPLEMENTED NVFP4 MEGA TRAINING FORWARD
+-------------------------------------------------------------------------+--------------------------------------------------------------------------------
+Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id        | Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
+                                                                         | w13_bf16, w2_bf16
+                                                                         |      │
+                                                                         |      │ dynamic per-expert quantization
+                                                                         |      ▼
+                                                                         | w13_nvfp4 = q(w13_bf16), w2_nvfp4 = q(w2_bf16) [S; not saved]
+                                                                         |
+x_bf16 + topk_ids                                                        | x_bf16 + topk_ids
+          │                                                              |      │
+          │ copy_routing_and_dispatch                                    |      ├── copy routing
+          │                                                              |      └── quantize/publish x
+          ▼                                                              |      ▼
+dispatch_x_bf16 [SYM]                                                    | x_nvfp4 = q(x_bf16) [SYM]
+routing_ids, routing_token_count                                         | routing_ids, routing_token_count
+          │                                                              |      │
+          └──────────── dispatch barrier ────────────┐                   |      └──────────── dispatch barrier ────────────┐
+                                                    ▼                    |                                                    ▼
+                                         dist_dispatch_routing           |                                         dist_dispatch_routing
+                                                    │                    |                                                    │
+                                                    ├── expert_counts    |                                                    ├── expert_counts
+                                                    ├── recv_by_rank     |                                                    ├── recv_by_rank
+                                                    ├── recv_count       |                                                    ├── recv_count
+                                                    └── fwd_gather_ptrs, |                                                    └── fwd_gather_ptrs,
+                                                        bwd_gather_ptrs, |                                                        bwd_gather_ptrs,
+                                                        scatter_ptrs     |                                                        scatter_ptrs
+                                                    │                    |                                                    │
+                                                    ▼                    |                                                    ▼
+                                         device forward planner          |                                         hybrid device forward planner
+                                         inputs: recv_count,             |                                         inputs: recv_count,
+                                         recv_by_rank, slot_id           |                                         recv_by_rank, slot_id
+                                                    │                    |                                                    │
+                           need_recompute, forward_state, recv_snapshot  |     need_recompute, recompute_condition, forward_offsets,
+                                                    │                    |     activation_offsets, recv_snapshot
+                                  ┌─────────────────┴──────────────┐     |                                  ┌─────────────────┴──────────────┐
+                                  │                                │     |                                  │                                │
+                              full-save                        recompute |                              full-save                        recompute
+                                  │                                │     |                                  │                                │
+                                  │                  x_saved_bf16 [P]    |                                  │                  x_saved_bf16 [P]
+                                  │                                │     |                                  │                                │
+                                  ▼                                ▼     |                                  ▼                                ▼
+┌──────────────────────────────────────────────────────────────┐         | ┌──────────────────────────────────────────────────────────────┐
+│ KERNEL: peer gather + BF16 W13 GEMM                          │         | │ ONE MEGA KERNEL:                                              │
+│ inputs: dispatch_x_bf16, fwd_gather_ptrs, expert_counts,     │         | │   NVFP4 W13 GEMM + q(SwiGLU) + NVFP4 W2 GEMM + peer scatter   │
+│         w13_bf16                                             │         | │ inputs: x_nvfp4 [SYM], w13_nvfp4, w2_nvfp4,                   │
+│ outputs: x_gathered_bf16, h1_bf16                            │         | │         fwd_gather_ptrs, scatter_ptrs, expert_counts          │
+│ default presets also fuse SwiGLU and output h2_bf16          │         | │ HBM handoff: W13 writes h1_bf16; q(SwiGLU) reads h1_bf16      │
+└──────────────────────────────┬───────────────────────────────┘         | │              and writes h2_nvfp4; W2 reloads h2_nvfp4        │
+                               ├── x_gathered_bf16 [P] or [S]            | │ outputs: h1_bf16 [P or S; HBM], h2_nvfp4 [S; HBM],            │
+                               │                                         | │          h3_route_bf16 [SYM]                                  │
+                               │                                         | └──────────────────────────────┬───────────────────────────────┘
+                               ├── h1_bf16 [P] or [S]                    |                                │
+                               └── h2_bf16 [S]                           |                                ├── h1_bf16 [P or S; HBM]
+                                   (otherwise standalone SwiGLU)         |                                ├── h2_nvfp4 [S; HBM]
+                                             │                           |                                └── h3_route_bf16 [SYM]
+                                             ▼                           |                                             │
+┌──────────────────────────────────────────────────────────────┐         |                                             │ full-save only
+│ KERNEL: BF16 W2 GEMM + peer scatter                          │         |                                             ▼
+│ inputs: h2_bf16, w2_bf16, expert_counts, scatter_ptrs        │         | ┌──────────────────────────────────────────────────────────────┐
+│ output: h3_route_bf16 [SYM]                                  │         | │ KERNEL: peer gather/copy packed X                            │
+└──────────────────────────────┬───────────────────────────────┘         | │ inputs: x_nvfp4 [SYM], fwd_gather_ptrs, recv_count           │
+                               │                                         | │ output: x_gathered_nvfp4 [S]                                 │
+                               │                                         | └──────────────────────────────┬───────────────────────────────┘
+                               │                                         |                                │ dispatch-lifetime barrier
+                               │                                         |                                ▼
+                               │                                         | ┌──────────────────────────────────────────────────────────────┐
+                               │                                         | │ KERNEL: dq(x_gathered_nvfp4)                                 │
+                               │                                         | │ output: x_q_dq_for_bwd_bf16 [P, M_pad,D]                     │
+                               │                                         | └──────────────────────────────┬───────────────────────────────┘
+                               ▼                                         |                                ▼
+h3_route_bf16 [SYM] ── combine barrier                                   | h3_route_bf16 [SYM] ── combine barrier
+          │                                                              |      │
+          ▼                                                              |      ▼
+score × h3_route_bf16 + top-k reduction                                  | score × h3_route_bf16 + top-k reduction
+inputs: h3_route_bf16, topk_scores                                       | inputs: h3_route_bf16, topk_scores
+outputs: y_bf16; full-save also writes h3_saved_bf16 [P]                 | outputs: y_bf16; full-save also writes h3_saved_bf16 [P]
+                                                                         |
+Full-save: [x_gathered_bf16 [M_dense,D], h1_bf16 [M_dense,2F],           | Full-save: [x_q_dq_for_bwd_bf16 [M_pad,D],
+            h3_saved_bf16 [T,K,D]]                                       |             h1_bf16 [M_pad,2F], h3_saved_bf16 [T,K,D]]
+Recompute: [x_saved_bf16 [T,D]]                                          | Recompute: [x_saved_bf16 [T,D]]
+                                                                         |
+Both save: weights, topk_ids/scores, expert_counts, recv_count,          | Fixed state retains every named metadata tensor:
+fwd_gather_ptrs, bwd_gather_ptrs, scatter_ptrs, recv_snapshot,           | expert_counts, fwd_gather_ptrs, bwd_gather_ptrs, scatter_ptrs,
+need_recompute, forward_state, slot and postprocess state.               | recv_count, recv_snapshot, need_recompute, recompute_condition,
+                                                                         | forward_offsets, activation_offsets, slot and postprocess state.
+                                                                         | Native BF16 weights and topk_ids/scores are also retained.
+                                                                         |
+h2_bf16 is never persistent.                                             | x_gathered_nvfp4, h2_nvfp4, published x_nvfp4, w13_nvfp4, and
+                                                                         | w2_nvfp4 are transient. Saved x_q_dq_for_bwd_bf16 and h1_bf16
+                                                                         | retain the M_pad routed-row layout on current main.
 ```
