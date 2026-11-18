@@ -1234,6 +1234,26 @@ class _Nvfp4Bf16BackwardAdapter:
     w2: _BlockscaledWeight
     num_sms: int | None
 
+    def materialize_w2_dgrad_weight(self) -> torch.Tensor:
+        """Decode packed W2 into its transient BF16 DGRAD operand."""
+        global_scale_inv = self.w2.w_global_scale_inv
+        assert global_scale_inv is not None
+        return _dequantize_nvfp4_weight(
+            self.w2.w_q_fprop,
+            self.w2.w_scale_fprop,
+            global_scale_inv,
+        )
+
+    def materialize_w13_dgrad_weight(self) -> torch.Tensor:
+        """Decode packed W13 into its transient BF16 DGRAD operand."""
+        global_scale_inv = self.w13.w_global_scale_inv
+        assert global_scale_inv is not None
+        return _dequantize_nvfp4_weight(
+            self.w13.w_q_fprop,
+            self.w13.w_scale_fprop,
+            global_scale_inv,
+        )
+
     def recreate_forward_activations(
         self,
         *,
@@ -2906,16 +2926,6 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     raise RuntimeError(
                         f"NVFP4 backward requires {name} inverse global scales"
                     )
-            w13_dq_EFD = _dequantize_nvfp4_weight(
-                w13_handle.blockscaled.w_q_fprop,
-                w13_handle.blockscaled.w_scale_fprop,
-                w13_handle.blockscaled.w_global_scale_inv,
-            )
-            w2_dq_EDF = _dequantize_nvfp4_weight(
-                w2_handle.blockscaled.w_q_fprop,
-                w2_handle.blockscaled.w_scale_fprop,
-                w2_handle.blockscaled.w_global_scale_inv,
-            )
 
             # Adapt only the forward-value reconstruction. The planner rewind,
             # postprocessing, native DGRAD/WGRAD kernels, gradient publication,
@@ -2961,9 +2971,21 @@ class _BlockScaledAutograd(torch.autograd.Function):
                     num_sms=num_sms,
                 ),
             )
+            # The shared BF16 path needs weight shape/dtype/device metadata
+            # before DGRAD, but the adapter supplies the actual Q-DQ operands
+            # just in time. Zero-stride views carry that metadata without
+            # allocating another logical weight-sized tensor.
+            w13_metadata_EFD = grad_output_TD.as_strided(
+                dense_ctx.w13_input_shape,
+                (0,) * len(dense_ctx.w13_input_shape),
+            )
+            w2_metadata_EDF = grad_output_TD.as_strided(
+                dense_ctx.w2_input_shape,
+                (0,) * len(dense_ctx.w2_input_shape),
+            )
             dense_ctx.saved_tensors = (
-                w13_dq_EFD,
-                w2_dq_EDF,
+                w13_metadata_EFD,
+                w2_metadata_EDF,
                 topk_expert_ids_TK,
                 topk_scores_TK,
                 num_tokens_per_local_expert_E,
