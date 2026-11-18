@@ -1047,6 +1047,16 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
                 selected_slot_bytes,
                 maximum_useful_slot_bytes,
             )
+        if (
+            config.vmm is None
+            and model_config.save_dequantized_activations
+            and selected_slot_bytes >= maximum_useful_slot_bytes
+        ):
+            # This slot can retain every layer at the device routing capacity,
+            # so the planner cannot select recompute. Gathered BF16 X is now
+            # persistent and its otherwise worst-case decode destination is
+            # unreachable. Partial-capacity slots retain full recompute scratch.
+            device_scratch = _align_memory(model_config.saved_bf16_x_scratch_mem_size)
     total_activation_bytes = num_slots * selected_slot_bytes
     total_device_buffer = total_activation_bytes + device_scratch
     balanced_rows = config.max_num_local_input_tokens * config.top_k

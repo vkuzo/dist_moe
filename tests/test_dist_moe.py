@@ -888,12 +888,12 @@ def _run_nvfp4_forward_with_saved_activations(
     )
 
 
-def _decode_saved_nvfp4_x(
+def _read_saved_bf16_x(
     activation_buffer: ActivationBuffer,
     state: list[torch.Tensor],
     hidden_dim: int,
 ) -> torch.Tensor:
-    """Decode the forward-retained gathered NVFP4 rows into test scratch.
+    """Read the forward-retained gathered BF16 rows.
 
     Args:
         activation_buffer: Planner-owned byte storage containing saved X.
@@ -904,34 +904,10 @@ def _decode_saved_nvfp4_x(
         BF16 gathered rows with shape ``[num_recv_tokens, hidden_dim]``.
     """
     num_recv_tokens = int(state[15].item())
-    output_offset = torch.tensor(
-        [activation_buffer.activation_slot_bytes],
-        dtype=torch.int64,
-        device=activation_buffer.buffer.device,
-    )
+    output_offset = int(state[17][1].item())
     output_bytes = num_recv_tokens * hidden_dim * torch.bfloat16.itemsize
-    if int(output_offset.item()) + output_bytes > activation_buffer.buffer.numel():
-        raise RuntimeError("test decode does not fit in activation-buffer scratch")
-    activation_offsets = state[18]
-    blockscaled_impl._dequantize_nvfp4_activation_buffer_to_buffer(
-        activation_buffer.buffer,
-        activation_offsets.narrow(0, blockscaled_impl.ACTIVATION_A_Q_OFFSET, 1),
-        activation_offsets.narrow(
-            0,
-            blockscaled_impl.ACTIVATION_A_SCALE_OFFSET,
-            1,
-        ),
-        state[15],
-        output_offset,
-        state[16],
-        num_recv_tokens,
-        hidden_dim,
-        True,
-    )
     return (
-        activation_buffer.buffer[
-            output_offset.item() : output_offset.item() + output_bytes
-        ]
+        activation_buffer.buffer[output_offset : output_offset + output_bytes]
         .view(torch.bfloat16)
         .view(num_recv_tokens, hidden_dim)
     )
@@ -1879,6 +1855,41 @@ class DistMoeConfigTest(unittest.TestCase):
 
         self.assertEqual(plan.balanced_recv_rows, 200)
         self.assertEqual(plan.device_scratch_capacity_rows, 768)
+
+    def test_nvfp4_full_save_plan_drops_saved_bf16_x_scratch(self) -> None:
+        """Reserve the X decode destination only when recompute is reachable."""
+        config = dist_moe.Config(
+            max_num_local_input_tokens=128,
+            hidden_dim=256,
+            intermediate_dim=256,
+            top_k=2,
+            num_experts=4,
+            max_moe_layers_per_activation_slot=1,
+            device_scratch_capacity_factor=1.0,
+            activation_slot_capacity_factor=1.0,
+            block_scaled=dist_moe.BlockScaledConfig(
+                format=dist_moe.BlockScaledFormat.NVFP4,
+            ),
+        )
+        model_config = api_impl._model_config(config, ep_size=2)
+        full_save = dist_moe.plan_memory(config, ep_size=2)
+        partial_save = dist_moe.plan_memory(
+            dataclasses.replace(config, activation_slot_capacity_factor=0.5),
+            ep_size=2,
+        )
+
+        self.assertEqual(
+            full_save.device_scratch_bytes,
+            api_impl._align_memory(model_config.saved_bf16_x_scratch_mem_size),
+        )
+        self.assertLess(
+            full_save.device_scratch_bytes,
+            partial_save.device_scratch_bytes,
+        )
+        self.assertEqual(
+            partial_save.device_scratch_bytes,
+            model_config.scratch_mem_size,
+        )
 
     def test_blockscaled_uses_activation_buffer_and_vmm_controls(self) -> None:
         """VMM preserves offset scratch rather than static inference layouts."""
@@ -4867,14 +4878,14 @@ class DistMoeKernelTest(unittest.TestCase):
         )
 
     def test_nvfp4_forward_saves_reference_backward_activations(self) -> None:
-        """Save packed X and real BF16 GEMM boundaries for backward.
+        """Save BF16 X and real BF16 GEMM boundaries for backward.
 
         Staged and Mega must preserve their current output bitwise. The saved
-        packed X is decoded from the activation slot and compared bitwise with
-        the Dist-MoE quantizer plus independent golden decoder. H1 and H3 are
-        compared with the real-quantized per-expert reference at tight bounds. Guard
-        bytes and empty weight-state slots prove that H2 and dynamic weight
-        quants do not persist in the activation slot or fixed state schema.
+        BF16 X is compared bitwise with the Dist-MoE quantizer plus independent
+        golden decoder. H1 and H3 are compared with the real-quantized
+        per-expert reference at tight bounds. Guard bytes and empty weight-state
+        slots prove that H2 and dynamic weight quants do not persist in the
+        activation slot or fixed state schema.
         """
         for pipeline in ("staged", "mega"):
             with self.subTest(pipeline=pipeline):
@@ -4971,8 +4982,12 @@ class DistMoeKernelTest(unittest.TestCase):
                     ),
                     offsets[5] + x_q_size,
                 )
-                self.assertEqual(offsets[2], offsets[5] + x_q_size + x_scale_size)
-                x_q_dq_MD = _decode_saved_nvfp4_x(
+                self.assertEqual(
+                    offsets[2],
+                    offsets[1]
+                    + num_recv_tokens * x_TD.shape[1] * torch.bfloat16.itemsize,
+                )
+                x_q_dq_MD = _read_saved_bf16_x(
                     activation_buffer,
                     state,
                     x_TD.shape[1],
@@ -8237,12 +8252,12 @@ class DistMoeTwoRankTest(unittest.TestCase):
         )
 
     @with_comms
-    def test_nvfp4_saved_packed_x_exercises_peer_gather_paths(self) -> None:
-        """Match saved packed rows gathered through real two-rank peer pointers.
+    def test_nvfp4_saved_bf16_x_exercises_peer_gather_paths(self) -> None:
+        """Match saved BF16 rows gathered through real two-rank peer pointers.
 
         Every local expert receives tokens from both ranks. Comparing the
-        decoded expert-grouped activation slot with Dist-MoE's independent
-        per-token Q-DQ primitive proves that saved NVFP4 X follows routed row
+        expert-grouped activation slot with Dist-MoE's independent per-token
+        Q-DQ primitive proves that saved BF16 X follows routed row
         order and masks padding.
         """
         rank = dist.get_rank()
@@ -8340,7 +8355,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
             offsets = state[17].tolist()
             self.assertEqual(offsets[1], 0)
             num_recv_tokens = int(state[15].item())
-            x_q_dq_MD = _decode_saved_nvfp4_x(
+            x_q_dq_MD = _read_saved_bf16_x(
                 activation_buffer,
                 state,
                 hidden_dim,
