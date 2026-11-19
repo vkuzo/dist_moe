@@ -96,6 +96,7 @@ from ..formats import (
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
 from ._cuda_context import ensure_cuda_driver_context
+from ._dsl_compat import thread_exit
 from ._jit_cache import jit_cache
 from ._kernel_name_prefix import scoped_kernel_name_prefixes
 from ._quack.cute_dsl_utils import torch2cute_dtype_map
@@ -148,6 +149,21 @@ from .blockscaled_quantization_common import (
     _store_qdata_row_words,
     _target_max_for_format_id,
     _warp_reduce_amax_f32,
+)
+from .activation_buffer import (
+    ACTIVATION_A_Q_OFFSET,
+    ACTIVATION_A_SCALE_OFFSET,
+    ACTIVATION_OFFSET_COUNT,
+    ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE,
+    activation_buffer_placeholder,
+    validate_activation_buffer_launch,
+    validate_conditional_execution,
+)
+from .activation_buffer_kernel import (
+    _activation_buffer_row_global_scale_tensor,
+    _activation_buffer_row_scale_storage_byte_extent,
+    _activation_buffer_tensor_with_byte_extent,
+    _require_valid_activation_buffer_range,
 )
 
 _INPUT_DTYPE_TAG = {
@@ -1547,6 +1563,223 @@ class _QuantizeNvfp4PerTokenRowDecodeClear(_QuantizeNvfp4PerTokenRow):
                     mWorkspace1[off] = Int32(0)
                 if off < mRoutingOut.shape[0]:
                     mRoutingOut[off] = Int16(mExpertIds[off])
+
+
+class _QuantizeNvfp4SwigluActivationBuffer(_QuantizeNvfp4PerTokenRow):
+    """Quantize SwiGLU rows between device-selected activation-buffer offsets."""
+
+    @staticmethod
+    @jit_cache
+    def compile(
+        input_dtype: type[cutlass.Numeric],
+        K: int,
+        fast_math: bool,
+        use_four_over_six: bool,
+        clamped: bool,
+        alpha: float,
+        limit: float,
+    ) -> object:
+        name_prefix = (
+            _QuantizeNvfp4PerTokenRow._name_prefix(
+                input_dtype,
+                K,
+                SCALE_FACTOR_LAYOUT_CUBLAS_BLOCKED,
+                BLOCK_SCALED_PRODUCER_SWIGLU_FWD,
+                fast_math,
+                use_four_over_six,
+                clamped,
+                alpha,
+                limit,
+            )
+            + "_activation_buffer"
+        )
+        rows = cute.sym_int()
+        scale_elems = cute.sym_int()
+        source = cute.runtime.make_fake_tensor(
+            input_dtype,
+            (rows, K),
+            stride=(2 * K, 1),
+            assumed_align=16,
+        )
+        q_words = fake_tensor(Uint32, (rows, K // 8), 4)
+        scale = fake_tensor(Uint8, (scale_elems,), 1)
+        token_scale_inv = fake_tensor(Float32, (rows,), 4)
+        offset = fake_tensor(Int64, (1,))
+        activation_offsets = fake_tensor(
+            Int64,
+            (ACTIVATION_OFFSET_COUNT,),
+        )
+        num_rows = fake_tensor(Int32, (1,), 4)
+        condition = fake_tensor(Int32, (1,), 4)
+        nvfp4_recip_lut = fake_tensor(Float32, (256,), 4)
+        with scoped_kernel_name_prefixes(
+            ((_QuantizeNvfp4SwigluActivationBuffer.kernel, name_prefix),)
+        ):
+            return cute.compile(
+                _QuantizeNvfp4SwigluActivationBuffer(
+                    input_dtype,
+                    K,
+                    SCALE_FACTOR_LAYOUT_CUBLAS_BLOCKED,
+                    BLOCK_SCALED_PRODUCER_SWIGLU_FWD,
+                    fast_math,
+                    use_four_over_six,
+                    clamped,
+                    alpha,
+                    limit,
+                ),
+                source,
+                source,
+                q_words,
+                scale,
+                token_scale_inv,
+                cutlass.Int64(0),
+                cutlass.Int64(1),
+                offset,
+                activation_offsets,
+                num_rows,
+                condition,
+                nvfp4_recip_lut,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--enable-tvm-ffi",
+            )
+
+    @cute.jit
+    def __call__(
+        self,
+        mGate: cute.Tensor,
+        mUp: cute.Tensor,
+        mQWords: cute.Tensor,
+        mScale: cute.Tensor,
+        mTokenScaleInv: cute.Tensor,
+        activation_buffer_base_ptr: Int64,
+        activation_buffer_size_bytes: Int64,
+        mH1Offset: cute.Tensor,
+        mActivationOffsets: cute.Tensor,
+        mNumRows: cute.Tensor,
+        mCondition: cute.Tensor,
+        mNvfp4RecipLut: cute.Tensor,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            mGate,
+            mUp,
+            mQWords,
+            mScale,
+            mTokenScaleInv,
+            activation_buffer_base_ptr,
+            activation_buffer_size_bytes,
+            mH1Offset,
+            mActivationOffsets,
+            mNumRows,
+            mCondition,
+            mNvfp4RecipLut,
+        ).launch(
+            grid=[mQWords.shape[0], 1, 1],
+            block=[self.num_threads, 1, 1],
+            smem=self.reduction_slots * 4,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGate: cute.Tensor,
+        mUp: cute.Tensor,
+        mQWords: cute.Tensor,
+        mScale: cute.Tensor,
+        mTokenScaleInv: cute.Tensor,
+        activation_buffer_base_ptr: Int64,
+        activation_buffer_size_bytes: Int64,
+        mH1Offset: cute.Tensor,
+        mActivationOffsets: cute.Tensor,
+        mNumRows: cute.Tensor,
+        mCondition: cute.Tensor,
+        mNvfp4RecipLut: cute.Tensor,
+    ) -> None:
+        if mCondition[0] != Int32(0):
+            thread_exit()
+
+        row, _, _ = cute.arch.block_idx()
+        num_rows = Int32(mNumRows[0])
+        if row >= num_rows:
+            thread_exit()
+
+        h1_offset = Int64(mH1Offset[0])
+        source_element_size = cutlass.const_expr(self.input_dtype.width // 8)
+        h1_byte_extent = (
+            Int64(num_rows) * Int64(2 * self.K) * Int64(source_element_size)
+        )
+        if (row == Int32(0)) & (cute.arch.thread_idx()[0] == Int32(0)):
+            _require_valid_activation_buffer_range(
+                byte_offset=h1_offset,
+                byte_extent=h1_byte_extent,
+                activation_buffer_size_bytes=activation_buffer_size_bytes,
+                warp_scoped_diagnostic=False,
+            )
+
+        gate_ptr = cute.make_ptr(
+            self.input_dtype,
+            activation_buffer_base_ptr + h1_offset,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        up_ptr = cute.make_ptr(
+            self.input_dtype,
+            activation_buffer_base_ptr
+            + h1_offset
+            + Int64(self.K * source_element_size),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        mGate = cute.make_tensor(gate_ptr, mGate.layout)
+        mUp = cute.make_tensor(up_ptr, mUp.layout)
+
+        q_byte_extent = Int64(num_rows) * Int64(self.K // 2)
+        mQWords = _activation_buffer_tensor_with_byte_extent(
+            mQWords,
+            activation_buffer_base_ptr,
+            activation_buffer_size_bytes,
+            mActivationOffsets,
+            ACTIVATION_A_Q_OFFSET,
+            Uint32,
+            q_byte_extent,
+        )
+        scale_byte_extent = _activation_buffer_row_scale_storage_byte_extent(
+            num_rows,
+            Int32(self.K),
+            sf_vec_size=16,
+            sf_dtype_width=8,
+        )
+        mScale = _activation_buffer_tensor_with_byte_extent(
+            mScale,
+            activation_buffer_base_ptr,
+            activation_buffer_size_bytes,
+            mActivationOffsets,
+            ACTIVATION_A_SCALE_OFFSET,
+            Uint8,
+            scale_byte_extent,
+        )
+        mTokenScaleInv = _activation_buffer_row_global_scale_tensor(
+            mTokenScaleInv,
+            activation_buffer_base_ptr,
+            activation_buffer_size_bytes,
+            mActivationOffsets,
+            num_rows,
+            Int32(self.K),
+            sf_vec_size=16,
+            sf_dtype_width=8,
+        )
+        self._quantize_row(
+            mGate,
+            mUp,
+            mQWords,
+            mQWords,
+            mScale,
+            Int64(self.K // 16),
+            mTokenScaleInv,
+            mNvfp4RecipLut,
+            row,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -5124,6 +5357,139 @@ def _dynamic_nvfp4_scale_storage(scale_bytes: torch.Tensor) -> torch.Tensor:
         0
     ) + scale_bytes.shape[1]
     return scale_bytes.as_strided((storage_elems,), (1,))
+
+
+def _quantize_nvfp4_swiglu_activation_buffer(
+    activation_buffer: torch.Tensor,
+    h1_offset: torch.Tensor,
+    activation_offsets: torch.Tensor,
+    num_rows: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    capacity_rows: int,
+    intermediate_dim: int,
+    input_dtype: torch.dtype,
+    fast_math: bool = False,
+    use_four_over_six: bool = False,
+    clamped: bool = False,
+    alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
+    limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+) -> None:
+    """Quantize SwiGLU(H1) between device-selected activation-buffer offsets.
+
+    This is the offset-backed form of ``_quantize_nvfp4_per_token``'s SwiGLU
+    producer. It is used when the forward planner saved dense H1 but H2 must
+    be reconstructed for BF16 WGRAD without rerunning the W2 GEMM.
+
+    Args:
+        activation_buffer: Contiguous byte storage containing H1 and receiving
+            the packed H2 row bundle.
+        h1_offset: Device-selected byte offset of dense ``[rows, 2F]`` H1.
+        activation_offsets: Device-selected offsets for the packed H2 bundle.
+        num_rows: One-element int32 device tensor with valid padded rows.
+        condition: One-element int32 device tensor. Quantization runs only when
+            its value is zero.
+        capacity_rows: Static row capacity used for launch geometry.
+        intermediate_dim: SwiGLU output width ``F``.
+        input_dtype: Dense H1 element type.
+        fast_math: Whether to use the approximate SiLU implementation.
+        use_four_over_six: Whether to use adaptive Four-over-Six quantization.
+        clamped: Whether to use the clamped SwiGLU producer.
+        alpha: Clamped SwiGLU alpha.
+        limit: Clamped SwiGLU limit.
+
+    Raises:
+        TypeError: If an operand dtype is unsupported.
+        ValueError: If tensor metadata or static dimensions violate the kernel
+            contract.
+    """
+    clamped, alpha, limit = canonical_swiglu_clamp(clamped, alpha, limit)
+    if capacity_rows <= 0:
+        raise ValueError(f"capacity_rows must be positive, got {capacity_rows}")
+    _QuantizeNvfp4PerTokenRow._validate_producer_k(
+        intermediate_dim,
+        BLOCK_SCALED_PRODUCER_SWIGLU_FWD,
+    )
+    if input_dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(
+            f"input_dtype must be torch.bfloat16 or torch.float16, got {input_dtype}"
+        )
+    validate_activation_buffer_launch(
+        activation_buffer=activation_buffer,
+        activation_offsets=h1_offset,
+        expected_offset_count=1,
+        device=activation_buffer.device,
+    )
+    validate_activation_buffer_launch(
+        activation_buffer=activation_buffer,
+        activation_offsets=activation_offsets,
+        expected_offset_count=ACTIVATION_OFFSET_COUNT,
+        device=activation_buffer.device,
+    )
+    validate_conditional_execution(condition, device=activation_buffer.device)
+    if condition.dtype != torch.int32:
+        raise TypeError("condition must have dtype int32")
+    if (
+        num_rows.dtype != torch.int32
+        or num_rows.shape != (1,)
+        or not num_rows.is_contiguous()
+        or num_rows.device != activation_buffer.device
+    ):
+        raise ValueError(
+            "num_rows must be a contiguous int32 tensor with shape (1,) on "
+            "the activation-buffer device"
+        )
+
+    h1 = activation_buffer_placeholder(
+        activation_buffer,
+        (capacity_rows, 2 * intermediate_dim),
+        input_dtype,
+    )
+    gate = h1[:, :intermediate_dim]
+    up = h1[:, intermediate_dim:]
+    q_words = activation_buffer_placeholder(
+        activation_buffer,
+        (capacity_rows, intermediate_dim // 8),
+        torch.uint32,
+    )
+    scale_storage = activation_buffer_placeholder(
+        activation_buffer,
+        (
+            capacity_rows
+            * ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+            * (intermediate_dim // 16),
+        ),
+        torch.uint8,
+    )
+    token_scale_inv = activation_buffer_placeholder(
+        activation_buffer,
+        (capacity_rows,),
+        torch.float32,
+    )
+
+    with ensure_cuda_driver_context():
+        _QuantizeNvfp4SwigluActivationBuffer.compile(
+            _TORCH_TO_CUTE_INPUT_DTYPE[input_dtype],
+            intermediate_dim,
+            fast_math,
+            use_four_over_six,
+            clamped,
+            alpha,
+            limit,
+        )(
+            gate,
+            up,
+            q_words,
+            scale_storage,
+            token_scale_inv,
+            cutlass.Int64(activation_buffer.data_ptr()),
+            cutlass.Int64(activation_buffer.nbytes),
+            h1_offset,
+            activation_offsets,
+            num_rows,
+            condition,
+            get_nvfp4_recip_lut(activation_buffer.device),
+        )
 
 
 def _quantize_nvfp4_per_token(  # noqa: C901 -- producer-specific host validation

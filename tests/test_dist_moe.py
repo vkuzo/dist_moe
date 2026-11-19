@@ -63,6 +63,7 @@ from dist_moe._triton_ops import (
 )
 from dist_moe.formats import (
     BlockScaledFormat as _KernelBlockScaledFormat,
+    BlockScaledProducer,
     canonical_situ_glu,
     E4M3_MIN_SUBNORMAL,
     FP4_E2M1_MAX,
@@ -73,10 +74,13 @@ from dist_moe.formats import (
     NVFP4_GLOBAL_SCALE_EPS,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
+    ScaleFactorLayout,
     SITU_GLU_GATE_BETA_DEFAULT,
     SITU_GLU_UP_BETA_DEFAULT,
 )
 from dist_moe.kernels import (
+    activation_buffer as kernel_activation_buffer,
+    blockscaled_quantize as blockscaled_quantize_impl,
     config as grouped_gemm_config_impl,
     dist_grouped_gemm as dist_grouped_gemm_impl,
     grouped_gemm as grouped_gemm_impl,
@@ -4454,6 +4458,142 @@ class DistMoeKernelTest(unittest.TestCase):
         torch.testing.assert_close(
             weight_NK.grad,
             expected_weight_grad_NK,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_nvfp4_activation_buffer_swiglu_matches_standalone(self) -> None:
+        """Match offset-backed H2 reconstruction and honor its device predicate."""
+        rows, intermediate_dim = 128, 256
+        h1_offset_value = 256
+        h1_bytes = rows * 2 * intermediate_dim * torch.bfloat16.itemsize
+        q_bytes = rows * intermediate_dim // 2
+        scale_storage_bytes = (
+            rows
+            * kernel_activation_buffer.ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+            * (intermediate_dim // 16)
+        )
+        outer_scale_bytes = rows * torch.float32.itemsize
+        q_offset_value = h1_offset_value + h1_bytes
+        scale_offset_value = q_offset_value + q_bytes
+        activation_buffer = torch.full(
+            (scale_offset_value + scale_storage_bytes + outer_scale_bytes,),
+            0xA5,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        h1_M2F = torch.randn(
+            rows,
+            2 * intermediate_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        activation_buffer[h1_offset_value : h1_offset_value + h1_bytes].view(
+            torch.bfloat16
+        ).view_as(h1_M2F).copy_(h1_M2F)
+        h1_offset = torch.tensor(
+            [h1_offset_value],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        activation_offsets = torch.full(
+            (kernel_activation_buffer.ACTIVATION_OFFSET_COUNT,),
+            kernel_activation_buffer.MISSING_ACTIVATION_OFFSET,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        activation_offsets[kernel_activation_buffer.ACTIVATION_A_Q_OFFSET] = (
+            q_offset_value
+        )
+        activation_offsets[kernel_activation_buffer.ACTIVATION_A_SCALE_OFFSET] = (
+            scale_offset_value
+        )
+        num_rows = torch.tensor([rows], dtype=torch.int32, device="cuda")
+        condition = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+        gate_MF, up_MF = h1_M2F.chunk(2, dim=1)
+        for use_four_over_six in (False, True):
+            with self.subTest(use_four_over_six=use_four_over_six):
+                expected_q, expected_scale, expected_outer_scale = (
+                    blockscaled_quantize_impl._quantize_nvfp4_per_token(
+                        gate_MF,
+                        layout=ScaleFactorLayout.CUBLAS_BLOCKED,
+                        producer_b=up_MF,
+                        producer_id=BlockScaledProducer.SWIGLU_FWD.value,
+                        use_four_over_six=use_four_over_six,
+                    )
+                )
+                blockscaled_quantize_impl._quantize_nvfp4_swiglu_activation_buffer(
+                    activation_buffer,
+                    h1_offset,
+                    activation_offsets,
+                    num_rows,
+                    condition,
+                    capacity_rows=rows,
+                    intermediate_dim=intermediate_dim,
+                    input_dtype=torch.bfloat16,
+                    use_four_over_six=use_four_over_six,
+                )
+                torch.cuda.synchronize()
+
+                actual_q = activation_buffer[q_offset_value : q_offset_value + q_bytes]
+                actual_scale = activation_buffer[
+                    scale_offset_value : scale_offset_value + expected_scale.numel()
+                ]
+                outer_scale_offset = scale_offset_value + scale_storage_bytes
+                actual_outer_scale = activation_buffer[
+                    outer_scale_offset : outer_scale_offset + outer_scale_bytes
+                ].view(torch.float32)
+                torch.testing.assert_close(
+                    actual_q,
+                    expected_q.view(torch.uint8).flatten(),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    actual_scale,
+                    expected_scale.view(torch.uint8).flatten(),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    actual_outer_scale,
+                    expected_outer_scale,
+                    rtol=0,
+                    atol=0,
+                )
+
+        condition.fill_(1)
+        q_before = activation_buffer[q_offset_value : q_offset_value + q_bytes].clone()
+        scales_before = activation_buffer[
+            scale_offset_value : scale_offset_value
+            + scale_storage_bytes
+            + outer_scale_bytes
+        ].clone()
+        blockscaled_quantize_impl._quantize_nvfp4_swiglu_activation_buffer(
+            activation_buffer,
+            h1_offset,
+            activation_offsets,
+            num_rows,
+            condition,
+            capacity_rows=rows,
+            intermediate_dim=intermediate_dim,
+            input_dtype=torch.bfloat16,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            activation_buffer[q_offset_value : q_offset_value + q_bytes],
+            q_before,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            activation_buffer[
+                scale_offset_value : scale_offset_value
+                + scale_storage_bytes
+                + outer_scale_bytes
+            ],
+            scales_before,
             rtol=0,
             atol=0,
         )
