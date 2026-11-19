@@ -845,6 +845,60 @@ def _cvt_scaled_e2m1x2_to_f32x2(
     )
 
 
+@dsl_user_op
+def _decode_scaled_nvfp4x2_to_bf16x2(
+    q_byte: Uint8,
+    scale_byte: Uint8,
+    global_scale_inv: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Decode one E2M1x2 pair with the activation decoder's operation order."""
+    q_u32 = llvm.zext(
+        T.i32(),
+        q_byte.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    scale_u32 = llvm.zext(
+        T.i32(),
+        scale_byte.ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    result = llvm.inline_asm(
+        T.i32(),
+        [
+            q_u32,
+            scale_u32,
+            global_scale_inv.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b8 q, scale_byte;\n"
+        ".reg .b16 scale_pair, lo, hi;\n"
+        ".reg .b32 value_bf16x2, scale_bf16x2;\n"
+        ".reg .f32 lo_f32, hi_f32;\n"
+        "cvt.u8.u32 q, $1;\n"
+        "cvt.u8.u32 scale_byte, $2;\n"
+        "mov.b16 scale_pair, {scale_byte, scale_byte};\n"
+        "cvt.rn.bf16x2.e2m1x2 value_bf16x2, q;\n"
+        "cvt.rn.bf16x2.e4m3x2 scale_bf16x2, scale_pair;\n"
+        "mul.rn.bf16x2 value_bf16x2, value_bf16x2, scale_bf16x2;\n"
+        "mov.b32 {lo, hi}, value_bf16x2;\n"
+        "cvt.f32.bf16 lo_f32, lo;\n"
+        "cvt.f32.bf16 hi_f32, hi;\n"
+        "mul.rn.f32 lo_f32, lo_f32, $3;\n"
+        "mul.rn.f32 hi_f32, hi_f32, $3;\n"
+        "cvt.rn.bf16x2.f32 $0, hi_f32, lo_f32; }",
+        "=r,r,r,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(result)
+
+
 @cute.jit
 def _scale_nvfp4_per_token_block(
     packed,

@@ -96,6 +96,7 @@ from ..formats import (
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
 from ._cuda_context import ensure_cuda_driver_context
+from ._dsl_compat import thread_exit
 from ._jit_cache import jit_cache
 from ._kernel_name_prefix import scoped_kernel_name_prefixes
 from ._quack.cute_dsl_utils import torch2cute_dtype_map
@@ -106,11 +107,18 @@ from ._quant_conversion import (
     _cvt_f32x4_to_fp8x4_u32_rn,
     _unpack_b16x2,
 )
+from ._quant_packing import _pack_fp4_e2m1_xn_to_u32_rn
 from ._swiglu_quant import (
     _load_swiglu_fwd_nvfp4_block,
     _quantize_swiglu_bwd_dxy_fp8_tile,
     _quantize_swiglu_fwd_fp8_tile,
 )
+from .activation_buffer import (
+    activation_buffer_placeholder,
+    validate_activation_buffer_launch,
+    validate_conditional_execution,
+)
+from .activation_buffer_kernel import _require_valid_activation_buffer_range
 from .blockscaled_quantization_common import (
     _apply_block_scaled_quant_dxy_producer,
     _apply_block_scaled_quant_producer,
@@ -129,6 +137,7 @@ from .blockscaled_quantization_common import (
     _copy_load_f16xn_as_f32,
     _copy_store_u32_words,
     _cublas_blockscaled_qscale_offset,
+    _decode_scaled_nvfp4x2_to_bf16x2,
     _fmax_nan,
     _frag_amax_nonfinite,
     _load_gather_row_as_b16x2,
@@ -1547,6 +1556,476 @@ class _QuantizeNvfp4PerTokenRowDecodeClear(_QuantizeNvfp4PerTokenRow):
                     mWorkspace1[off] = Int32(0)
                 if off < mRoutingOut.shape[0]:
                     mRoutingOut[off] = Int16(mExpertIds[off])
+
+
+class _Nvfp4SwigluQdqActivationBuffer(_QuantizeNvfp4PerTokenRow):
+    """Run SwiGLU and exact NVFP4 Q-DQ directly into a BF16 activation."""
+
+    def __init__(
+        self,
+        input_dtype: type[cutlass.Numeric],
+        K: int,
+        layout_id: int,
+        producer_id: int,
+        fast_math: bool,
+        use_four_over_six: bool,
+        clamped: bool,
+        alpha: float,
+        limit: float,
+    ) -> None:
+        super().__init__(
+            input_dtype,
+            K,
+            layout_id,
+            producer_id,
+            fast_math,
+            use_four_over_six,
+            clamped,
+            alpha,
+            limit,
+        )
+        # A warp can cover the short expert rows used by current training
+        # configurations without cross-warp barriers. Process four rows per
+        # CTA; retain the general CTA-wide reduction for larger row widths.
+        self.use_warp_rows: cutlass.Constexpr[bool] = K <= 2048
+        self.warp_blocks_per_lane: cutlass.Constexpr[int] = (
+            self.scale_cols + self.warp_size - 1
+        ) // self.warp_size
+        self.rows_per_cta: cutlass.Constexpr[int] = (
+            self.num_warps if self.use_warp_rows else 1
+        )
+
+    @staticmethod
+    @jit_cache
+    def compile(
+        K: int,
+        fast_math: bool,
+        use_four_over_six: bool,
+        clamped: bool,
+        alpha: float,
+        limit: float,
+    ) -> object:
+        name_prefix = (
+            _QuantizeNvfp4PerTokenRow._name_prefix(
+                BFloat16,
+                K,
+                SCALE_FACTOR_LAYOUT_NATURAL,
+                BLOCK_SCALED_PRODUCER_SWIGLU_FWD,
+                fast_math,
+                use_four_over_six,
+                clamped,
+                alpha,
+                limit,
+            )
+            + "_qdq_activation_buffer"
+        )
+        rows = cute.sym_int()
+        source = cute.runtime.make_fake_tensor(
+            BFloat16,
+            (rows, K),
+            stride=(2 * K, 1),
+            assumed_align=16,
+        )
+        output_words = fake_tensor(Uint32, (rows, K // 2), 16)
+        offset = fake_tensor(Int64, (1,))
+        num_rows = fake_tensor(Int32, (1,), 4)
+        condition = fake_tensor(Int32, (1,), 4)
+        nvfp4_recip_lut = fake_tensor(Float32, (256,), 4)
+        with scoped_kernel_name_prefixes(
+            ((_Nvfp4SwigluQdqActivationBuffer.kernel, name_prefix),)
+        ):
+            return cute.compile(
+                _Nvfp4SwigluQdqActivationBuffer(
+                    BFloat16,
+                    K,
+                    SCALE_FACTOR_LAYOUT_NATURAL,
+                    BLOCK_SCALED_PRODUCER_SWIGLU_FWD,
+                    fast_math,
+                    use_four_over_six,
+                    clamped,
+                    alpha,
+                    limit,
+                ),
+                source,
+                source,
+                output_words,
+                cutlass.Int64(0),
+                cutlass.Int64(1),
+                offset,
+                offset,
+                num_rows,
+                condition,
+                nvfp4_recip_lut,
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--enable-tvm-ffi",
+            )
+
+    @cute.jit
+    def __call__(
+        self,
+        mGate: cute.Tensor,
+        mUp: cute.Tensor,
+        mOutputWords: cute.Tensor,
+        activation_buffer_base_ptr: Int64,
+        activation_buffer_size_bytes: Int64,
+        mH1Offset: cute.Tensor,
+        mH2Offset: cute.Tensor,
+        mNumRows: cute.Tensor,
+        mCondition: cute.Tensor,
+        mNvfp4RecipLut: cute.Tensor,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            mGate,
+            mUp,
+            mOutputWords,
+            activation_buffer_base_ptr,
+            activation_buffer_size_bytes,
+            mH1Offset,
+            mH2Offset,
+            mNumRows,
+            mCondition,
+            mNvfp4RecipLut,
+        ).launch(
+            grid=[cute.ceil_div(mOutputWords.shape[0], self.rows_per_cta), 1, 1],
+            block=[self.num_threads, 1, 1],
+            smem=0 if self.use_warp_rows else self.reduction_slots * 4,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mGate: cute.Tensor,
+        mUp: cute.Tensor,
+        mOutputWords: cute.Tensor,
+        activation_buffer_base_ptr: Int64,
+        activation_buffer_size_bytes: Int64,
+        mH1Offset: cute.Tensor,
+        mH2Offset: cute.Tensor,
+        mNumRows: cute.Tensor,
+        mCondition: cute.Tensor,
+        mNvfp4RecipLut: cute.Tensor,
+    ) -> None:
+        if mCondition[0] != Int32(0):
+            thread_exit()
+
+        block_row, _, _ = cute.arch.block_idx()
+        row = block_row
+        if cutlass.const_expr(self.use_warp_rows):
+            row = block_row * self.rows_per_cta + cute.arch.make_warp_uniform(
+                cute.arch.warp_idx()
+            )
+        num_rows = Int32(mNumRows[0])
+        if row >= num_rows:
+            thread_exit()
+
+        h1_offset = Int64(mH1Offset[0])
+        h2_offset = Int64(mH2Offset[0])
+        h1_byte_extent = Int64(num_rows) * Int64(2 * self.K * 2)
+        h2_byte_extent = Int64(num_rows) * Int64(self.K * 2)
+        if (row == Int32(0)) & (cute.arch.thread_idx()[0] == Int32(0)):
+            _require_valid_activation_buffer_range(
+                byte_offset=h1_offset,
+                byte_extent=h1_byte_extent,
+                activation_buffer_size_bytes=activation_buffer_size_bytes,
+                warp_scoped_diagnostic=False,
+            )
+            _require_valid_activation_buffer_range(
+                byte_offset=h2_offset,
+                byte_extent=h2_byte_extent,
+                activation_buffer_size_bytes=activation_buffer_size_bytes,
+                warp_scoped_diagnostic=False,
+            )
+
+        gate_ptr = cute.make_ptr(
+            BFloat16,
+            activation_buffer_base_ptr + h1_offset,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        up_ptr = cute.make_ptr(
+            BFloat16,
+            activation_buffer_base_ptr + h1_offset + Int64(self.K * 2),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        output_ptr = cute.make_ptr(
+            Uint32,
+            activation_buffer_base_ptr + h2_offset,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        mGate = cute.make_tensor(gate_ptr, mGate.layout)
+        mUp = cute.make_tensor(up_ptr, mUp.layout)
+        mOutputWords = cute.make_tensor(output_ptr, mOutputWords.layout)
+        if cutlass.const_expr(self.use_warp_rows):
+            self._quantize_dequantize_warp_row(
+                mGate,
+                mUp,
+                mOutputWords,
+                mNvfp4RecipLut,
+                row,
+            )
+        else:
+            self._quantize_dequantize_row(
+                mGate,
+                mUp,
+                mOutputWords,
+                mNvfp4RecipLut,
+                row,
+            )
+
+    @cute.jit
+    def _quantize_dequantize_block(
+        self,
+        packed: cute.Tensor,
+        block_rep: cutlass.Constexpr[int],
+        block_amax: Float32,
+        row_scale: Float32,
+        token_scale_inv: Float32,
+        mNvfp4RecipLut: cute.Tensor,
+        output_words: cute.Tensor,
+    ) -> None:
+        """Quantize one retained block and decode it into eight BF16x2 words."""
+        q_words = cute.make_rmem_tensor(2, Uint32)
+        if cutlass.const_expr(self.use_four_over_six):
+            scale_byte = _quantize_nvfp4_per_token_block_four_over_six(
+                packed,
+                block_rep,
+                block_amax,
+                row_scale,
+                mNvfp4RecipLut,
+                BFloat16,
+                q_words,
+            )
+        else:
+            values = cute.make_rmem_tensor(self.values_per_block, Float32)
+            scale_byte = _scale_nvfp4_per_token_block(
+                packed,
+                block_rep,
+                block_amax,
+                row_scale,
+                mNvfp4RecipLut,
+                BFloat16,
+                values,
+            )
+            _pack_fp4_e2m1_xn_to_u32_rn(
+                values,
+                q_words,
+                base=0,
+                packed_base=0,
+                recip=Float32(_FP32_ONE),
+                num_elems=self.values_per_block,
+                scale_values=False,
+            )
+
+        for q_word_idx in cutlass.range_constexpr(2):
+            for byte_idx in cutlass.range_constexpr(4):
+                shift: cutlass.Constexpr[int] = byte_idx * 8
+                q_byte = Uint8(q_words[q_word_idx] >> Uint32(shift))
+                output_words[q_word_idx * 4 + byte_idx] = (
+                    _decode_scaled_nvfp4x2_to_bf16x2(
+                        q_byte,
+                        scale_byte,
+                        token_scale_inv,
+                    )
+                )
+
+    @cute.jit
+    def _quantize_dequantize_warp_row(
+        self,
+        mGate: cute.Tensor,
+        mUp: cute.Tensor,
+        mOutputWords: cute.Tensor,
+        mNvfp4RecipLut: cute.Tensor,
+        row: Int32,
+    ) -> None:
+        """Process one short activation row independently in each warp."""
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % Int32(self.warp_size)
+
+        packed = cute.make_rmem_tensor(
+            (self.warp_blocks_per_lane, self.words_per_block),
+            Int32,
+        )
+        block_amaxes = cute.make_rmem_tensor(
+            self.warp_blocks_per_lane,
+            Float32,
+        )
+        for block_rep in cutlass.range_constexpr(self.warp_blocks_per_lane):
+            scale_col = block_rep * self.warp_size + lane
+            active = scale_col < self.scale_cols
+            _load_swiglu_fwd_nvfp4_block(
+                mGate,
+                mUp,
+                row,
+                scale_col * self.values_per_block,
+                active,
+                packed,
+                block_rep,
+                BFloat16,
+                self.fast_math,
+                self.clamped,
+                self.alpha,
+                self.limit,
+            )
+            block_amaxes[block_rep] = _compute_row_amax_b16x2_x16(
+                packed,
+                block_rep,
+                BFloat16,
+            )
+
+        row_amax = _warp_reduce_amax_f32(
+            _reduce_nvfp4_block_amaxes(
+                block_amaxes,
+                self.warp_blocks_per_lane,
+            )
+        )
+        row_scale = Float32(_FP32_ZERO)
+        token_scale_inv = Float32(_FP32_ZERO)
+        if lane == Int32(0):
+            row_scale, token_scale_inv = _compute_nvfp4_token_scales(
+                row_amax,
+                self.use_four_over_six,
+            )
+        row_scale = cute.arch.shuffle_sync(row_scale, Int32(0))
+        token_scale_inv = cute.arch.shuffle_sync(token_scale_inv, Int32(0))
+
+        for block_rep in cutlass.range_constexpr(self.warp_blocks_per_lane):
+            scale_col = block_rep * self.warp_size + lane
+            if scale_col < self.scale_cols:
+                output_words = cute.make_rmem_tensor(8, Uint32)
+                self._quantize_dequantize_block(
+                    packed,
+                    block_rep,
+                    block_amaxes[block_rep],
+                    row_scale,
+                    token_scale_inv,
+                    mNvfp4RecipLut,
+                    output_words,
+                )
+                output_word_col = scale_col * 8
+                _copy_store_u32_words(
+                    mOutputWords,
+                    row,
+                    output_word_col,
+                    output_words,
+                    4,
+                )
+                _copy_store_u32_words(
+                    mOutputWords,
+                    row,
+                    output_word_col + Int32(4),
+                    output_words,
+                    4,
+                    4,
+                )
+
+    @cute.jit
+    def _quantize_dequantize_row(
+        self,
+        mGate: cute.Tensor,
+        mUp: cute.Tensor,
+        mOutputWords: cute.Tensor,
+        mNvfp4RecipLut: cute.Tensor,
+        row: Int32,
+    ) -> None:
+        """Retain packed E2M1 and scales in registers through the BF16 store."""
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % Int32(self.warp_size)
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        packed = cute.make_rmem_tensor(
+            (self.blocks_per_lane, self.words_per_block),
+            Int32,
+        )
+        block_amaxes = cute.make_rmem_tensor(self.blocks_per_lane, Float32)
+        for block_rep in cutlass.range_constexpr(self.blocks_per_lane):
+            scale_col = block_rep * self.num_threads + tidx
+            active = scale_col < self.scale_cols
+            _load_swiglu_fwd_nvfp4_block(
+                mGate,
+                mUp,
+                row,
+                scale_col * self.values_per_block,
+                active,
+                packed,
+                block_rep,
+                BFloat16,
+                self.fast_math,
+                self.clamped,
+                self.alpha,
+                self.limit,
+            )
+            block_amaxes[block_rep] = _compute_row_amax_b16x2_x16(
+                packed,
+                block_rep,
+                BFloat16,
+            )
+
+        row_amax_local = _reduce_nvfp4_block_amaxes(
+            block_amaxes,
+            self.blocks_per_lane,
+        )
+        warp_amax = _warp_reduce_amax_f32(row_amax_local)
+        smem = cutlass.utils.SmemAllocator()
+        sReduction = smem.allocate_tensor(
+            Float32,
+            cute.make_layout((self.reduction_slots,)),
+            byte_alignment=16,
+        )
+        if lane == Int32(0):
+            sReduction[warp] = warp_amax
+        cute.arch.sync_threads()
+
+        if warp == Int32(0):
+            warpgroup_amax = (
+                sReduction[lane]
+                if lane < Int32(self.num_warps)
+                else Float32(_FP32_ZERO)
+            )
+            warpgroup_amax = _warp_reduce_amax_f32(warpgroup_amax)
+            if lane == Int32(0):
+                row_scale, token_scale_inv = _compute_nvfp4_token_scales(
+                    warpgroup_amax,
+                    self.use_four_over_six,
+                )
+                sReduction[self.token_scale_inv_slot] = token_scale_inv
+                sReduction[self.row_scale_slot] = row_scale
+        cute.arch.sync_threads()
+        token_scale_inv = sReduction[self.token_scale_inv_slot]
+        row_scale = sReduction[self.row_scale_slot]
+
+        for block_rep in cutlass.range_constexpr(self.blocks_per_lane):
+            scale_col = block_rep * self.num_threads + tidx
+            if scale_col < self.scale_cols:
+                output_words = cute.make_rmem_tensor(8, Uint32)
+                self._quantize_dequantize_block(
+                    packed,
+                    block_rep,
+                    block_amaxes[block_rep],
+                    row_scale,
+                    token_scale_inv,
+                    mNvfp4RecipLut,
+                    output_words,
+                )
+                output_word_col = scale_col * 8
+                _copy_store_u32_words(
+                    mOutputWords,
+                    row,
+                    output_word_col,
+                    output_words,
+                    4,
+                )
+                _copy_store_u32_words(
+                    mOutputWords,
+                    row,
+                    output_word_col + Int32(4),
+                    output_words,
+                    4,
+                    4,
+                )
 
 
 # -----------------------------------------------------------------------------
@@ -5124,6 +5603,113 @@ def _dynamic_nvfp4_scale_storage(scale_bytes: torch.Tensor) -> torch.Tensor:
         0
     ) + scale_bytes.shape[1]
     return scale_bytes.as_strided((storage_elems,), (1,))
+
+
+def _nvfp4_swiglu_qdq_activation_buffer(
+    activation_buffer: torch.Tensor,
+    h1_offset: torch.Tensor,
+    h2_offset: torch.Tensor,
+    num_rows: torch.Tensor,
+    condition: torch.Tensor,
+    *,
+    capacity_rows: int,
+    intermediate_dim: int,
+    input_dtype: torch.dtype,
+    fast_math: bool = False,
+    use_four_over_six: bool = False,
+    clamped: bool = False,
+    alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
+    limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+) -> None:
+    """Write exact NVFP4 Q-DQ SwiGLU rows between activation-buffer offsets.
+
+    Args:
+        activation_buffer: Contiguous byte storage containing H1 and receiving
+            the BF16 Q-DQ H2 result.
+        h1_offset: Device-selected byte offset of dense BF16 ``[rows, 2F]`` H1.
+        h2_offset: Device-selected byte offset of dense BF16 ``[rows, F]`` H2.
+        num_rows: One-element int32 device tensor with valid padded rows.
+        condition: One-element int32 device tensor. The kernel runs only when
+            its value is zero.
+        capacity_rows: Static row capacity used for launch geometry.
+        intermediate_dim: SwiGLU output width ``F``.
+        input_dtype: Dense H1 and H2 element type. Only BF16 is supported.
+        fast_math: Whether to use the approximate SiLU implementation.
+        use_four_over_six: Whether to use adaptive Four-over-Six quantization.
+        clamped: Whether to use the clamped SwiGLU producer.
+        alpha: Clamped SwiGLU alpha.
+        limit: Clamped SwiGLU limit.
+
+    Raises:
+        TypeError: If the activation dtype is not BF16.
+        ValueError: If tensor metadata or static dimensions violate the kernel
+            contract.
+    """
+    clamped, alpha, limit = canonical_swiglu_clamp(clamped, alpha, limit)
+    if capacity_rows <= 0:
+        raise ValueError(f"capacity_rows must be positive, got {capacity_rows}")
+    _QuantizeNvfp4PerTokenRow._validate_producer_k(
+        intermediate_dim,
+        BLOCK_SCALED_PRODUCER_SWIGLU_FWD,
+    )
+    if input_dtype is not torch.bfloat16:
+        raise TypeError(f"input_dtype must be torch.bfloat16, got {input_dtype}")
+    for name, offset in (("h1_offset", h1_offset), ("h2_offset", h2_offset)):
+        validate_activation_buffer_launch(
+            activation_buffer=activation_buffer,
+            activation_offsets=offset,
+            expected_offset_count=1,
+            device=activation_buffer.device,
+        )
+        if offset.dtype != torch.int64:
+            raise TypeError(f"{name} must have dtype int64")
+    validate_conditional_execution(condition, device=activation_buffer.device)
+    if condition.dtype != torch.int32:
+        raise TypeError("condition must have dtype int32")
+    if (
+        num_rows.dtype != torch.int32
+        or num_rows.shape != (1,)
+        or not num_rows.is_contiguous()
+        or num_rows.device != activation_buffer.device
+    ):
+        raise ValueError(
+            "num_rows must be a contiguous int32 tensor with shape (1,) on "
+            "the activation-buffer device"
+        )
+
+    h1 = activation_buffer_placeholder(
+        activation_buffer,
+        (capacity_rows, 2 * intermediate_dim),
+        input_dtype,
+    )
+    gate = h1[:, :intermediate_dim]
+    up = h1[:, intermediate_dim:]
+    output_words = activation_buffer_placeholder(
+        activation_buffer,
+        (capacity_rows, intermediate_dim // 2),
+        torch.uint32,
+    )
+
+    with ensure_cuda_driver_context():
+        _Nvfp4SwigluQdqActivationBuffer.compile(
+            intermediate_dim,
+            fast_math,
+            use_four_over_six,
+            clamped,
+            alpha,
+            limit,
+        )(
+            gate,
+            up,
+            output_words,
+            cutlass.Int64(activation_buffer.data_ptr()),
+            cutlass.Int64(activation_buffer.nbytes),
+            h1_offset,
+            h2_offset,
+            num_rows,
+            condition,
+            get_nvfp4_recip_lut(activation_buffer.device),
+        )
 
 
 def _quantize_nvfp4_per_token(  # noqa: C901 -- producer-specific host validation

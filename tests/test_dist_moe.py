@@ -63,6 +63,7 @@ from dist_moe._triton_ops import (
 )
 from dist_moe.formats import (
     BlockScaledFormat as _KernelBlockScaledFormat,
+    BlockScaledProducer,
     canonical_situ_glu,
     E4M3_MIN_SUBNORMAL,
     FP4_E2M1_MAX,
@@ -73,10 +74,13 @@ from dist_moe.formats import (
     NVFP4_GLOBAL_SCALE_EPS,
     NVFP4_MAX,
     NVFP4_TOKEN_AMAX_FLOOR,
+    ScaleFactorLayout,
     SITU_GLU_GATE_BETA_DEFAULT,
     SITU_GLU_UP_BETA_DEFAULT,
 )
 from dist_moe.kernels import (
+    activation_buffer as kernel_activation_buffer,
+    blockscaled_quantize as blockscaled_quantize_impl,
     config as grouped_gemm_config_impl,
     dist_grouped_gemm as dist_grouped_gemm_impl,
     grouped_gemm as grouped_gemm_impl,
@@ -4454,6 +4458,147 @@ class DistMoeKernelTest(unittest.TestCase):
         torch.testing.assert_close(
             weight_NK.grad,
             expected_weight_grad_NK,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_nvfp4_activation_buffer_swiglu_qdq_matches_materialized(
+        self,
+    ) -> None:
+        """Match fused Q-DQ to packed production plus the retained decoder."""
+        rows, intermediate_dim = 130, 256
+        h1_offset_value = 256
+        h1_bytes = rows * 2 * intermediate_dim * torch.bfloat16.itemsize
+        h2_bytes = rows * intermediate_dim * torch.bfloat16.itemsize
+        q_bytes = rows * intermediate_dim // 2
+        scale_storage_bytes = (
+            rows
+            * kernel_activation_buffer.ACTIVATION_ROW_SCALE_STORAGE_MULTIPLE
+            * (intermediate_dim // 16)
+        )
+        outer_scale_bytes = rows * torch.float32.itemsize
+        h2_offset_value = h1_offset_value + h1_bytes
+        q_offset_value = h2_offset_value + h2_bytes
+        scale_offset_value = q_offset_value + q_bytes
+        expected_offset_value = (
+            scale_offset_value + scale_storage_bytes + outer_scale_bytes
+        )
+        activation_buffer = torch.full(
+            (expected_offset_value + h2_bytes,),
+            0xA5,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        h1_M2F = torch.randn(
+            rows,
+            2 * intermediate_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        activation_buffer[h1_offset_value : h1_offset_value + h1_bytes].view(
+            torch.bfloat16
+        ).view_as(h1_M2F).copy_(h1_M2F)
+        h1_offset = torch.tensor(
+            [h1_offset_value],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        h2_offset = torch.tensor(
+            [h2_offset_value],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        q_offset = torch.tensor(
+            [q_offset_value],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        scale_offset = torch.tensor(
+            [scale_offset_value],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        expected_offset = torch.tensor(
+            [expected_offset_value],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        num_rows = torch.tensor([rows], dtype=torch.int32, device="cuda")
+        condition = torch.zeros(1, dtype=torch.int32, device="cuda")
+        gate_MF, up_MF = h1_M2F.chunk(2, dim=1)
+
+        for use_four_over_six in (False, True):
+            with self.subTest(use_four_over_six=use_four_over_six):
+                qdata, scale, outer_scale_inv = (
+                    blockscaled_quantize_impl._quantize_nvfp4_per_token(
+                        gate_MF,
+                        layout=ScaleFactorLayout.CUBLAS_BLOCKED,
+                        producer_b=up_MF,
+                        producer_id=BlockScaledProducer.SWIGLU_FWD.value,
+                        use_four_over_six=use_four_over_six,
+                    )
+                )
+                activation_buffer[q_offset_value : q_offset_value + q_bytes].copy_(
+                    qdata.view(torch.uint8).flatten()
+                )
+                scale_bytes = scale.view(torch.uint8).flatten()
+                activation_buffer[
+                    scale_offset_value : scale_offset_value + scale_bytes.numel()
+                ].copy_(scale_bytes)
+                outer_scale_offset = scale_offset_value + scale_storage_bytes
+                activation_buffer[
+                    outer_scale_offset : outer_scale_offset + outer_scale_bytes
+                ].view(torch.float32).copy_(outer_scale_inv)
+                blockscaled_impl._dequantize_nvfp4_activation_buffer_to_buffer(
+                    activation_buffer,
+                    q_offset,
+                    scale_offset,
+                    num_rows,
+                    expected_offset,
+                    condition,
+                    rows,
+                    intermediate_dim,
+                    execute_unconditionally=True,
+                )
+
+                blockscaled_quantize_impl._nvfp4_swiglu_qdq_activation_buffer(
+                    activation_buffer,
+                    h1_offset,
+                    h2_offset,
+                    num_rows,
+                    condition,
+                    capacity_rows=rows,
+                    intermediate_dim=intermediate_dim,
+                    input_dtype=torch.bfloat16,
+                    use_four_over_six=use_four_over_six,
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    activation_buffer[h2_offset_value : h2_offset_value + h2_bytes],
+                    activation_buffer[
+                        expected_offset_value : expected_offset_value + h2_bytes
+                    ],
+                    rtol=0,
+                    atol=0,
+                )
+
+        condition.fill_(1)
+        fused_output = activation_buffer[h2_offset_value : h2_offset_value + h2_bytes]
+        fused_output.fill_(0x5A)
+        blockscaled_quantize_impl._nvfp4_swiglu_qdq_activation_buffer(
+            activation_buffer,
+            h1_offset,
+            h2_offset,
+            num_rows,
+            condition,
+            capacity_rows=rows,
+            intermediate_dim=intermediate_dim,
+            input_dtype=torch.bfloat16,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            fused_output,
+            torch.full_like(fused_output, 0x5A),
             rtol=0,
             atol=0,
         )
