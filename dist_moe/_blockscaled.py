@@ -109,6 +109,7 @@ from .kernels.blockscaled_grouped_gemm import (
     NVFP4,
 )
 from .kernels.blockscaled_quantize import (
+    _nvfp4_swiglu_qdq_activation_buffer,
     _quantize_nvfp4_per_token,
     quantize_block_scaled,
 )
@@ -1361,6 +1362,7 @@ class _Nvfp4Bf16BackwardAdapter:
             (capacity_rows, 2 * intermediate_dim),
             self.model_config.dtype,
         )
+        combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
         h3_MD = dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_combine(
             h1_M2F=h1_placeholder,
             w=self.w2.w_q_fprop,
@@ -1383,15 +1385,32 @@ class _Nvfp4Bf16BackwardAdapter:
             swiglu_alpha=self.execution_context.config.swiglu_alpha,
             swiglu_limit=self.execution_context.config.swiglu_limit,
             activation_buffer=activation_buffer.buffer,
-            activation_offsets=backward_plan.blockscaled.recompute_combine_offsets,
+            activation_offsets=combine_offsets,
             num_recv_tokens=capacity_rows,
+            conditional_execution=forward_plan.need_recompute,
             w_global_scale_inv=self.w2.w_global_scale_inv,
             derive_pipeline_depth=True,
         )
 
-        # The planner likewise publishes the selected H2 row-bundle offset
-        # before one graph-stable unconditional decode.
-        combine_offsets = backward_plan.blockscaled.recompute_combine_offsets
+        assert forward_plan.blockscaled is not None
+        _nvfp4_swiglu_qdq_activation_buffer(
+            activation_buffer.buffer,
+            backward_plan.h1_offset,
+            backward_plan.h2_offset,
+            num_recv_rows_1,
+            forward_plan.blockscaled.recompute_condition,
+            capacity_rows=capacity_rows,
+            intermediate_dim=intermediate_dim,
+            input_dtype=self.model_config.dtype,
+            fast_math=self.blockscaled_cfg.fast_math,
+            use_four_over_six=self.blockscaled_cfg.use_four_over_six,
+            clamped=self.execution_context.config.activation == _SWIGLU_CLAMPED,
+            alpha=self.execution_context.config.swiglu_alpha,
+            limit=self.execution_context.config.swiglu_limit,
+        )
+
+        # Recompute still obtains packed H2 as a side output of W2 FPROP.
+        # Full-save writes its exact BF16 Q-DQ result directly above.
         _dequantize_nvfp4_activation_buffer_to_buffer(
             activation_buffer.buffer,
             combine_offsets[ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1],
@@ -1401,7 +1420,6 @@ class _Nvfp4Bf16BackwardAdapter:
             forward_plan.need_recompute,
             capacity_rows,
             intermediate_dim,
-            execute_unconditionally=True,
         )
         return h3_MD
 
