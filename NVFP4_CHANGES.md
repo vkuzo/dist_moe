@@ -62,25 +62,23 @@ positive delta means that NVFP4 is slower than BF16.
 
 The training comparison measures one forward and backward using reusable
 prepared weights. Refreshing both NVFP4 weight operands from BF16 is outside
-the iteration and measured 0.5840 ms separately. The NVFP4 backward continues
+the iteration and measured 0.4723 ms separately. The NVFP4 backward continues
 to use BF16 GEMMs.
-
-(human note - training path has not been benchmarked or optimized yet)
 
 | Local `T` | BF16 forward + backward | NVFP4 staged forward + BF16 backward | NVFP4 delta |
 | ---: | ---: | ---: | ---: |
-| 16 | 0.4592 ms | 0.6512 ms | +41.8% |
-| 32 | 0.4605 ms | 0.6606 ms | +43.5% |
-| 64 | 0.4701 ms | 0.6683 ms | +42.2% |
-| 128 | 0.4785 ms | 0.6822 ms | +42.6% |
-| 256 | 0.4937 ms | 0.6917 ms | +40.1% |
-| 512 | 0.5401 ms | 0.7044 ms | +30.4% |
-| 1,024 | 0.6388 ms | 0.9070 ms | +42.0% |
-| 2,048 | 0.9422 ms | 1.3227 ms | +40.4% |
-| 4,096 | 1.5073 ms | 2.1677 ms | +43.8% |
-| 8,192 | 2.6966 ms | 3.8183 ms | +41.6% |
-| 16,384 | 5.1165 ms | 7.0572 ms | +37.9% |
-| 32,768 | 10.1535 ms | 13.8651 ms | +36.6% |
+| 16 | 0.4590 ms | 0.5952 ms | +29.7% |
+| 32 | 0.4635 ms | 0.6015 ms | +29.8% |
+| 64 | 0.4708 ms | 0.6103 ms | +29.6% |
+| 128 | 0.4787 ms | 0.6219 ms | +29.9% |
+| 256 | 0.4977 ms | 0.6272 ms | +26.0% |
+| 512 | 0.5401 ms | 0.6637 ms | +22.9% |
+| 1,024 | 0.6406 ms | 0.8412 ms | +31.3% |
+| 2,048 | 0.9462 ms | 1.2048 ms | +27.3% |
+| 4,096 | 1.5045 ms | 1.9469 ms | +29.4% |
+| 8,192 | 2.6969 ms | 3.3403 ms | +23.9% |
+| 16,384 | 5.1086 ms | 6.1817 ms | +21.0% |
+| 32,768 | 10.1407 ms | 12.0282 ms | +18.6% |
 
 The rollout comparison measures forward only. NVFP4 weight conversion is
 excluded: W13 uses the inference-only fused-SwiGLU interleaved layout, W2 is
@@ -100,6 +98,59 @@ also prepared ahead of time, and both prepared operands are reused.
 | 8,192 | 0.9036 ms | 0.8483 ms | -6.1% |
 | 16,384 | 1.7119 ms | 1.6080 ms | -6.1% |
 | 32,768 | 3.3591 ms | 3.5274 ms | +5.0% |
+
+The rollout measurements are unchanged because the latest optimization only
+changes training backward.
+
+## Four-GPU T=4,096 Training Breakdown
+
+This full-save breakdown uses four NVIDIA B200 GPUs, expert parallelism of
+four, local `T=4096`, `D=2048`, `F=768`, 128 global experts, top-k 8, CUDA
+graphs, prepared weights, and standard NVFP4 scaling
+(`use_four_over_six=False`). The direct end-to-end measurements are 1.5045 ms
+for BF16 forward + backward and 1.9469 ms for NVFP4 staged forward + BF16
+backward, a 442.4 us or 29.4% NVFP4 regression.
+
+The phase measurements below are averages from ten profiled CUDA-graph
+replays on rank zero. The profiler used the dynamic-weight entry point, and
+its four weight-quant kernels are excluded from the sums below. The weight
+dequant required by the BF16 backward GEMMs remains included. Totals use the
+unrounded measurements. These summed kernel times differ slightly from the
+maximum-rank end-to-end medians above because they do not include GPU gaps and
+use one rank rather than the maximum across ranks.
+
+### Forward, excluding weight preparation
+
+| Step | BF16 | NVFP4 |
+| --- | ---: | ---: |
+| Input NVFP4 quant | - | 6.2 us |
+| Routing/planning | 47.9 us | 35.4 us |
+| W13 stage | 279.4 us | 420.0 us |
+| Dequant/save gathered X | - | 51.1 us |
+| W2 stage + combine | 164.4 us | 230.9 us |
+| Postprocess | 42.1 us | 44.0 us |
+| **Total** | **533.9 us** | **787.6 us** |
+
+NVFP4 forward is 253.7 us slower in summed rank-zero kernel time.
+
+### Backward, excluding weight preparation
+
+| Step | BF16 | NVFP4 |
+| --- | ---: | ---: |
+| Planning/recompute scaffolding | 27.6 us | 38.5 us |
+| Reconstruct H2 | 50.7 us | 59.1 us |
+| Predicated-off NVFP4 H2 dequant | - | 70.5 us |
+| Gradient routing/scaling | 53.6 us | 57.2 us |
+| Weight dequant for BF16 GEMMs | - | 100.0 us |
+| All DGRAD/WGRAD kernels | 793.1 us | 797.8 us |
+| Score gradient | 29.8 us | 29.8 us |
+| **Total** | **954.6 us** | **1153.1 us** |
+
+NVFP4 backward is 198.4 us slower in summed rank-zero kernel time. The
+predicated-off H2 dequant is a graph-stable recompute-path launch. Full-save
+is active for this measurement, so its programs exit after checking the
+device predicate without dequantizing H2, but launching the capacity-sized
+grid still costs 70.5 us.
 
 ## Training Peak Memory
 
