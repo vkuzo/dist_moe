@@ -9,6 +9,8 @@ Legend:
 [P] persistent activation slot
 [S] reusable scratch
 [SYM] peer-addressable symmetric HBM
+MEGAKERNEL: one persistent launch; numbered parts are not separate launches
+Producer/consumer parts may pipeline by tile; numbering shows data dependency
 M_dense: routed-row capacity before per-expert NVFP4 kernel padding
 M_pad: routed-row capacity after per-expert NVFP4 kernel padding
 q(a_bf16) -> a_nvfp4: packed qdata and every required scale
@@ -51,11 +53,22 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                   │                                │
                                   ▼                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: peer gather + BF16 W13 GEMM                          │
+│ MEGAKERNEL: peer gather + BF16 W13 GEMM                      │
 │ inputs: dispatch_x_bf16, fwd_gather_ptrs, expert_counts,     │
 │         w13_bf16                                             │
 │ outputs: x_gathered_bf16, h1_bf16; default presets also      │
 │          fuse SwiGLU and output h2_bf16                      │
+│                                                              │
+│ part 1: peer gather dispatch X                               │
+│   inputs: dispatch_x_bf16 [SYM], fwd_gather_ptrs,            │
+│           expert_counts                                      │
+│   outputs: x_gathered_bf16 [P or S; written to local HBM]    │
+│ part 2: BF16 W13 GEMM                                        │
+│   inputs: x_gathered_bf16 [HBM], w13_bf16                    │
+│   outputs: h1_bf16 [P or S; written to HBM]                  │
+│ part 3, eligible presets only: SwiGLU                        │
+│   inputs: rounded h1_bf16 fragment or h1_bf16 [HBM]          │
+│   outputs: h2_bf16 [S; written to HBM]                       │
 └──────────────────────────────┬───────────────────────────────┘
                                ├── x_gathered_bf16 [P] or [S]
                                ├── h1_bf16 [P] or [S]
@@ -69,9 +82,16 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: BF16 W2 GEMM + peer scatter                          │
+│ MEGAKERNEL: BF16 W2 GEMM + peer scatter                      │
 │ inputs: h2_bf16, w2_bf16, expert_counts, scatter_ptrs        │
 │ outputs: h3_route_bf16 [SYM]                                 │
+│                                                              │
+│ part 1: BF16 W2 GEMM                                         │
+│   inputs: h2_bf16 [HBM], w2_bf16, expert_counts              │
+│   outputs: h3_bf16 fragment [registers; not written to HBM]  │
+│ part 2: peer scatter                                         │
+│   inputs: h3_bf16 fragment, scatter_ptrs                     │
+│   outputs: h3_route_bf16 [SYM; written to owner HBM]         │
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 h3_route_bf16 [SYM] ── combine barrier
@@ -122,11 +142,21 @@ Native w13_bf16, w2_bf16
              │                               │ dispatch barrier
              │                               ▼
              │  ┌──────────────────────────────────────────────────────┐
-             │  │ KERNEL: BF16 W13 reconstruction                      │
+             │  │ MEGAKERNEL: BF16 W13 reconstruction                  │
              │  │ inputs: dispatch_x_bf16, fwd_gather_ptrs,            │
              │  │         expert_counts, w13_bf16                      │
              │  │ outputs: x_gathered_recomputed_bf16 [S],             │
              │  │          h1_recomputed_bf16 [S]                      │
+             │  │                                                      │
+             │  │ part 1: peer gather dispatch X                       │
+             │  │   inputs: dispatch_x_bf16, fwd_gather_ptrs,          │
+             │  │           expert_counts                              │
+             │  │   outputs: x_gathered_recomputed_bf16                │
+             │  │            [S; written to local HBM]                 │
+             │  │ part 2: BF16 W13 GEMM                                │
+             │  │   inputs: x_gathered_recomputed_bf16 [HBM],          │
+             │  │           w13_bf16                                   │
+             │  │   outputs: h1_recomputed_bf16 [S; written to HBM]    │
              │  └──────────────────────────┬───────────────────────────┘
              └─────────────────────────────┤
                                            ▼
@@ -140,9 +170,16 @@ select x_for_bwd_bf16, h1_for_bwd_bf16
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: conditional BF16 W2 GEMM + peer scatter              │
+│ MEGAKERNEL: conditional BF16 W2 GEMM + peer scatter          │
 │ inputs: h2_bf16, w2_bf16, expert_counts, scatter_ptrs        │
 │ outputs: h3_candidate_bf16 [SYM]                             │
+│                                                              │
+│ part 1: conditional BF16 W2 GEMM                             │
+│   inputs: h2_bf16 [HBM], w2_bf16, expert_counts              │
+│   outputs: h3_bf16 fragment [registers; not written to HBM]  │
+│ part 2: peer scatter, when part 1 executes                   │
+│   inputs: h3_bf16 fragment, scatter_ptrs                     │
+│   outputs: h3_candidate_bf16 [SYM; written to owner HBM]     │
 └──────────────────────────────┬───────────────────────────────┘
                                │ conditional combine barrier
                                ▼
@@ -155,10 +192,18 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
               │ combine barrier
               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: BF16 W2 DGRAD + peer gather                          │
+│ MEGAKERNEL: BF16 W2 DGRAD + peer gather                      │
 │ inputs: grad_h3_route_bf16, scatter_ptrs, expert_counts,     │
 │         w2_bf16                                              │
 │ outputs: grad_h3_gathered_bf16 [S], grad_h2_bf16 [S]         │
+│                                                              │
+│ part 1: peer gather grad H3                                  │
+│   inputs: grad_h3_route_bf16 [SYM], scatter_ptrs,            │
+│           expert_counts                                      │
+│   outputs: grad_h3_gathered_bf16 [S; written to local HBM]   │
+│ part 2: BF16 W2 DGRAD                                        │
+│   inputs: grad_h3_gathered_bf16 [HBM], w2_bf16               │
+│   outputs: grad_h2_bf16 [S; written to HBM]                  │
 └──────────────────────────────────────────────────────────────┘
               │
               ▼
@@ -170,10 +215,20 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
               │
               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: SwiGLU backward + BF16 W13 DGRAD, when eligible      │
+│ MEGAKERNEL: SwiGLU backward + W13 DGRAD, when eligible       │
 │ inputs: grad_h2_bf16, h1_for_bwd_bf16, w13_bf16,             │
 │         bwd_gather_ptrs                                      │
 │ outputs: grad_h1_bf16 [S], grad_x_route_bf16 [SYM]           │
+│                                                              │
+│ part 1: SwiGLU backward                                      │
+│   inputs: grad_h2_bf16, h1_for_bwd_bf16                      │
+│   outputs: grad_h1_bf16 [S; written to HBM]                  │
+│ part 2: BF16 W13 DGRAD                                       │
+│   inputs: grad_h1_bf16 [HBM], w13_bf16                       │
+│   outputs: grad_x_bf16 fragment [registers]                  │
+│ part 3: peer scatter                                         │
+│   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
+│   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
 └──────────────────────────────────────────────────────────────┘
 Fallback when the fused kernel is ineligible:
 ┌──────────────────────────────────────────────────────────────┐
@@ -183,9 +238,16 @@ Fallback when the fused kernel is ineligible:
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: BF16 W13 DGRAD + peer scatter                        │
+│ MEGAKERNEL: BF16 W13 DGRAD + peer scatter                    │
 │ inputs: grad_h1_bf16, w13_bf16, bwd_gather_ptrs              │
 │ outputs: grad_x_route_bf16 [SYM]                             │
+│                                                              │
+│ part 1: BF16 W13 DGRAD                                       │
+│   inputs: grad_h1_bf16 [HBM], w13_bf16                       │
+│   outputs: grad_x_bf16 fragment [registers]                  │
+│ part 2: peer scatter                                         │
+│   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
+│   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
 └──────────────────────────────────────────────────────────────┘
               │
               ▼
@@ -259,10 +321,17 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                  │                                │
                                  ▼                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: staged NVFP4 W13 GEMM + packed-X copy                │
+│ MEGAKERNEL: staged NVFP4 W13 GEMM + peer gather              │
 │ inputs: x_nvfp4 [SYM], w13_nvfp4                             │
 │         fwd_gather_ptrs, expert_counts                       │
 │ outputs: x_gathered_nvfp4 [S], h1_bf16 [P] or [S]            │
+│                                                              │
+│ part 1: peer gather/copy X NVFP4                             │
+│   inputs: x_nvfp4 [SYM], fwd_gather_ptrs, expert_counts      │
+│   outputs: x_gathered_nvfp4 [S; written to local HBM]        │
+│ part 2: NVFP4 W13 GEMM                                       │
+│   inputs: x_gathered_nvfp4 [HBM], w13_nvfp4                  │
+│   outputs: h1_bf16 [P or S; written to HBM]                  │
 └──────────────────────────────┬───────────────────────────────┘
                                │
                                ├── x_gathered_nvfp4 [S]
@@ -278,9 +347,19 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                             │
                                             ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: q(SwiGLU(h1_bf16)) + W2 GEMM + peer scatter          │
+│ MEGAKERNEL: q(SwiGLU) + NVFP4 W2 GEMM + peer scatter         │
 │ inputs: h1_bf16, w2_nvfp4, expert_counts, scatter_ptrs       │
 │ outputs: h2_nvfp4 [S], h3_route_bf16 [SYM]                   │
+│                                                              │
+│ part 1: q(SwiGLU(h1_bf16))                                   │
+│   inputs: h1_bf16 [HBM], expert_counts                       │
+│   outputs: h2_nvfp4 [S; written to HBM]                      │
+│ part 2: NVFP4 W2 GEMM                                        │
+│   inputs: h2_nvfp4 [HBM], w2_nvfp4                           │
+│   outputs: h3_bf16 fragment [registers; not written to HBM]  │
+│ part 3: peer scatter                                         │
+│   inputs: h3_bf16 fragment, scatter_ptrs                     │
+│   outputs: h3_route_bf16 [SYM; written to owner HBM]         │
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 h3_route_bf16 [SYM] ── combine barrier
@@ -354,11 +433,21 @@ h3_saved_bf16 [P]                 ▼
              │                               │ dispatch barrier
              │                               ▼
              │  ┌──────────────────────────────────────────────────────┐
-             │  │ KERNEL: NVFP4 W13 reconstruction                     │
+             │  │ MEGAKERNEL: NVFP4 W13 reconstruction                 │
              │  │ inputs: x_nvfp4, fwd_gather_ptrs,                    │
              │  │         expert_counts, w13_nvfp4                     │
              │  │ outputs: x_gathered_recomputed_nvfp4 [S],            │
              │  │          h1_recomputed_bf16 [S]                      │
+             │  │                                                      │
+             │  │ part 1: peer gather/copy X NVFP4                     │
+             │  │   inputs: x_nvfp4 [SYM], fwd_gather_ptrs,            │
+             │  │           expert_counts                              │
+             │  │   outputs: x_gathered_recomputed_nvfp4               │
+             │  │            [S; written to local HBM]                 │
+             │  │ part 2: NVFP4 W13 GEMM                               │
+             │  │   inputs: x_gathered_recomputed_nvfp4 [HBM],         │
+             │  │           w13_nvfp4                                  │
+             │  │   outputs: h1_recomputed_bf16 [S; written to HBM]    │
              │  └──────────────────────────┬───────────────────────────┘
              └─────────────────────────────┤
                                            ▼
@@ -375,11 +464,21 @@ select x_q_dq_for_bwd_bf16:
                            │
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: q(SwiGLU) + W2 GEMM + peer scatter                   │
+│ MEGAKERNEL: q(SwiGLU) + NVFP4 W2 GEMM + peer scatter         │
 │ inputs: h1_for_bwd_bf16, w2_nvfp4, expert_counts,            │
 │         scatter_ptrs                                         │
 │ outputs: h2_nvfp4 = q(SwiGLU(h1_for_bwd_bf16)) [S],          │
 │          h3_candidate_bf16 [SYM]                             │
+│                                                              │
+│ part 1: q(SwiGLU(h1_for_bwd_bf16))                           │
+│   inputs: h1_for_bwd_bf16 [HBM], expert_counts               │
+│   outputs: h2_nvfp4 [S; written to HBM]                      │
+│ part 2: NVFP4 W2 GEMM                                        │
+│   inputs: h2_nvfp4 [HBM], w2_nvfp4                           │
+│   outputs: h3_bf16 fragment [registers; not written to HBM]  │
+│ part 3: peer scatter                                         │
+│   inputs: h3_bf16 fragment, scatter_ptrs                     │
+│   outputs: h3_candidate_bf16 [SYM; written to owner HBM]     │
 └──────────────────────────────┬───────────────────────────────┘
                                ├───────────────────────────────┐
                                │                               │
@@ -410,10 +509,18 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: shared BF16 W2 DGRAD + peer gather                   │
+│ MEGAKERNEL: shared BF16 W2 DGRAD + peer gather               │
 │ inputs: grad_h3_route_bf16, scatter_ptrs, expert_counts,     │
 │         w2_q_dq_bf16                                         │
 │ outputs: grad_h3_gathered_bf16 [S], grad_h2_bf16 [S]         │
+│                                                              │
+│ part 1: peer gather grad H3                                  │
+│   inputs: grad_h3_route_bf16 [SYM], scatter_ptrs,            │
+│           expert_counts                                      │
+│   outputs: grad_h3_gathered_bf16 [S; written to local HBM]   │
+│ part 2: BF16 W2 DGRAD                                        │
+│   inputs: grad_h3_gathered_bf16 [HBM], w2_q_dq_bf16          │
+│   outputs: grad_h2_bf16 [S; written to HBM]                  │
 └──────────────────────────────────────────────────────────────┘
               │ w2_q_dq_bf16 released
               ▼
@@ -430,10 +537,20 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: shared SwiGLU backward + BF16 W13 DGRAD, if eligible │
+│ MEGAKERNEL: shared SwiGLU backward + W13 DGRAD, if eligible  │
 │ inputs: grad_h2_bf16, h1_for_bwd_bf16, w13_q_dq_bf16,        │
 │         bwd_gather_ptrs                                      │
 │ outputs: grad_h1_bf16 [S], grad_x_route_bf16 [SYM]           │
+│                                                              │
+│ part 1: SwiGLU backward                                      │
+│   inputs: grad_h2_bf16, h1_for_bwd_bf16                      │
+│   outputs: grad_h1_bf16 [S; written to HBM]                  │
+│ part 2: BF16 W13 DGRAD                                       │
+│   inputs: grad_h1_bf16 [HBM], w13_q_dq_bf16                  │
+│   outputs: grad_x_bf16 fragment [registers]                  │
+│ part 3: peer scatter                                         │
+│   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
+│   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
 └──────────────────────────────────────────────────────────────┘
 Fallback when the fused kernel is ineligible:
 ┌──────────────────────────────────────────────────────────────┐
@@ -443,9 +560,16 @@ Fallback when the fused kernel is ineligible:
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: shared BF16 W13 DGRAD + peer scatter                 │
+│ MEGAKERNEL: shared BF16 W13 DGRAD + peer scatter             │
 │ inputs: grad_h1_bf16, w13_q_dq_bf16, bwd_gather_ptrs         │
 │ outputs: grad_x_route_bf16 [SYM]                             │
+│                                                              │
+│ part 1: BF16 W13 DGRAD                                       │
+│   inputs: grad_h1_bf16 [HBM], w13_q_dq_bf16                  │
+│   outputs: grad_x_bf16 fragment [registers]                  │
+│ part 2: peer scatter                                         │
+│   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
+│   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
 └──────────────────────────────────────────────────────────────┘
               │ w13_q_dq_bf16 released
               ▼
@@ -517,14 +641,29 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                  │                                │
                                  ▼                                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ KERNEL: Mega NVFP4 W13 + q(SwiGLU) + W2 + peer scatter       │
-│ fused: NVFP4 W13 GEMM + q(SwiGLU) + NVFP4 W2 GEMM + scatter  │
+│ MEGAKERNEL: persistent NVFP4 forward                         │
 │ inputs: x_nvfp4 [SYM], w13_nvfp4, w2_nvfp4,                  │
 │         fwd_gather_ptrs, scatter_ptrs, expert_counts         │
-│ HBM handoff: W13 writes h1_bf16; q(SwiGLU) reads h1_bf16     │
-│              and writes h2_nvfp4; W2 reloads h2_nvfp4        │
-│ outputs: h1_bf16 [P or S; HBM], h2_nvfp4 [S; HBM],           │
+│ outputs: x_row_nvfp4 [internal S; HBM],                      │
+│          h1_bf16 [P or S; HBM], h2_nvfp4 [S; HBM],           │
 │          h3_route_bf16 [SYM]                                 │
+│                                                              │
+│ Parts pipeline by chunk; they are not separate launches.     │
+│ part 1: peer gather/copy X NVFP4                             │
+│   inputs: x_nvfp4 [SYM], fwd_gather_ptrs, expert_counts      │
+│   outputs: x_row_nvfp4 [internal S; written to local HBM]    │
+│ part 2: NVFP4 W13 GEMM                                       │
+│   inputs: x_row_nvfp4 [HBM], w13_nvfp4                       │
+│   outputs: h1_bf16 [P or S; written to HBM]                  │
+│ part 3: q(SwiGLU(h1_bf16))                                   │
+│   inputs: h1_bf16 [HBM]                                      │
+│   outputs: h2_nvfp4 [S; written to HBM]                      │
+│ part 4: NVFP4 W2 GEMM                                        │
+│   inputs: h2_nvfp4 [HBM], w2_nvfp4                           │
+│   outputs: h3_bf16 fragment [registers; not written to HBM]  │
+│ part 5: peer scatter                                         │
+│   inputs: h3_bf16 fragment, scatter_ptrs                     │
+│   outputs: h3_route_bf16 [SYM; written to owner HBM]         │
 └──────────────────────────────┬───────────────────────────────┘
                                │
                                ├── h1_bf16 [P or S; HBM]
