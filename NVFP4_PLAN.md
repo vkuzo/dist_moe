@@ -23,27 +23,12 @@ a_q_dq_bf16 = dq(a_nvfp4)
 BF16 FORWARD
 -----------------------------------------------------------------------------------------
 Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
-
-
-
-
-
-
-
-
-
-
-
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: copy_routing_and_dispatch                            │
 │ inputs: x_bf16, topk_ids                                     │
 │ outputs: dispatch_x_bf16 [SYM], routing_ids,                 │
 │          routing_token_count                                 │
 └──────────────────────────────┬───────────────────────────────┘
-                               │
-                               │
-                               │
-                               │
                                └─ dispatch barrier ─┐
                                                     ▼
                      ┌──────────────────────────────────────────────────────────────┐
@@ -57,7 +42,6 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                      │ KERNEL: device forward planner                               │
                      │ inputs: recv_count, recv_by_rank, slot_id                    │
                      │ outputs: need_recompute, forward_state, recv_snapshot        │
-                     │                                                              │
                      └──────────────────────────────┬───────────────────────────────┘
                                   ┌─────────────────┴──────────────┐
                                   │                                │
@@ -84,7 +68,6 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 └──────────────────────────────┬───────────────────────────────┘
                                │
                                ▼
-
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: BF16 W2 GEMM + peer scatter                          │
 │ inputs: h2_bf16, w2_bf16, expert_counts, scatter_ptrs        │
@@ -108,11 +91,7 @@ Both save: weights, topk_ids/scores, expert_counts, recv_count,
 fwd_gather_ptrs, bwd_gather_ptrs, scatter_ptrs, recv_snapshot,
 need_recompute, forward_state, slot and postprocess state.
 
-
-
 h2_bf16 is never persistent.
-
-
 ```
 
 ### Backward
@@ -122,23 +101,10 @@ BF16 BACKWARD
 -----------------------------------------------------------------------------------------
 Inputs: grad_y_bf16 and all saved forward tensors
 Native w13_bf16, w2_bf16
-
-
-
-
-
-
-
-
-
-
-
-
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: device backward planner                              │
 │ inputs: need_recompute, forward_state, recv_count,           │
 │         recv_snapshot                                        │
-│                                                              │
 │ outputs: backward_offsets                                    │
 └──────────────────────────────┬───────────────────────────────┘
              ┌───────────┴────────────┐
@@ -153,11 +119,6 @@ Native w13_bf16, w2_bf16
              │       │ inputs: x_saved_bf16 [P]                      │
              │       │ outputs: dispatch_x_bf16 [SYM]                │
              │       └───────────────────────┬───────────────────────┘
-             │                               │
-             │                               │
-             │                               │
-             │                               │
-             │                               │
              │                               │ dispatch barrier
              │                               ▼
              │  ┌──────────────────────────────────────────────────────┐
@@ -170,18 +131,6 @@ Native w13_bf16, w2_bf16
              └─────────────────────────────┤
                                            ▼
 select x_for_bwd_bf16, h1_for_bwd_bf16
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
-                        │
                         │
                         ▼
 ┌──────────────────────────────────────────────────────────────┐
@@ -196,28 +145,14 @@ select x_for_bwd_bf16, h1_for_bwd_bf16
 │ outputs: h3_candidate_bf16 [SYM]                             │
 └──────────────────────────────┬───────────────────────────────┘
                                │ conditional combine barrier
-                               │
-                               │
                                ▼
 select h3_for_bwd_bf16 = h3_saved or h3_candidate
-
-
-
-
-
-
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: score/reduction backward                             │
 │ inputs: grad_y_bf16, topk_scores, h3_for_bwd_bf16            │
 │ outputs: grad_h3_route_bf16 [SYM], grad_scores [OUT]         │
 └──────────────────────────────┬───────────────────────────────┘
               │ combine barrier
-              │
-              │
-              │
-              │
-              │
-              │
               ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: BF16 W2 DGRAD + peer gather                          │
@@ -232,11 +167,6 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
 │ inputs: grad_h3_gathered_bf16, h2_bf16, expert_counts        │
 │ outputs: grad_w2                                             │
 └──────────────────────────────┬───────────────────────────────┘
-              │
-              │
-              │
-              │
-              │
               │
               ▼
 ┌──────────────────────────────────────────────────────────────┐
@@ -431,9 +361,7 @@ h3_saved_bf16 [P]                 ▼
              │  │          h1_recomputed_bf16 [S]                      │
              │  └──────────────────────────┬───────────────────────────┘
              └─────────────────────────────┤
-
-                           │
-                           ▼
+                                           ▼
 select h1_for_bwd_bf16
                            │
 recompute only:
@@ -602,10 +530,6 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                ├── h1_bf16 [P or S; HBM]
                                ├── h2_nvfp4 [S; HBM]
                                └── h3_route_bf16 [SYM]
-                                            │
-                                            │
-                                            │
-                                            │
                                             │
                                             │ full-save only
                                             ▼
