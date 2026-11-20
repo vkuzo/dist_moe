@@ -11,6 +11,7 @@ Legend:
 [SYM] peer-addressable symmetric HBM
 MEGAKERNEL: one persistent launch; numbered parts are not separate launches
 Producer/consumer parts may pipeline by tile; numbering shows data dependency
+executes: condition for body; a captured launch may remain as a predicated no-op
 M_dense: routed-row capacity before per-expert NVFP4 kernel padding
 M_pad: routed-row capacity after per-expert NVFP4 kernel padding
 q(a_bf16) -> a_nvfp4: packed qdata and every required scale
@@ -78,6 +79,7 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 │ KERNEL: standalone BF16 SwiGLU                               │
 │ inputs: h1_bf16                                              │
 │ outputs: h2_bf16 [S]                                         │
+│ executes: only when W13 does not fuse SwiGLU                 │
 └──────────────────────────────┬───────────────────────────────┘
                                │
                                ▼
@@ -138,6 +140,7 @@ Native w13_bf16, w2_bf16
              │       │ KERNEL: publish saved X                       │
              │       │ inputs: x_saved_bf16 [P]                      │
              │       │ outputs: dispatch_x_bf16 [SYM]                │
+             │       │ executes: backward recompute only             │
              │       └───────────────────────┬───────────────────────┘
              │                               │ dispatch barrier
              │                               ▼
@@ -157,6 +160,7 @@ Native w13_bf16, w2_bf16
              │  │   inputs: x_gathered_recomputed_bf16 [HBM],          │
              │  │           w13_bf16                                   │
              │  │   outputs: h1_recomputed_bf16 [S; written to HBM]    │
+             │  │ executes: backward recompute only                    │
              │  └──────────────────────────┬───────────────────────────┘
              └─────────────────────────────┤
                                            ▼
@@ -180,6 +184,7 @@ select x_for_bwd_bf16, h1_for_bwd_bf16
 │ part 2: peer scatter, when part 1 executes                   │
 │   inputs: h3_bf16 fragment, scatter_ptrs                     │
 │   outputs: h3_candidate_bf16 [SYM; written to owner HBM]     │
+│ executes: backward recompute only                            │
 └──────────────────────────────┬───────────────────────────────┘
                                │ conditional combine barrier
                                ▼
@@ -229,12 +234,14 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
 │ part 3: peer scatter                                         │
 │   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
 │   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
+│ executes: backward when the fused W13 DGRAD is eligible      │
 └──────────────────────────────────────────────────────────────┘
 Fallback when the fused kernel is ineligible:
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: standalone SwiGLU backward                           │
 │ inputs: grad_h2_bf16, h1_for_bwd_bf16                        │
 │ outputs: grad_h1_bf16 [S]                                    │
+│ executes: only when fused W13 DGRAD is ineligible            │
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
@@ -248,6 +255,7 @@ Fallback when the fused kernel is ineligible:
 │ part 2: peer scatter                                         │
 │   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
 │   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
+│ executes: only when fused W13 DGRAD is ineligible            │
 └──────────────────────────────────────────────────────────────┘
               │
               ▼
@@ -281,11 +289,13 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 │ KERNEL: dynamic W13 NVFP4 quant                              │
 │ inputs: w13_bf16                                             │
 │ outputs: w13_nvfp4 [S; not saved]                            │
+│ executes: only when W13 is supplied as native BF16           │
 └──────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: dynamic W2 NVFP4 quant                               │
 │ inputs: w2_bf16                                              │
 │ outputs: w2_nvfp4 [S; not saved]                             │
+│ executes: only when W2 is supplied as native BF16            │
 └──────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────┐
@@ -341,6 +351,7 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                │  │ KERNEL: dq(x_gathered_nvfp4)              │
                                │  │ inputs: x_gathered_nvfp4 [S]              │
                                │  │ outputs: x_q_dq_for_bwd_bf16 [P,M_pad,D]  │
+                               │  │ executes: training full-save only         │
                                │  └───────────────────────────────────────────┘
                                │
                                └── h1_bf16 [P] or [S]
@@ -397,11 +408,13 @@ Native w13_bf16, w2_bf16
 │ KERNEL: dynamic W13 NVFP4 quant, unless already prepared     │
 │ inputs: w13_bf16                                             │
 │ outputs: w13_nvfp4 [S]                                       │
+│ executes: only for native BF16 W13                           │
 └──────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: dynamic W2 NVFP4 quant, unless already prepared      │
 │ inputs: w2_bf16                                              │
 │ outputs: w2_nvfp4 [S]                                        │
+│ executes: only for native BF16 W2                            │
 └──────────────────────────────────────────────────────────────┘
 Packed operands coexist; BF16 weight dequant is deferred.
 
@@ -423,12 +436,15 @@ h3_saved_bf16 [P]                 ▼
              │       │ KERNEL: conditional load saved X              │
              │       │ inputs: x_saved_bf16 [P]                      │
              │       │ outputs: local_x_bf16                         │
+             │       │ executes: backward recompute only             │
              │       └───────────────────────┬───────────────────────┘
              │                               ▼
              │       ┌────────────────────────────────────────────────┐
              │       │ KERNEL: q/publish saved X                      │
              │       │ inputs: local_x_bf16                           │
              │       │ outputs: x_nvfp4 [SYM]                         │
+             │       │ executes: every backward                       │
+             │       │ output used only by recompute                  │
              │       └───────────────────────┬────────────────────────┘
              │                               │ dispatch barrier
              │                               ▼
@@ -448,6 +464,7 @@ h3_saved_bf16 [P]                 ▼
              │  │   inputs: x_gathered_recomputed_nvfp4 [HBM],         │
              │  │           w13_nvfp4                                  │
              │  │   outputs: h1_recomputed_bf16 [S; written to HBM]    │
+             │  │ executes: backward recompute only                    │
              │  └──────────────────────────┬───────────────────────────┘
              └─────────────────────────────┤
                                            ▼
@@ -458,11 +475,20 @@ recompute only:
 │ KERNEL: dq(x_gathered_recomputed_nvfp4)                      │
 │ inputs: x_gathered_recomputed_nvfp4 [S]                      │
 │ outputs: x_q_dq_recomputed_bf16 [S]                          │
+│ executes: backward recompute only                            │
 └──────────────────────────────┬───────────────────────────────┘
 select x_q_dq_for_bwd_bf16:
   full-save [P] or recompute [S]
-                           │
-                           ▼
+
+Full-save H2 reconstruction:
+┌──────────────────────────────────────────────────────────────┐
+│ KERNEL: dq(q(SwiGLU(h1_for_bwd_bf16)))                       │
+│ inputs: h1_for_bwd_bf16 [P]                                  │
+│ outputs: h2_q_dq_bf16 [S]                                    │
+│ executes: backward full-save only                            │
+└──────────────────────────────────────────────────────────────┘
+
+Recompute H2 and H3 reconstruction:
 ┌──────────────────────────────────────────────────────────────┐
 │ MEGAKERNEL: q(SwiGLU) + NVFP4 W2 GEMM + peer scatter         │
 │ inputs: h1_for_bwd_bf16, w2_nvfp4, expert_counts,            │
@@ -479,6 +505,7 @@ select x_q_dq_for_bwd_bf16:
 │ part 3: peer scatter                                         │
 │   inputs: h3_bf16 fragment, scatter_ptrs                     │
 │   outputs: h3_candidate_bf16 [SYM; written to owner HBM]     │
+│ executes: backward recompute only                            │
 └──────────────────────────────┬───────────────────────────────┘
                                ├───────────────────────────────┐
                                │                               │
@@ -487,12 +514,13 @@ select x_q_dq_for_bwd_bf16:
 │ KERNEL: dq(h2_nvfp4)                                         │ │
 │ inputs: h2_nvfp4 [S]                                         │ │
 │ outputs: h2_q_dq_bf16 [S]                                    │ │
+│ executes: backward recompute only                            │ │
 └──────────────────────────────────────────────────────────────┘ │
                                                                │ adapter combine barrier
                                                                ▼
                                                h3_candidate peer-visible
-                           │
-                           ▼
+
+Exactly one H2 reconstruction path writes h2_q_dq_bf16.
 select h3_for_bwd_bf16 = h3_saved or h3_candidate
 
 ┌──────────────────────────────────────────────────────────────┐
@@ -551,12 +579,14 @@ select h3_for_bwd_bf16 = h3_saved or h3_candidate
 │ part 3: peer scatter                                         │
 │   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
 │   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
+│ executes: backward when the fused W13 DGRAD is eligible      │
 └──────────────────────────────────────────────────────────────┘
 Fallback when the fused kernel is ineligible:
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: shared standalone SwiGLU backward                    │
 │ inputs: grad_h2_bf16, h1_for_bwd_bf16                        │
 │ outputs: grad_h1_bf16 [S]                                    │
+│ executes: only when fused W13 DGRAD is ineligible            │
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
@@ -570,6 +600,7 @@ Fallback when the fused kernel is ineligible:
 │ part 2: peer scatter                                         │
 │   inputs: grad_x_bf16 fragment, bwd_gather_ptrs              │
 │   outputs: grad_x_route_bf16 [SYM; written to owner HBM]     │
+│ executes: only when fused W13 DGRAD is ineligible            │
 └──────────────────────────────────────────────────────────────┘
               │ w13_q_dq_bf16 released
               ▼
@@ -601,11 +632,13 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 │ KERNEL: dynamic W13 NVFP4 quant                              │
 │ inputs: w13_bf16                                             │
 │ outputs: w13_nvfp4 [S; not saved]                            │
+│ executes: only when W13 is supplied as native BF16           │
 └──────────────────────────────────────────────────────────────┘
 ┌──────────────────────────────────────────────────────────────┐
 │ KERNEL: dynamic W2 NVFP4 quant                               │
 │ inputs: w2_bf16                                              │
 │ outputs: w2_nvfp4 [S; not saved]                             │
+│ executes: only when W2 is supplied as native BF16            │
 └──────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────┐
@@ -676,6 +709,7 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 │ KERNEL: peer gather/copy packed X                            │
 │ inputs: x_nvfp4 [SYM], fwd_gather_ptrs, recv_count           │
 │ outputs: x_gathered_nvfp4 [S]                                │
+│ executes: training full-save only                            │
 └──────────────────────────────┬───────────────────────────────┘
                                │ dispatch-lifetime barrier
                                ▼
@@ -683,6 +717,7 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 │ KERNEL: dq(x_gathered_nvfp4)                                 │
 │ inputs: x_gathered_nvfp4 [S]                                 │
 │ outputs: x_q_dq_for_bwd_bf16 [P,M_pad,D]                     │
+│ executes: training full-save only                            │
 └──────────────────────────────┬───────────────────────────────┘
                                ▼
 h3_route_bf16 [SYM] ── combine barrier
