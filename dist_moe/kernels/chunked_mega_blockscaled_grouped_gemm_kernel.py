@@ -1818,6 +1818,8 @@ class ChunkedMegaBlockScaledGroupedGemmKernel(base.MegaBlockScaledGroupedGemmKer
                 dispatch_row_scale_byte_extent,
             )
             if cutlass.const_expr(use_global_scale_inv):
+                # Keep each inverse row scale immediately after the block-scale
+                # storage so training can decode Mega's gathered X in place.
                 mDispatchQuantRowGlobalScaleInv = (
                     _activation_buffer_row_global_scale_tensor(
                         mDispatchQuantRowGlobalScaleInv,
