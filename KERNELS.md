@@ -826,14 +826,15 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
 │ MEGAKERNEL: persistent NVFP4 forward                         │
 │ inputs: x_nvfp4 [SYM], w13_nvfp4, w2_nvfp4,                  │
 │         fwd_gather_ptrs, scatter_ptrs, expert_counts         │
-│ outputs: x_row_nvfp4 [internal S; HBM],                      │
+│ outputs: x_row_nvfp4 [S; qdata + block scales + row inverse  │
+│          scales in HBM],                                     │
 │          h1_bf16 [P or S; HBM], h2_nvfp4 [S; HBM],           │
 │          h3_route_bf16 [SYM]                                 │
 │                                                              │
 │ Parts pipeline by chunk; they are not separate launches.     │
 │ part 1: peer gather/copy X NVFP4                             │
 │   inputs: x_nvfp4 [SYM], fwd_gather_ptrs, expert_counts      │
-│   outputs: x_row_nvfp4 [internal S; written to local HBM]    │
+│   outputs: x_row_nvfp4 [S; written to local HBM]             │
 │ part 2: NVFP4 W13 GEMM                                       │
 │   inputs: x_row_nvfp4 [HBM], w13_nvfp4                       │
 │   outputs: h1_bf16 [P or S; written to HBM]                  │
@@ -854,22 +855,31 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                                │                                                    │
                                └── training full-save save-X side path              │
                                             │                                       │
+                         ┌──────────────────┴──────────────────┐                    │
+                         │                                     │                    │
+              canonical scale rows                    paged scale rows              │
+              BLOCK_SIZE_N % 128 == 0               BLOCK_SIZE_N % 128 != 0       │
+              (usually larger-token schedules)      (usually smaller-token)       │
+              reuse x_row_nvfp4                               ▼                    │
+                         │        ┌──────────────────────────────────────────────┐   │
+                         │        │ KERNEL: peer gather/copy NVFP4 X             │   │
+                         │        │ inputs: x_nvfp4 [SYM], fwd_gather_ptrs,       │   │
+                         │        │         recv_count                            │   │
+                         │        │ outputs: x_gathered_nvfp4 [S; canonical]      │   │
+                         │        │ executes: training full-save, paged scale     │   │
+                         │        │           layout only                         │   │
+                         │        └──────────────────────┬───────────────────────┘   │
+                         └──────────────────┬────────────┘                           │
+                                            │ select x_for_bwd_nvfp4                │
+                                            │ dispatch-lifetime barrier             │
                                             ▼                                       │
-┌──────────────────────────────────────────────────────────────┐                    │
-│ KERNEL: peer gather/copy NVFP4 X                             │                    │
-│ inputs: x_nvfp4 [SYM], fwd_gather_ptrs, recv_count           │                    │
-│ outputs: x_gathered_nvfp4 [S]                                │                    │
-│ executes: training full-save only                            │                    │
-└──────────────────────────────┬───────────────────────────────┘                    │
-                               │ dispatch-lifetime barrier                          │
-                               ▼                                                    │
-┌──────────────────────────────────────────────────────────────┐                    │
-│ KERNEL: dq(x_gathered_nvfp4)                                 │                    │
-│ inputs: x_gathered_nvfp4 [S]                                 │                    │
-│ outputs: x_q_dq_for_bwd_bf16 [P,M_pad,D]                     │                    │
-│ executes: training full-save only                            │                    │
-└──────────────────────────────┬───────────────────────────────┘                    │
-                               └────────────────────────────────────────────────────┤
+             ┌──────────────────────────────────────────────────────────────┐       │
+             │ KERNEL: dq(x_for_bwd_nvfp4)                                 │       │
+             │ inputs: x_row_nvfp4 [S] or x_gathered_nvfp4 [S; canonical]  │       │
+             │ outputs: x_q_dq_for_bwd_bf16 [P,M_pad,D]                    │       │
+             │ executes: training full-save only                           │       │
+             └──────────────────────────────┬───────────────────────────────┘       │
+                                            └───────────────────────────────────────┤
                                                                                     ▼
 h3_route_bf16 [SYM] ── combine barrier
      │
@@ -890,7 +900,8 @@ recv_count, recv_snapshot, need_recompute, recompute_condition,
 forward_offsets, activation_offsets, slot and postprocess state.
 Native BF16 weights and topk_ids/scores are also retained.
 
-x_gathered_nvfp4, h2_nvfp4, published x_nvfp4, w13_nvfp4, and
+x_row_nvfp4, fallback x_gathered_nvfp4, h2_nvfp4, published x_nvfp4,
+w13_nvfp4, and
 w2_nvfp4 are transient. Saved x_q_dq_for_bwd_bf16 and h1_bf16
 retain the M_pad routed-row layout on current main.
 ```

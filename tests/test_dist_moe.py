@@ -5033,17 +5033,24 @@ class DistMoeKernelTest(unittest.TestCase):
         golden decoder. H1 and H3 are compared with the real-quantized
         per-expert reference at tight bounds. Guard bytes and empty weight-state
         slots prove that H2 and dynamic weight quants do not persist in the
-        activation slot or fixed state schema.
+        activation slot or fixed state schema. Mega covers both the paged
+        scale-layout fallback and enough rows to select its canonical layout,
+        proving that the latter can decode saved X directly from the row bundle
+        already gathered by the persistent kernel.
         """
-        for pipeline in ("staged", "mega"):
-            with self.subTest(pipeline=pipeline):
+        for pipeline, num_tokens in (
+            ("staged", 128),
+            ("mega", 128),
+            ("mega", 1024),
+        ):
+            with self.subTest(pipeline=pipeline, num_tokens=num_tokens):
                 policy = dist_moe.BlockScaledConfig(
                     format=dist_moe.BlockScaledFormat.NVFP4,
                     pipeline=pipeline,
                 )
                 context, case_a, _, w13_EFD, w2_EDF = self._create_case(
                     block_scaled=policy,
-                    num_tokens=128,
+                    num_tokens=num_tokens,
                     num_experts=4,
                 )
                 x_TD, ids_TK, scores_TK = case_a

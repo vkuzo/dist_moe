@@ -113,7 +113,10 @@ from .kernels.blockscaled_quantize import (
     _quantize_nvfp4_per_token,
     quantize_block_scaled,
 )
-from .kernels.config import BLOCKSCALED_DISPATCH_DIM_ALIGNMENT
+from .kernels.config import (
+    BLOCKSCALED_DISPATCH_DIM_ALIGNMENT,
+    uses_paged_blockscaled_scale_rows,
+)
 from .kernels.inference_config import _inference_routing_multiple
 
 if TYPE_CHECKING:
@@ -2599,25 +2602,38 @@ class _BlockScaledAutograd(torch.autograd.Function):
                             forward_plan is not None
                             and forward_plan.blockscaled is not None
                         )
-                        dispatch_offsets = forward_plan.blockscaled.dispatch_offsets
-                        _copy_gathered_nvfp4_activation_to_buffer(
-                            dispatch_fwd_gather_ptrs,
-                            num_recv_tokens,
-                            activation_buffer.buffer,
-                            dispatch_offsets[
-                                ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
-                            ],
-                            dispatch_offsets[
-                                ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
-                                + 1
-                            ],
-                            forward_plan.blockscaled.recompute_condition,
-                            capacity_rows,
-                            hidden_dim,
-                            True,
-                        )
-                        # The copied peer rows must stay published until every
-                        # rank has finished reading them.
+                        if config is not None and uses_paged_blockscaled_scale_rows(
+                            int(config["BLOCK_SIZE_N"])
+                        ):
+                            # Small-token Mega schedules pad each expert scale
+                            # tile into an independent physical page. Fall
+                            # back to copying the complete peer row bundle
+                            # into decoder-compatible canonical storage.
+                            x_for_bwd_offsets = (
+                                forward_plan.blockscaled.dispatch_offsets
+                            )
+                            _copy_gathered_nvfp4_activation_to_buffer(
+                                dispatch_fwd_gather_ptrs,
+                                num_recv_tokens,
+                                activation_buffer.buffer,
+                                x_for_bwd_offsets[
+                                    ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
+                                ],
+                                x_for_bwd_offsets[
+                                    ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
+                                    + 1
+                                ],
+                                forward_plan.blockscaled.recompute_condition,
+                                capacity_rows,
+                                hidden_dim,
+                                True,
+                            )
+                        else:
+                            # Mega has already gathered this canonical NVFP4
+                            # row bundle into planner-owned scratch.
+                            x_for_bwd_offsets = forward_plan.blockscaled.mega_offsets
+                        # Keep peer dispatch rows published until every rank has
+                        # finished the Mega gather or paged-layout fallback.
                         _ep_barrier(
                             dispatch_buffer,
                             conditional_execution=torch.logical_not(
@@ -2626,10 +2642,10 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         )
                         _dequantize_nvfp4_activation_buffer_to_buffer(
                             activation_buffer.buffer,
-                            dispatch_offsets[
+                            x_for_bwd_offsets[
                                 ACTIVATION_A_Q_OFFSET : ACTIVATION_A_Q_OFFSET + 1
                             ],
-                            dispatch_offsets[
+                            x_for_bwd_offsets[
                                 ACTIVATION_A_SCALE_OFFSET : ACTIVATION_A_SCALE_OFFSET
                                 + 1
                             ],
