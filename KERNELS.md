@@ -858,6 +858,8 @@ Inputs: x_bf16, w13_bf16, w2_bf16, topk_ids, topk_scores, slot_id
                          ┌──────────────────┴──────────────────┐                    │
                          │                                     │                    │
               canonical scale rows                    paged scale rows              │
+              BLOCK_SIZE_N % 128 == 0               BLOCK_SIZE_N % 128 != 0       │
+              (usually larger-token schedules)      (usually smaller-token)       │
               reuse x_row_nvfp4                               ▼                    │
                          │        ┌──────────────────────────────────────────────┐   │
                          │        │ KERNEL: peer gather/copy NVFP4 X             │   │
