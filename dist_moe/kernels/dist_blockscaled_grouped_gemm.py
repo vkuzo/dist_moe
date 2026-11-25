@@ -217,9 +217,7 @@ def allocate_decode_counter_storage(
 
 
 def _q_words_tensor(words: torch.Tensor, *, wide: bool, format: BlockScaledFormatSpec):
-    tensor = from_dlpack(
-        words.detach(), assumed_align=16, enable_tvm_ffi=_format_uses_fp4(format)
-    )
+    tensor = from_dlpack(words.detach(), assumed_align=16, enable_tvm_ffi=True)
     # Quant producers index q-words with Int32 rows; past 2**31 words the row
     # stride must be dynamic (Int64) so row * stride cannot wrap. Smaller buffers
     # keep the static layout, which is cheaper in the register-bound fused kernels.
@@ -783,7 +781,7 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
         weight_format=weight_format,
         out_dtype=out_dtype,
     )
-    dlpack_kwargs = {"enable_tvm_ffi": _format_uses_fp4(kernel_format)}
+    dlpack_kwargs = {"enable_tvm_ffi": True}
     scatter_cute = from_dlpack(
         scatter_ptrs[: problem.GM].detach(), assumed_align=8, **dlpack_kwargs
     )
@@ -919,7 +917,7 @@ def _fused_dist_blockscaled_grouped_gemm_combine_impl(  # noqa: C901
         conditional_execution=conditional_execution,
         fallback_offsets=tensormaps,
         expected_offset_count=ACTIVATION_OFFSET_COUNT,
-        enable_tvm_ffi=_format_uses_fp4(kernel_format),
+        enable_tvm_ffi=True,
     )
     stream = cutlass_torch.current_stream()
     b_global_scale_inv_ptr = (
@@ -1514,7 +1512,7 @@ def _fused_dist_blockscaled_grouped_gemm_dispatch_quant_impl(  # noqa: C901
         weight_format=weight_format,
         out_dtype=out_dtype,
     )
-    dlpack_kwargs = {"enable_tvm_ffi": _format_uses_fp4(kernel_format)}
+    dlpack_kwargs = {"enable_tvm_ffi": True}
     gather_cute = from_dlpack(
         gather_ptrs[:rows].detach(), assumed_align=8, **dlpack_kwargs
     )
@@ -1582,7 +1580,7 @@ def _fused_dist_blockscaled_grouped_gemm_dispatch_quant_impl(  # noqa: C901
         conditional_execution=conditional_execution,
         fallback_offsets=tensormaps,
         expected_offset_count=ACTIVATION_OFFSET_COUNT,
-        enable_tvm_ffi=_format_uses_fp4(kernel_format),
+        enable_tvm_ffi=True,
     )
     stream = cutlass_torch.current_stream()
     b_global_scale_inv_ptr = (

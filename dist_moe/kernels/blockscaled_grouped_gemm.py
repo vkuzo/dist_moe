@@ -42,6 +42,7 @@ from ..formats import (
 )
 from . import sm103_blockscaled_helpers as sm103
 from ._environment import num_sms_per_device
+from ._jit_cache import compile_with_persistent_cache, tvm_ffi_tensor_abi_signature
 from ._kernel_name_prefix import scoped_kernel_name_prefixes
 from .activation_buffer import (
     GEMM_OPERAND_OFFSET_COUNT,
@@ -199,6 +200,7 @@ def _compile_or_get(
     name_prefix: str | None = None,
     **kwargs,
 ):
+    cache_key = (*cache_key, tvm_ffi_tensor_abi_signature(args))
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is not None:
         return compiled
@@ -206,10 +208,9 @@ def _compile_or_get(
         compiled = _COMPILED_CACHE.get(cache_key)
         if compiled is not None:
             return compiled
-        if _format_uses_fp4(kernel.format):
-            options = kwargs.get("options") or ""
-            if "--enable-tvm-ffi" not in options:
-                kwargs["options"] = f"{options} --enable-tvm-ffi".strip()
+        options = kwargs.get("options") or ""
+        if "--enable-tvm-ffi" not in options:
+            kwargs["options"] = f"{options} --enable-tvm-ffi".strip()
         if name_prefix is not None:
             kernel_cls = type(kernel)
             prepare_name_prefix = name_prefix.replace(
@@ -232,8 +233,17 @@ def _compile_or_get(
             )
         else:
             prefixes = ()
-        with scoped_kernel_name_prefixes(prefixes):
-            compiled = cute.compile(kernel, *args, **kwargs)
+
+        def compile_kernel():
+            """Compile the current block-scaled grouped-GEMM specialization."""
+            with scoped_kernel_name_prefixes(prefixes):
+                return cute.compile(kernel, *args, **kwargs)
+
+        compiled = compile_with_persistent_cache(
+            "blockscaled_grouped_gemm",
+            cache_key,
+            compile_kernel,
+        )
         _COMPILED_CACHE[cache_key] = compiled
     return compiled
 
@@ -595,7 +605,6 @@ def _make_launch_tensor_bundle(
     out_dtype: torch.dtype,
 ) -> _LaunchTensorBundle:
     weight_format = _resolve_weight_format(format, weight_format)
-    is_fp4_op = _format_uses_fp4(format) or _format_uses_fp4(weight_format)
     a_placeholder = a.detach().unsqueeze(-1)
     b_placeholder = (
         b.detach().permute(1, 2, 0) if b.dim() == 3 else b.detach().unsqueeze(-1)
@@ -611,7 +620,7 @@ def _make_launch_tensor_bundle(
     a_leading_dim = next(i for i, s in enumerate(a_placeholder.stride()) if s == 1)
     b_leading_dim = next(i for i, s in enumerate(b_placeholder.stride()) if s == 1)
     c_leading_dim = next(i for i, s in enumerate(c_placeholder.stride()) if s == 1)
-    dlpack_kwargs = {"enable_tvm_ffi": is_fp4_op}
+    dlpack_kwargs = {"enable_tvm_ffi": True}
     a_cute = from_dlpack(
         a_placeholder, assumed_align=16, **dlpack_kwargs
     ).mark_layout_dynamic(leading_dim=a_leading_dim)
@@ -636,19 +645,15 @@ def _make_launch_tensor_bundle(
         counter_cute,
         tensormaps_cute,
     )
-    compile_tensors = (
-        _make_blockscaled_compile_tensors(
-            format=format,
-            weight_format=weight_format,
-            out_dtype=out_dtype,
-            a_leading_dim=a_leading_dim,
-            b_leading_dim=b_leading_dim,
-            split_cute=split_cute,
-            counter_cute=counter_cute,
-            tensormaps_cute=tensormaps_cute,
-        )
-        if is_fp4_op
-        else runtime_tensors
+    compile_tensors = _make_blockscaled_compile_tensors(
+        format=format,
+        weight_format=weight_format,
+        out_dtype=out_dtype,
+        a_leading_dim=a_leading_dim,
+        b_leading_dim=b_leading_dim,
+        split_cute=split_cute,
+        counter_cute=counter_cute,
+        tensormaps_cute=tensormaps_cute,
     )
     return _LaunchTensorBundle(
         placeholders=(a_placeholder, b_placeholder, c_placeholder),
@@ -906,7 +911,7 @@ def _blockscaled_grouped_gemm(  # noqa: C901
     activation_offsets_cute = from_dlpack(
         activation_offsets_tensor,
         assumed_align=8,
-        enable_tvm_ffi=_format_uses_fp4(kernel_format),
+        enable_tvm_ffi=True,
     )
     use_a_global_scale_inv = a_global_scale_inv is not None
     use_b_global_scale_inv = b_global_scale_inv is not None

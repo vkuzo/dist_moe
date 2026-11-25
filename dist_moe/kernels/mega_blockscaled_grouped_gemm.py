@@ -37,7 +37,6 @@ from .blockscaled_grouped_gemm import (
     _compile_or_get,
     _config_cache_key,
     _cutlass_dtype_from_torch,
-    _format_uses_fp4,
     _make_launch_tensor_bundle,
     _make_pointer_stride_args,
     _parse_blockscaled_problem,
@@ -639,7 +638,7 @@ def _to_cute_tensor(
     return from_dlpack(
         tensor.detach(),
         assumed_align=assumed_align,
-        enable_tvm_ffi=_format_uses_fp4(format),
+        enable_tvm_ffi=True,
     )
 
 
@@ -879,7 +878,7 @@ def _make_mega_two_gemm_kernel_args(  # noqa: C901
         conditional_execution=conditional_execution,
         fallback_offsets=tensormaps,
         expected_offset_count=MEGA_ACTIVATION_OFFSET_COUNT,
-        enable_tvm_ffi=_format_uses_fp4(kernel_format),
+        enable_tvm_ffi=True,
     )
     stream = cutlass_torch.current_stream()
     compile_tensor_args = (
@@ -951,6 +950,16 @@ def _make_mega_two_gemm_kernel_args(  # noqa: C901
             cutlass.Int64(wgrad_b_global_scale_inv_ptr),
             cutlass.Int64(nvfp4_recip_lut_ptr),
             stream,
+            # Exported TVM-FFI functions retain the optional weight-borrow
+            # parameters in their callable schema even when this launch
+            # specializes them all to None. The original cute.compile wrapper
+            # supplies the Python defaults; a launchable reloaded from the
+            # persistent object cache requires explicit placeholders.
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     )
     return (
