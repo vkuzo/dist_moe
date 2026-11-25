@@ -25,7 +25,7 @@ in this repo) does not honor file-level per-rule disables.
 import cutlass
 import cutlass.torch as cutlass_torch
 import torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack as _from_dlpack
 
 from .._activation_buffer_planner_kernel import (
     MEMORY_ALIGNMENT as _ACTIVATION_BUFFER_ALIGNMENT,
@@ -99,6 +99,16 @@ from .grouped_gemm import (
 from .native_combine_swiglu import (
     native_swiglu_bwd_col_multiple,
 )
+
+
+def from_dlpack(tensor: torch.Tensor, *, assumed_align: int):
+    """Bind a Torch tensor to the exportable TVM-FFI CuTe ABI."""
+    return _from_dlpack(
+        tensor,
+        assumed_align=assumed_align,
+        enable_tvm_ffi=True,
+    )
+
 
 _PYTORCH_ALLOCATOR_MIN_ALIGNMENT: int = 16
 
@@ -861,8 +871,12 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     )
     tensormaps_cute = from_dlpack(tensormaps, assumed_align=8)
 
-    secondary_compile_args: tuple = ()
-    secondary_runtime_args: tuple = ()
+    # Exported TVM-FFI functions retain trailing optional parameters in their
+    # callable schema. Pass explicit ``None`` placeholders so a launch loaded
+    # from the persistent object cache has the same argument list as the
+    # original ``cute.compile`` wrapper.
+    secondary_compile_args: tuple = (None,) * 8
+    secondary_runtime_args: tuple = secondary_compile_args
     secondary_layout_key: tuple = ()
     if use_secondary_gemm:
         assert secondary_weight is not None

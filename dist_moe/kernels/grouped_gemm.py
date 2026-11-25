@@ -23,9 +23,10 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
 import torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack as _from_dlpack
 
 from ._environment import l2_cache_size, num_sms_per_device
+from ._jit_cache import compile_with_persistent_cache, tvm_ffi_tensor_abi_signature
 from ._kernel_name_prefix import scoped_kernel_name_prefixes
 from .config import (  # noqa: F401
     _resolve_grouped_gemm_config,
@@ -41,6 +42,16 @@ from .grouped_gemm_kernel import (
     GroupedGemmKernel,
 )
 from .tile_scheduler import _DGRAD, _FPROP, _WGRAD
+
+
+def from_dlpack(tensor: torch.Tensor, *, assumed_align: int):
+    """Bind a Torch tensor to the exportable TVM-FFI CuTe ABI."""
+    return _from_dlpack(
+        tensor,
+        assumed_align=assumed_align,
+        enable_tvm_ffi=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Kernel class. Host-side __call__ builds SharedStorage + TMA atoms and
@@ -162,6 +173,7 @@ def _compile_or_get(
     **kwargs,
 ):
     """Lookup or compile-and-cache a launchable for this (kernel, args) shape."""
+    cache_key = (*cache_key, tvm_ffi_tensor_abi_signature(args))
     compiled = _COMPILED_CACHE.get(cache_key)
     if compiled is not None:
         return compiled
@@ -169,13 +181,25 @@ def _compile_or_get(
         compiled = _COMPILED_CACHE.get(cache_key)
         if compiled is not None:
             return compiled
+        options = kwargs.get("options") or ""
+        if "--enable-tvm-ffi" not in options:
+            kwargs["options"] = f"{options} --enable-tvm-ffi".strip()
         if name_prefix is not None:
             assert prefix_target is not None
             prefixes = ((prefix_target, name_prefix),)
         else:
             prefixes = ()
-        with scoped_kernel_name_prefixes(prefixes):
-            compiled = cute.compile(kernel, *args, **kwargs)
+
+        def compile_kernel():
+            """Compile the current BF16 grouped-GEMM specialization."""
+            with scoped_kernel_name_prefixes(prefixes):
+                return cute.compile(kernel, *args, **kwargs)
+
+        compiled = compile_with_persistent_cache(
+            "grouped_gemm",
+            cache_key,
+            compile_kernel,
+        )
         _COMPILED_CACHE[cache_key] = compiled
     return compiled
 
